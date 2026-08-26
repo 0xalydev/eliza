@@ -1,19 +1,25 @@
-// View-bundle `interact` capability handler, split out of ContactsAppView.tsx so
-// that file exports only React components and stays Fast-Refresh-compatible
-// (Vite would full-reload a component file that also exports a plain function).
-// The view bundle re-exports `interact` via ./contacts-view-bundle.ts.
+/**
+ * Dispatches the Contacts view bundle's classified interaction operations.
+ * Keeping the exact handler map keyed by the production declaration union
+ * makes an undeclared operation or an unimplemented declaration a type error.
+ */
 
 import {
   Contacts,
   type CreateContactOptions,
 } from "@elizaos/capacitor-contacts";
+import type { ContactsViewCapabilityId } from "../view-capabilities";
 import { loadContactsState } from "./ContactsAppView.helpers";
 
-export async function interact(
-  capability: string,
+type ContactsCapabilityHandler = (
   params?: Record<string, unknown>,
-): Promise<unknown> {
-  if (capability === "list-contacts") {
+) => Promise<unknown>;
+
+const CONTACTS_CAPABILITY_HANDLERS: Record<
+  ContactsViewCapabilityId,
+  ContactsCapabilityHandler
+> = {
+  "list-contacts": async (params) => {
     const state = await loadContactsState({
       query: typeof params?.query === "string" ? params.query : undefined,
       limit: typeof params?.limit === "number" ? params.limit : undefined,
@@ -30,9 +36,8 @@ export async function interact(
         starred: contact.starred,
       })),
     };
-  }
-
-  if (capability === "create-contact") {
+  },
+  "create-contact": async (params) => {
     const displayName =
       typeof params?.displayName === "string" ? params.displayName.trim() : "";
     if (!displayName) throw new Error("displayName is required");
@@ -47,9 +52,8 @@ export async function interact(
     if (emailAddress) payload.emailAddress = emailAddress;
     const result = await Contacts.createContact(payload);
     return { created: true, id: result.id };
-  }
-
-  if (capability === "import-vcard") {
+  },
+  "import-vcard": async (params) => {
     const vcardText =
       typeof params?.vcardText === "string" ? params.vcardText.trim() : "";
     if (!vcardText) throw new Error("vcardText is required");
@@ -66,7 +70,17 @@ export async function interact(
         sourceName: contact.sourceName,
       })),
     };
-  }
+  },
+};
 
-  throw new Error(`Unsupported capability "${capability}"`);
+export async function interact(
+  capability: string,
+  params?: Record<string, unknown>,
+): Promise<unknown> {
+  if (!Object.hasOwn(CONTACTS_CAPABILITY_HANDLERS, capability)) {
+    throw new Error(`Unsupported capability "${capability}"`);
+  }
+  return CONTACTS_CAPABILITY_HANDLERS[capability as ContactsViewCapabilityId](
+    params,
+  );
 }

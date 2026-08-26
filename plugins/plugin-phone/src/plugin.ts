@@ -13,6 +13,7 @@
 
 import type { Plugin } from "@elizaos/core";
 import { phoneCallLogProvider } from "./providers/call-log";
+import { PHONE_VIEW_CAPABILITIES } from "./view-capabilities";
 
 const PHONE_APP_NAME = "@elizaos/plugin-phone";
 
@@ -43,6 +44,7 @@ export const appPhonePlugin: Plugin = {
       // agent-surface capability so the view broker admits agent-driven
       // fills/clicks (#13452 manifest gate).
       surface: { capabilities: ["agent-surface"] },
+      capabilities: [...PHONE_VIEW_CAPABILITIES],
       componentExport: "PhoneView",
       tags: ["phone", "calls", "android"],
       visibleInManager: true,

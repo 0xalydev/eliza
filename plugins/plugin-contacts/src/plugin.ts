@@ -10,6 +10,7 @@
 
 import type { Plugin } from "@elizaos/core";
 import { contactsProvider } from "./providers/contacts";
+import { CONTACTS_VIEW_CAPABILITIES } from "./view-capabilities";
 
 const CONTACTS_APP_NAME = "@elizaos/plugin-contacts";
 
@@ -33,6 +34,7 @@ export const appContactsPlugin: Plugin = {
       // agent-surface capability so the view broker admits agent-driven
       // fills/clicks (#13452 manifest gate).
       surface: { capabilities: ["agent-surface"] },
+      capabilities: [...CONTACTS_VIEW_CAPABILITIES],
       componentExport: "ContactsView",
       tags: ["contacts", "android", "address-book"],
       visibleInManager: true,

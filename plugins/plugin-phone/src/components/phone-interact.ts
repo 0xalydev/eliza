@@ -1,19 +1,26 @@
-// View-bundle `interact` capability handler — the agent-facing terminal
-// capability bridge for the Phone view. The view bundle re-exports `interact`
-// via ./phone-view-bundle.ts.
+/**
+ * Dispatches the Phone view bundle's classified interaction operations.
+ * Keeping the exact handler map keyed by the production declaration union
+ * makes an undeclared operation or an unimplemented declaration a type error.
+ */
 
 import { Phone } from "@elizaos/capacitor-phone";
+import type { PhoneViewCapabilityId } from "../view-capabilities.ts";
 import {
   callLabelFor,
   loadPhoneState,
   normalizeNumber,
 } from "./phone-view-helpers.ts";
 
-export async function interact(
-  capability: string,
+type PhoneCapabilityHandler = (
   params?: Record<string, unknown>,
-): Promise<unknown> {
-  if (capability === "phone-state") {
+) => Promise<unknown>;
+
+const PHONE_CAPABILITY_HANDLERS: Record<
+  PhoneViewCapabilityId,
+  PhoneCapabilityHandler
+> = {
+  "phone-state": async (params) => {
     const state = await loadPhoneState({
       limit: params?.limit,
       number: typeof params?.number === "string" ? params.number : undefined,
@@ -33,26 +40,23 @@ export async function interact(
         agentTranscript: call.agentTranscript,
       })),
     };
-  }
-
-  if (capability === "place-call") {
+  },
+  "place-call": async (params) => {
     const number = normalizeNumber(
       typeof params?.number === "string" ? params.number : "",
     );
     if (!number) throw new Error("number is required");
     await Phone.placeCall({ number });
     return { placed: true, number };
-  }
-
-  if (capability === "open-dialer") {
+  },
+  "open-dialer": async (params) => {
     const number = normalizeNumber(
       typeof params?.number === "string" ? params.number : "",
     );
     await Phone.openDialer(number ? { number } : undefined);
     return { opened: true, number: number || null };
-  }
-
-  if (capability === "save-call-transcript") {
+  },
+  "save-call-transcript": async (params) => {
     const callId =
       typeof params?.callId === "string" ? params.callId.trim() : "";
     const transcript =
@@ -67,7 +71,15 @@ export async function interact(
       ...(summary ? { summary } : {}),
     });
     return { saved: true, updatedAt: result.updatedAt };
-  }
+  },
+};
 
-  throw new Error(`Unsupported capability "${capability}"`);
+export async function interact(
+  capability: string,
+  params?: Record<string, unknown>,
+): Promise<unknown> {
+  if (!Object.hasOwn(PHONE_CAPABILITY_HANDLERS, capability)) {
+    throw new Error(`Unsupported capability "${capability}"`);
+  }
+  return PHONE_CAPABILITY_HANDLERS[capability as PhoneViewCapabilityId](params);
 }
