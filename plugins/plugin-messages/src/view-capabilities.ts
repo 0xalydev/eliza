@@ -5,16 +5,9 @@ import type { ViewCapability } from "@elizaos/core";
 export const MESSAGES_VIEW_CAPABILITIES = [
   {
     id: "list-threads",
-    description: "List Android SMS conversation threads and role state.",
+    description:
+      "List the complete Android SMS conversation-thread set and role state.",
     authority: "agent",
-    params: {
-      limit: {
-        type: "number",
-        description: "Maximum messages to load before grouping into threads.",
-        minimum: 1,
-        maximum: 500,
-      },
-    },
   },
   {
     id: "send-sms",

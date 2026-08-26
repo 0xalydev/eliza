@@ -44,7 +44,9 @@ describe("phoneCallLogProvider", () => {
       {} as never,
     );
 
-    expect(phoneBridge.listRecentCalls).toHaveBeenCalledWith();
+    expect(phoneBridge.listRecentCalls).toHaveBeenCalledWith({
+      limit: 2_147_483_647,
+    });
     expect(result.values).toEqual({
       callLogAvailable: true,
       callLogCount: 1,
@@ -88,6 +90,25 @@ describe("phoneCallLogProvider", () => {
 
     expect((result.data as { calls: unknown[] }).calls).toHaveLength(75);
     expect(result.text).toContain("Caller 74");
+  });
+
+  it("returns unavailable instead of a potentially incomplete native page", async () => {
+    phoneBridge.listRecentCalls.mockResolvedValue({
+      calls: Object.assign([], { length: 2_147_483_647 }),
+    });
+
+    const result = await phoneCallLogProvider.get(
+      {} as never,
+      {} as never,
+      {} as never,
+    );
+
+    expect(result.values).toMatchObject({
+      callLogAvailable: false,
+      callLogCount: 0,
+      callLogError: expect.stringContaining("potentially incomplete"),
+    });
+    expect((result.data as { calls: unknown[] }).calls).toEqual([]);
   });
 
   it("turns native call-log permission failures into unavailable provider state", async () => {

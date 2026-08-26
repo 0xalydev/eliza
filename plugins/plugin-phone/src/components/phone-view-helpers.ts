@@ -9,6 +9,7 @@ import { Phone } from "@elizaos/capacitor-phone";
 
 const DEFAULT_CALL_LOG_LIMIT = 50;
 const MAX_CALL_LOG_LIMIT = 200;
+export const COMPLETE_CALL_LOG_READ_LIMIT = 2_147_483_647;
 
 export function callLabelFor(entry: CallLogEntry): string {
   if (entry.cachedName && entry.cachedName.trim().length > 0) {
@@ -36,6 +37,7 @@ function normalizeCallLogLimit(limit: unknown): number {
 }
 
 export async function loadPhoneState(options?: {
+  complete?: boolean;
   limit?: unknown;
   number?: string;
 }) {
@@ -44,7 +46,9 @@ export async function loadPhoneState(options?: {
   const [status, recent] = await Promise.all([
     Phone.getStatus().catch(() => null),
     Phone.listRecentCalls({
-      limit: normalizeCallLogLimit(options?.limit),
+      limit: options?.complete
+        ? COMPLETE_CALL_LOG_READ_LIMIT
+        : normalizeCallLogLimit(options?.limit),
       ...(normalizedNumber ? { number: normalizedNumber } : {}),
     }),
   ]);

@@ -5,8 +5,10 @@
  */
 
 import { Phone } from "@elizaos/capacitor-phone";
+import { ElizaError } from "@elizaos/core";
 import type { PhoneViewCapabilityId } from "../view-capabilities.ts";
 import {
+  COMPLETE_CALL_LOG_READ_LIMIT,
   callLabelFor,
   loadPhoneState,
   normalizeNumber,
@@ -22,9 +24,18 @@ const PHONE_CAPABILITY_HANDLERS: Record<
 > = {
   "phone-state": async (params) => {
     const state = await loadPhoneState({
-      limit: params?.limit,
+      complete: true,
       number: typeof params?.number === "string" ? params.number : undefined,
     });
+    if (state.calls.length === COMPLETE_CALL_LOG_READ_LIMIT) {
+      throw new ElizaError(
+        "Phone-state read reached the native bridge boundary; refusing to return a potentially incomplete call log.",
+        {
+          code: "NATIVE_PHONE_STATE_READ_INCOMPLETE",
+          context: { limit: COMPLETE_CALL_LOG_READ_LIMIT },
+        },
+      );
+    }
     return {
       status: state.status,
       calls: state.calls.map((call) => ({

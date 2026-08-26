@@ -8,12 +8,6 @@ export const PHONE_VIEW_CAPABILITIES = [
     description: "Read Android phone status and recent calls.",
     authority: "agent",
     params: {
-      limit: {
-        type: "number",
-        description: "Maximum recent calls to return.",
-        minimum: 1,
-        maximum: 200,
-      },
       number: {
         type: "string",
         description: "Optional phone-number filter.",

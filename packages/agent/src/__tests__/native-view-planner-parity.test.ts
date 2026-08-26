@@ -9,7 +9,7 @@ import http from "node:http";
 import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ChannelType, type Memory } from "@elizaos/core";
+import { ChannelType, type Memory, type RoleGateRole } from "@elizaos/core";
 import {
   afterAll,
   beforeAll,
@@ -105,6 +105,7 @@ interface DispatchedInteraction {
 const dispatched: DispatchedInteraction[] = [];
 let server: http.Server;
 let priorPort: string | undefined;
+let serverCallerRole: RoleGateRole = "OWNER";
 
 function writeJson(
   response: http.ServerResponse,
@@ -171,6 +172,7 @@ function startViewsServer(): Promise<http.Server> {
           );
           return 1;
         },
+        callerAuthorization: { ok: true, role: serverCallerRole },
       });
       if (!handled && !response.headersSent) {
         writeJson(response, 404, { error: "Not found" });
@@ -192,7 +194,7 @@ function startViewsServer(): Promise<http.Server> {
 
 function message(channelType: ChannelType, text: string): Memory {
   return {
-    entityId: "native-view-user",
+    entityId: "native-view-agent",
     roomId: "native-view-room",
     agentId: "native-view-agent",
     content: {
@@ -234,6 +236,7 @@ beforeAll(async () => {
 
 beforeEach(() => {
   dispatched.length = 0;
+  serverCallerRole = "OWNER";
   vi.clearAllMocks();
   nativeBridge.listContacts.mockResolvedValue({
     contacts: [
@@ -305,13 +308,9 @@ describe.each([ChannelType.DM, ChannelType.VOICE_DM])(
     it("validates parameters and returns all three mounted native results", async () => {
       const contacts = await invoke(channelType, "contacts", "list-contacts", {
         query: "Ada",
-        limit: 2,
       });
-      const messages = await invoke(channelType, "messages", "list-threads", {
-        limit: 3,
-      });
+      const messages = await invoke(channelType, "messages", "list-threads");
       const phone = await invoke(channelType, "phone", "phone-state", {
-        limit: 4,
         number: "+1 (555) 0300",
       });
 
@@ -324,7 +323,7 @@ describe.each([ChannelType.DM, ChannelType.VOICE_DM])(
         {
           viewId: "contacts",
           capability: "list-contacts",
-          params: { query: "Ada", limit: 2 },
+          params: { query: "Ada" },
           result: {
             query: "Ada",
             count: 1,
@@ -343,7 +342,7 @@ describe.each([ChannelType.DM, ChannelType.VOICE_DM])(
         {
           viewId: "messages",
           capability: "list-threads",
-          params: { limit: 3 },
+          params: undefined,
           result: {
             threads: [
               {
@@ -362,7 +361,7 @@ describe.each([ChannelType.DM, ChannelType.VOICE_DM])(
         {
           viewId: "phone",
           capability: "phone-state",
-          params: { limit: 4, number: "+1 (555) 0300" },
+          params: { number: "+1 (555) 0300" },
           result: {
             status: { ready: true },
             calls: [
@@ -384,11 +383,11 @@ describe.each([ChannelType.DM, ChannelType.VOICE_DM])(
       ]);
       expect(nativeBridge.listContacts).toHaveBeenCalledWith({
         query: "Ada",
-        limit: 2,
+        limit: 2_147_483_647,
       });
-      expect(nativeBridge.listMessages).toHaveBeenCalledWith({ limit: 3 });
+      expect(nativeBridge.listMessages).toHaveBeenCalledWith({ limit: 500 });
       expect(nativeBridge.listRecentCalls).toHaveBeenCalledWith({
-        limit: 4,
+        limit: 2_147_483_647,
         number: "+15550300",
       });
     });
@@ -425,6 +424,73 @@ it("keeps every classified native mutation outside planner dispatch", async () =
   expect(nativeBridge.saveCallTranscript).not.toHaveBeenCalled();
 });
 
+it("rejects generic agent-fill and agent-click mutation bypasses before mounted dispatch", async () => {
+  const bypasses = [
+    ["contacts", "agent-fill", { id: "contact-create-name", value: "Ada" }],
+    ["contacts", "agent-click", { id: "contact-create-save" }],
+    ["messages", "agent-fill", { id: "composer-body", value: "hello" }],
+    ["messages", "agent-click", { id: "send-message" }],
+    ["phone", "agent-click", { id: "place-call" }],
+  ] as const;
+
+  for (const [view, capability, params] of bypasses) {
+    const result = await invoke(ChannelType.DM, view, capability, params);
+    expect(result.success).toBe(false);
+    expect(result.text).toBe(`Interact with view "${view}" failed (HTTP 403).`);
+  }
+
+  expect(dispatched).toEqual([]);
+  expect(nativeBridge.createContact).not.toHaveBeenCalled();
+  expect(nativeBridge.sendSms).not.toHaveBeenCalled();
+  expect(nativeBridge.placeCall).not.toHaveBeenCalled();
+});
+
+it("denies USER callers at the real HTTP interaction boundary", async () => {
+  serverCallerRole = "USER";
+  const port = (server.address() as AddressInfo).port;
+
+  for (const [view, capability] of [
+    ["contacts", "list-contacts"],
+    ["messages", "list-threads"],
+    ["phone", "phone-state"],
+  ] as const) {
+    const response = await fetch(
+      `http://127.0.0.1:${port}/api/views/${view}/interact`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ capability }),
+      },
+    );
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toEqual({
+      error: `View "${view}" is not available to this caller`,
+    });
+  }
+
+  expect(dispatched).toEqual([]);
+  expect(nativeBridge.listContacts).not.toHaveBeenCalled();
+  expect(nativeBridge.listMessages).not.toHaveBeenCalled();
+  expect(nativeBridge.listRecentCalls).not.toHaveBeenCalled();
+});
+
+it("rejects a native contacts page that cannot prove completeness", async () => {
+  nativeBridge.listContacts.mockResolvedValue({
+    contacts: Object.assign([], { length: 2_147_483_647 }),
+  });
+
+  const result = await invoke(ChannelType.DM, "contacts", "list-contacts");
+  expect(result.success).toBe(false);
+  await expect(interactContacts("list-contacts")).rejects.toMatchObject({
+    code: "NATIVE_CONTACTS_READ_INCOMPLETE",
+    context: { limit: 2_147_483_647 },
+  });
+  expect(dispatched).toEqual([]);
+  expect(nativeBridge.listContacts).toHaveBeenCalledWith({
+    limit: 2_147_483_647,
+  });
+});
+
 it("classifies the complete native capability inventory at registration", () => {
   const classified = PLUGINS.flatMap((plugin) =>
     (plugin.views ?? []).flatMap((view) =>
@@ -432,6 +498,8 @@ it("classifies the complete native capability inventory at registration", () => 
         view: view.id,
         id: capability.id,
         authority: capability.authority,
+        minRole: view.roleGate?.minRole,
+        surface: view.surface?.capabilities ?? [],
       })),
     ),
   );
@@ -439,6 +507,8 @@ it("classifies the complete native capability inventory at registration", () => 
   expect(classified.filter(({ authority }) => authority === undefined)).toEqual(
     [],
   );
+  expect(classified.every(({ minRole }) => minRole === "ADMIN")).toBe(true);
+  expect(classified.every(({ surface }) => surface.length === 0)).toBe(true);
   expect(
     classified
       .filter(({ authority }) => authority === "agent")

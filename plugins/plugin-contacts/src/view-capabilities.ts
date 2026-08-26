@@ -12,12 +12,6 @@ export const CONTACTS_VIEW_CAPABILITIES = [
         type: "string",
         description: "Optional name, phone number, or email search text.",
       },
-      limit: {
-        type: "number",
-        description: "Maximum contacts to return.",
-        minimum: 1,
-        maximum: 500,
-      },
     },
   },
   {

@@ -31,11 +31,8 @@ export const appMessagesPlugin: Plugin = {
       path: "/messages",
       modalities: ["gui"],
       bundlePath: "dist/views/bundle.js",
-      // First-party instrumented view (data-agent-id controls): grant the
-      // agent-surface capability so the view broker admits agent-driven
-      // fills/clicks (#13452 manifest gate).
-      surface: { capabilities: ["agent-surface"] },
       capabilities: [...MESSAGES_VIEW_CAPABILITIES],
+      roleGate: { minRole: "ADMIN" },
       componentExport: "MessagesView",
       tags: ["messaging", "sms", "android"],
       visibleInManager: true,

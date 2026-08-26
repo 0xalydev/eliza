@@ -65,17 +65,23 @@ describe("real ContactsWeb parser contract", () => {
     });
   });
 
-  describe("ContactsWeb itself enforces the documented 1..500 limit", () => {
+  describe("ContactsWeb itself enforces positive safe-integer limits", () => {
     // Hit the real parser directly (bypassing loadContactsState's pre-clamp) to
     // prove the upstream contract these consumers depend on still holds.
-    it.each([0, -1, 501, Number.POSITIVE_INFINITY, Number.NaN])(
-      "rejects out-of-range limit %s",
+    it.each([0, -1, Number.POSITIVE_INFINITY, Number.NaN])(
+      "rejects invalid limit %s",
       async (limit) => {
         await expect(realWeb.listContacts({ limit })).rejects.toThrow(
-          "limit must be between 1 and 500",
+          "limit must be a positive safe integer",
         );
       },
     );
+
+    it("accepts the Android bridge's signed 32-bit maximum", async () => {
+      await expect(
+        realWeb.listContacts({ limit: 2_147_483_647 }),
+      ).resolves.toEqual({ contacts: [] });
+    });
 
     it("returns the empty {contacts:[]} web shape for valid queries", async () => {
       await expect(
@@ -119,14 +125,13 @@ describe("real ContactsWeb parser contract", () => {
   });
 
   describe("androidContacts provider over the real ContactsWeb", () => {
-    it("requests limit 50 and reports the empty web list (contactsAvailable=false, no error)", async () => {
+    it("reports the empty web list as available complete state", async () => {
       const result = await contactsProvider.get(
         {} as IAgentRuntime,
         {} as Memory,
         {} as State,
       );
-      const data = result.data as { count: number; limit: number };
-      expect(data.limit).toBe(50);
+      const data = result.data as { count: number };
       expect(data.count).toBe(0);
       // The real ContactsWeb returns zero rows (web fallback), so the provider
       // reports contactsAvailable=false. Crucially it does NOT report an error:

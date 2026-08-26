@@ -6,24 +6,31 @@
 
 import { Messages } from "@elizaos/capacitor-messages";
 import { System } from "@elizaos/capacitor-system";
+import { ElizaError } from "@elizaos/core";
 import type { MessagesViewCapabilityId } from "../view-capabilities.ts";
-import {
-  loadMessagesState,
-  normalizeMessagesLimit,
-} from "./messages-view-helpers.ts";
+import { loadMessagesState } from "./messages-view-helpers.ts";
 
 type MessagesCapabilityHandler = (
   params?: Record<string, unknown>,
 ) => Promise<unknown>;
 
+const COMPLETE_MESSAGES_READ_LIMIT = 500;
+
 const MESSAGES_CAPABILITY_HANDLERS: Record<
   MessagesViewCapabilityId,
   MessagesCapabilityHandler
 > = {
-  "list-threads": async (params) => {
-    const state = await loadMessagesState(
-      normalizeMessagesLimit(params?.limit),
-    );
+  "list-threads": async () => {
+    const state = await loadMessagesState(COMPLETE_MESSAGES_READ_LIMIT);
+    if (state.messages.length === COMPLETE_MESSAGES_READ_LIMIT) {
+      throw new ElizaError(
+        "Messages read reached the native bridge boundary; refusing to return a potentially incomplete conversation history.",
+        {
+          code: "NATIVE_MESSAGES_READ_INCOMPLETE",
+          context: { limit: COMPLETE_MESSAGES_READ_LIMIT },
+        },
+      );
+    }
     return {
       threads: state.threads.map((thread) => ({
         id: thread.id,

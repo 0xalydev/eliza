@@ -8,26 +8,42 @@ import {
   Contacts,
   type CreateContactOptions,
 } from "@elizaos/capacitor-contacts";
+import { ElizaError } from "@elizaos/core";
 import type { ContactsViewCapabilityId } from "../view-capabilities";
-import { loadContactsState } from "./ContactsAppView.helpers";
+import { matchesQuery } from "./ContactsAppView.helpers";
 
 type ContactsCapabilityHandler = (
   params?: Record<string, unknown>,
 ) => Promise<unknown>;
+
+const COMPLETE_CONTACTS_READ_LIMIT = 2_147_483_647;
 
 const CONTACTS_CAPABILITY_HANDLERS: Record<
   ContactsViewCapabilityId,
   ContactsCapabilityHandler
 > = {
   "list-contacts": async (params) => {
-    const state = await loadContactsState({
-      query: typeof params?.query === "string" ? params.query : undefined,
-      limit: typeof params?.limit === "number" ? params.limit : undefined,
+    const query = typeof params?.query === "string" ? params.query.trim() : "";
+    const result = await Contacts.listContacts({
+      ...(query ? { query } : {}),
+      limit: COMPLETE_CONTACTS_READ_LIMIT,
     });
+    if (result.contacts.length === COMPLETE_CONTACTS_READ_LIMIT) {
+      throw new ElizaError(
+        "Contacts read reached the native bridge boundary; refusing to return a potentially incomplete address book.",
+        {
+          code: "NATIVE_CONTACTS_READ_INCOMPLETE",
+          context: { limit: COMPLETE_CONTACTS_READ_LIMIT },
+        },
+      );
+    }
+    const contacts = query
+      ? result.contacts.filter((contact) => matchesQuery(contact, query))
+      : result.contacts;
     return {
-      query: state.query,
-      count: state.count,
-      contacts: state.contacts.map((contact) => ({
+      query,
+      count: contacts.length,
+      contacts: contacts.map((contact) => ({
         id: contact.id,
         lookupKey: contact.lookupKey,
         displayName: contact.displayName,
