@@ -49,6 +49,22 @@ mock.module("../cloud-capabilities", () => ({
         mcp: { tool: "cloud.billing.cancel_resource" },
       },
     },
+    {
+      summary: "Use platform MCP.",
+      auth: { modes: ["session", "api_key", "admin"] },
+      surfaces: {
+        rest: { method: "POST", path: "/api/mcp" },
+        mcp: { tool: "cloud.mcp.platform" },
+      },
+    },
+    {
+      summary: "Administer users.",
+      auth: { modes: ["admin"], adminOnly: true },
+      surfaces: {
+        rest: { method: "GET", path: "/api/v1/admin/users" },
+        mcp: { tool: "cloud.admin.users" },
+      },
+    },
   ],
   getCloudProtocolCoverage: () => [],
 }));
@@ -116,6 +132,14 @@ describe("platform MCP billing cancellation authority", () => {
         (candidate) => candidate.name === "cloud.billing.active_resources",
       )?.access,
     ).toEqual({ effect: "read", authority: "member" });
+  });
+
+  test("mixed admin auth modes remain member-authorized unless adminOnly is explicit", () => {
+    const tools = listPlatformCloudMcpTools();
+    expect(tools.find((tool) => tool.name === "cloud.mcp.platform")?.access.authority).toBe(
+      "member",
+    );
+    expect(tools.find((tool) => tool.name === "cloud.admin.users")?.access.authority).toBe("admin");
   });
 
   test("uses the current authorized tenant and rechecks before infrastructure", async () => {

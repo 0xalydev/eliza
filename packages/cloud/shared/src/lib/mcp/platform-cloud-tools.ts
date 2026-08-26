@@ -105,7 +105,7 @@ function capabilityToolDefinitions(): McpToolDefinition[] {
     access: {
       effect: capability.surfaces.rest.method === "GET" ? "read" : "mutation",
       authority:
-        capability.auth.adminOnly || capability.auth.modes.includes("admin")
+        capability.auth.adminOnly === true
           ? "admin"
           : capability.auth.organizationRoles?.length
             ? "billing_manager"

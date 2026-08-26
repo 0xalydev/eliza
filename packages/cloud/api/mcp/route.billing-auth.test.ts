@@ -330,7 +330,8 @@ describe("configured platform MCP billing cancellation authority", () => {
     expect(requireAdmin).toHaveBeenCalledTimes(1);
     expect(requireCurrentBillingManagerSession).toHaveBeenCalledTimes(1);
     expect(requireUserOrApiKeyWithOrg).not.toHaveBeenCalled();
-    expect(await response.json()).toEqual([
+    const payload: unknown = await response.json();
+    expect(payload).toEqual([
       expect.objectContaining({
         id: "admin",
         error: expect.objectContaining({ code: -32000 }),

@@ -4,6 +4,7 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { pushSchema } from "drizzle-kit/api";
 import { eq, sql } from "drizzle-orm";
 
@@ -18,7 +19,7 @@ import {
   listRecoverableContainerStopIntents,
 } from "../../../lib/services/container-stop-job-service";
 import { getHetznerContainersClient } from "../../../lib/services/containers/hetzner-client/client";
-import { closeDatabaseConnectionsForTests, dbWrite } from "../../client";
+import { closeDatabaseConnectionsForTests, dbWrite, getPgliteClientForTests } from "../../client";
 import { agentSandboxes } from "../../schemas/agent-sandboxes";
 import { apiKeys } from "../../schemas/api-keys";
 import {
@@ -46,6 +47,10 @@ import { containerBillingRepository } from "../container-billing";
 import { containersRepository } from "../containers";
 
 const PGLITE_TIMEOUT = 60_000;
+const deletionBillingMigration = readFileSync(
+  new URL("../../migrations/0320_provider_unconfirmed_deletion_billing.sql", import.meta.url),
+  "utf8",
+).replaceAll("--> statement-breakpoint", "");
 let ready = true;
 
 beforeAll(async () => {
@@ -534,6 +539,84 @@ describe("compute billing recovery", () => {
       amount: "0.035000",
     });
     expect(runItem?.transaction_id).toBeTruthy();
+  });
+
+  test("migration-backed deletion states debit once and replay with zero effect", async () => {
+    const { org, user, sandbox } = await seed("20.000000");
+    await getPgliteClientForTests().exec(deletionBillingMigration);
+    try {
+      const transitionAt = new Date();
+      await dbWrite
+        .update(agentSandboxes)
+        .set({ status: "deletion_failed", updated_at: transitionAt })
+        .where(eq(agentSandboxes.id, sandbox.id));
+      const agentNow = new Date(transitionAt.getTime() + 2 * 60 * 60 * 1000);
+      const agentInput = {
+        ...(await claimBillingRun(agentNow)),
+        sandboxId: sandbox.id,
+        organizationId: org.id,
+        userId: user.id,
+        agentName: "deletion-failed-agent",
+        hourlyRate: 0.01,
+        billingDescription: "provider-unconfirmed agent compute",
+        lowCreditWarningAmount: 1,
+        now: agentNow,
+      };
+      const [agentFirst, agentReplay] = await Promise.all([
+        agentBillingRepository.recordHourlyBilling(agentInput),
+        agentBillingRepository.recordHourlyBilling(agentInput),
+      ]);
+      expect([agentFirst, agentReplay].filter((result) => result.status === "billed")).toHaveLength(
+        1,
+      );
+
+      const containerId = "00000000-0000-4000-8000-000000000099";
+      await dbWrite.insert(containers).values({
+        id: containerId,
+        organization_id: org.id,
+        user_id: user.id,
+        name: "deleting-container",
+        project_name: "deleting-container",
+        status: "deleting",
+        billing_status: "active",
+        desired_count: 1,
+        cpu: 1024,
+        memory: 2048,
+        last_billed_at: transitionAt,
+        next_billing_at: new Date(0),
+        created_at: transitionAt,
+        updated_at: transitionAt,
+      });
+      const containerInput = {
+        containerId,
+        organizationId: org.id,
+        userId: user.id,
+        containerName: "deleting-container",
+        dailyRate: 0.67,
+        earningsSourceUserId: null,
+        payAsYouGoFromEarnings: false,
+        newBalance: 0,
+        now: new Date(transitionAt.getTime() + 24 * 60 * 60 * 1000),
+      };
+      const first = await containerBillingRepository.recordSuccessfulDailyBilling(containerInput);
+      const replay = await containerBillingRepository.recordSuccessfulDailyBilling(containerInput);
+      expect(first).toMatchObject({ alreadyBilled: false });
+      expect(first.amount).toBeCloseTo(0.67, 4);
+      expect(replay).toMatchObject({ alreadyBilled: true, amount: 0 });
+
+      const segments = await dbWrite.execute(sql`SELECT workload_kind, billing_state, rate_per_hour
+        FROM compute_billing_rate_segments
+        WHERE workload_id IN (${sandbox.id}, ${containerId})
+        ORDER BY workload_kind, effective_at`);
+      expect(segments.rows.some((row) => row.billing_state !== "running")).toBe(false);
+      expect(await dbWrite.select().from(agentBillingRecords)).toHaveLength(1);
+      expect(await dbWrite.select().from(containerBillingRecords)).toHaveLength(1);
+    } finally {
+      await getPgliteClientForTests().exec(
+        `DROP TRIGGER IF EXISTS agent_compute_billing_rate_segment_append ON agent_sandboxes;
+         DROP TRIGGER IF EXISTS container_compute_billing_rate_segment_append ON containers;`,
+      );
+    }
   });
 
   test("insufficient credit rolls back the claim and creates no ledger or receipt", async () => {

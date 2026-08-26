@@ -227,7 +227,7 @@ export class ContainerBillingRepository {
     if (
       !locked ||
       (!options.forceLifecycleSettlement &&
-        (locked.status !== "running" ||
+        (!["running", "deleting"].includes(locked.status) ||
           !["active", "warning", "shutdown_pending"].includes(locked.billing_status) ||
           (locked.next_billing_at !== null && locked.next_billing_at > input.now)))
     ) {
