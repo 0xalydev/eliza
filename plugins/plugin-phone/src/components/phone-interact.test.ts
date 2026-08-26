@@ -171,6 +171,15 @@ describe("phone view capability bridge", () => {
     });
   });
 
+  it("rejects with a typed error when phone status is unavailable", async () => {
+    mockBridge();
+    phoneBridge.getStatus.mockRejectedValue(new Error("telecom unavailable"));
+
+    await expect(interact("phone-state")).rejects.toMatchObject({
+      code: "NATIVE_PHONE_STATUS_UNAVAILABLE",
+    });
+  });
+
   it("rejects an unsupported capability", async () => {
     await expect(interact("not-a-thing")).rejects.toThrow(
       'Unsupported capability "not-a-thing"',

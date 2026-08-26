@@ -6,6 +6,7 @@
 
 import type { CallLogEntry } from "@elizaos/capacitor-phone";
 import { Phone } from "@elizaos/capacitor-phone";
+import { ElizaError } from "@elizaos/core";
 
 const DEFAULT_CALL_LOG_LIMIT = 50;
 const MAX_CALL_LOG_LIMIT = 200;
@@ -44,7 +45,14 @@ export async function loadPhoneState(options?: {
   const normalizedNumber =
     typeof options?.number === "string" ? normalizeNumber(options.number) : "";
   const [status, recent] = await Promise.all([
-    Phone.getStatus().catch(() => null),
+    Phone.getStatus().catch((cause) => {
+      // error-policy:J2 phone status is part of phone-state; a native failure
+      // must remain distinct from a valid but unavailable device feature.
+      throw new ElizaError("Android phone status is unavailable", {
+        code: "NATIVE_PHONE_STATUS_UNAVAILABLE",
+        cause,
+      });
+    }),
     Phone.listRecentCalls({
       limit: options?.complete
         ? COMPLETE_CALL_LOG_READ_LIMIT

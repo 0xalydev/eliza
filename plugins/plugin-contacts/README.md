@@ -21,7 +21,7 @@ The plugin is **Android-only**. On other platforms the overlay app is not regist
 | Surface | Name | What it does |
 |---------|------|-------------|
 | Provider | `androidContacts` | Injects the complete read-only address book into the planner for `contacts` and `messaging` conversation contexts. Requires ADMIN role session. |
-| Overlay app (UI) | Contacts | ADMIN-gated address-book UI. Agents may invoke only the complete-or-error `list-contacts` read; create/import and generic fill/click controls require direct human interaction. |
+| Overlay app (UI) | Contacts | ADMIN-gated address-book UI. Agents may invoke only the complete-or-error `list-contacts` read; create/import and generic renderer state, element, focus, fill, and click operations require direct human interaction. |
 
 Note: live dialling is not part of this plugin. Placing a call remains in the Phone app (`PLACE_CALL` action).
 

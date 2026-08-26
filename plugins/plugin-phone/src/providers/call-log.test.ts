@@ -116,14 +116,17 @@ describe("phoneCallLogProvider", () => {
       new Error("READ_CALL_LOG denied"),
     );
 
+    const reportError = vi.fn();
     const result = await phoneCallLogProvider.get(
-      {} as never,
+      { reportError } as never,
       {} as never,
       {} as never,
     );
 
     expect(result).toEqual({
-      text: "",
+      text: JSON.stringify({
+        phone_call_log: { error: "READ_CALL_LOG denied" },
+      }),
       values: {
         callLogAvailable: false,
         callLogCount: 0,
@@ -135,5 +138,9 @@ describe("phoneCallLogProvider", () => {
         error: "READ_CALL_LOG denied",
       },
     });
+    expect(reportError).toHaveBeenCalledWith(
+      "phoneCallLog.provider",
+      expect.any(Error),
+    );
   });
 });

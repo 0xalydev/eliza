@@ -42,7 +42,7 @@ export const phoneCallLogProvider: Provider = {
   cacheStable: false,
 
   get: async (
-    _runtime: IAgentRuntime,
+    runtime: IAgentRuntime,
     _message: Memory,
     _state: State,
   ): Promise<ProviderResult> => {
@@ -89,8 +89,11 @@ export const phoneCallLogProvider: Provider = {
       };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // error-policy:J4 a native call-log failure is explicit planner context,
+      // not a successful empty history, and is observable to the owner.
+      runtime.reportError?.("phoneCallLog.provider", error);
       return {
-        text: "",
+        text: JSON.stringify({ phone_call_log: { error: message } }),
         values: {
           callLogAvailable: false,
           callLogCount: 0,

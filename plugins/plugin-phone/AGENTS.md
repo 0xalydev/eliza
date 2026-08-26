@@ -110,10 +110,11 @@ The `phoneCallLog` provider reads no env vars; it calls `Phone.listRecentCalls` 
   dispatch move with parity tests.
 - **View authority.** The native Phone view and call-log provider require
   `ADMIN`. The view intentionally omits `agent-surface`, so generic
-  `agent-fill`/`agent-click` cannot bypass the human-only call, dialer, or
-  transcript capabilities. `phone-state` requests the native signed 32-bit
-  maximum (`2,147,483,647`) and rejects if the bridge returns exactly that many
-  rows because no continuation contract exists.
+  renderer state, element, focus, fill, and click operations cannot bypass the
+  semantic contract. `phone-state` is the only planner-authorized capability;
+  it requests the native signed 32-bit maximum (`2,147,483,647`) and rejects if
+  the bridge returns exactly that many rows or native phone status is
+  unavailable.
 - **Contacts live in their own view.** The Phone view has no contacts pane — it links to the separate `@elizaos/plugin-contacts` view via `eliza:navigate:view` (`{ viewId: "contacts", viewPath: "/contacts" }`). Do not re-embed a contacts list or add a `@elizaos/capacitor-contacts` dependency here.
 - **Cross-view number handoff.** The Phone view consumes a one-shot `{ number }` payload via `consumeNavigateViewPayload("phone")` from `@elizaos/ui/app-navigate-view` on mount, pre-seeding the dialer. Callers dispatch `eliza:navigate:view` with `{ viewId: "phone", viewPath: "/phone", payload: { number } }`; the shared UI module must stay generic and contain no Phone-specific pending state.
 - **`ElizaIntentWeb` does not simulate success.** The web fallback for the iOS native bridge explicitly returns `paired: false` and throws on `scheduleAlarm` — intentional, to prevent dev builds from appearing to work without a simulator.

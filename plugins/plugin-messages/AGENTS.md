@@ -98,12 +98,14 @@ import messagesPlugin from "@elizaos/plugin-messages";
 - **SMS role vs bridge mode.** The UI shows two modes: "Default SMS app" (owns the role, full inbox) and "Android SMS bridge" (read-only via the capacitor bridge, no role held). Agents can request the role via the interact handler.
 - **Interact authority.** The view requires `ADMIN` and intentionally omits the
   generic `agent-surface` grant. Agents may dispatch only `list-threads`;
-  `send-sms`, `request-sms-role`, and generic fill/click attempts are rejected
-  before mounted-view dispatch. Direct renderer calls remain the human UI path.
+  `send-sms`, `request-sms-role`, and generic renderer state, element, focus,
+  fill, and click attempts are human-only and rejected before mounted-view
+  dispatch. Direct renderer calls remain the human UI path.
 - **Complete reads.** `list-threads` always requests the native maximum and
   rejects with a typed incomplete-read error if 500 rows are returned. The
   bridge has no continuation token, so a bounded prefix is never presented to
-  the planner as complete history.
+  the planner as complete history. Failure to read Android SMS-role status is
+  likewise a typed failure, not fabricated `ownsSmsRole: false` state.
 - **Cross-view recipient handoff.** `MessagesView` consumes a one-shot `{ recipient }` payload via `consumeNavigateViewPayload("messages")` from `@elizaos/ui/app-navigate-view` on mount, opening the composer with the "To" field pre-seeded. Callers dispatch `eliza:navigate:view` with `{ viewId: "messages", viewPath: "/messages", payload: { recipient } }`; the shared UI module must stay generic and contain no Messages-specific pending state.
 - **Spatial view.** `MessagesSpatialView` is a presentational component retained for future modality adapters. It is purely presentational (a snapshot + action callback in, spatial primitives out) and does not import Capacitor runtime code.
 

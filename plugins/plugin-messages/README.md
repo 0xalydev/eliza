@@ -54,7 +54,7 @@ await interact("send-sms", { address: "+15550100", body: "Hello" });
 await interact("request-sms-role");
 ```
 
-Planner dispatch requires an `ADMIN` caller. Only `list-threads` is agent-authorized; it rejects rather than returning a possibly incomplete 500-message prefix. `send-sms`, `request-sms-role`, and generic agent fill/click operations are denied before mounted-view dispatch.
+Planner dispatch requires an `ADMIN` caller. Only `list-threads` is agent-authorized; it rejects rather than returning a possibly incomplete 500-message prefix or fabricated SMS-role state. `send-sms`, `request-sms-role`, and generic renderer state, element, focus, fill, and click operations are denied before mounted-view dispatch.
 
 ## Dependencies
 

@@ -169,6 +169,15 @@ describe("interact view capabilities", () => {
     expect(bridge.listMessages).toHaveBeenLastCalledWith({ limit: 500 });
   });
 
+  it("rejects with a typed error when SMS role status is unavailable", async () => {
+    mockBridge();
+    bridge.getStatus.mockRejectedValue(new Error("role service unavailable"));
+
+    await expect(interact("list-threads")).rejects.toMatchObject({
+      code: "NATIVE_MESSAGES_STATUS_UNAVAILABLE",
+    });
+  });
+
   it("rejects malformed send-sms payloads without calling native send", async () => {
     mockBridge();
 

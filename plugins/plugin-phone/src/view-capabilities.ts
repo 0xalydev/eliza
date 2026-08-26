@@ -61,7 +61,23 @@ export const PHONE_VIEW_CAPABILITIES = [
       },
     },
   },
+  ...[
+    "get-state",
+    "get-text",
+    "list-elements",
+    "describe-element",
+    "get-focus",
+    "get-agent-state",
+  ].map((id) => ({
+    id,
+    description:
+      "Inspect renderer-owned state or elements outside the complete semantic phone read.",
+    authority: "human" as const,
+  })),
 ] as const satisfies readonly ViewCapability[];
 
 export type PhoneViewCapabilityId =
-  (typeof PHONE_VIEW_CAPABILITIES)[number]["id"];
+  | "phone-state"
+  | "place-call"
+  | "open-dialer"
+  | "save-call-transcript";

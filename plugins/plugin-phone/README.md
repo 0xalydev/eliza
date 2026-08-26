@@ -17,7 +17,7 @@ A three-screen Capacitor surface (Chat, Pairing, Remote Session) that runs insid
 | Surface | What the agent gains |
 |---------|---------------------|
 | `phoneCallLog` provider | Complete read-only Android call history injected into the agent's context for questions about prior calls. Requires `ADMIN` role. Available in `contacts` and `messaging` contexts. |
-| `/phone` view | ADMIN-gated GUI dialer + transcript UI. Agents may invoke only complete-or-error `phone-state`; call, dialer, transcript, and generic fill/click mutations require direct human interaction. |
+| `/phone` view | ADMIN-gated GUI dialer + transcript UI. Agents may invoke only complete-or-error `phone-state`; call, dialer, transcript, and generic renderer state, element, focus, fill, and click operations require direct human interaction. |
 | `/phone-companion` nav tab | iOS companion surface (pairing, chat-mirror, remote-session). |
 
 ## Enabling the plugin
@@ -38,7 +38,7 @@ The Android overlay registers automatically when the host is the elizaOS Android
 
 The native `@elizaos/capacitor-phone` plugin requires `READ_CALL_LOG` and `CALL_PHONE` permissions in the host APK's `AndroidManifest.xml`. The plugin surface renders correctly without these permissions, but call-log and call-placement features will fail at runtime.
 
-Planner-facing call-log reads request the native signed 32-bit maximum (`2,147,483,647`) and reject if that boundary is reached, because the bridge has no continuation token. The UI's normal recent-call projection remains capped at 200. The view does not grant generic agent-surface control, so human-only mutations cannot be reached through element fill/click operations.
+Planner-facing call-log reads request the native signed 32-bit maximum (`2,147,483,647`) and reject if that boundary is reached, because the bridge has no continuation token. Phone-status failures are explicit typed failures rather than successful null state. The UI's normal recent-call projection remains capped at 200. The view does not grant generic agent-surface control, and generic renderer reads and writes are classified human-only.
 
 ## Environment / config
 

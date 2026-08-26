@@ -424,25 +424,56 @@ it("keeps every classified native mutation outside planner dispatch", async () =
   expect(nativeBridge.saveCallTranscript).not.toHaveBeenCalled();
 });
 
-it("rejects generic agent-fill and agent-click mutation bypasses before mounted dispatch", async () => {
+it("rejects every generic DOM/state bypass before mounted dispatch", async () => {
   const bypasses = [
     ["contacts", "agent-fill", { id: "contact-create-name", value: "Ada" }],
     ["contacts", "agent-click", { id: "contact-create-save" }],
     ["messages", "agent-fill", { id: "composer-body", value: "hello" }],
     ["messages", "agent-click", { id: "send-message" }],
     ["phone", "agent-click", { id: "place-call" }],
+    ...(
+      [
+        "get-state",
+        "get-text",
+        "list-elements",
+        "describe-element",
+        "get-focus",
+        "get-agent-state",
+      ] as const
+    ).flatMap((capability) =>
+      (["contacts", "messages", "phone"] as const).map(
+        (view) => [view, capability, undefined] as const,
+      ),
+    ),
   ] as const;
 
   for (const [view, capability, params] of bypasses) {
     const result = await invoke(ChannelType.DM, view, capability, params);
     expect(result.success).toBe(false);
-    expect(result.text).toBe(`Interact with view "${view}" failed (HTTP 403).`);
+    expect(result.text).toMatch(
+      /requires direct human interaction|failed \(HTTP 403\)/,
+    );
   }
 
   expect(dispatched).toEqual([]);
   expect(nativeBridge.createContact).not.toHaveBeenCalled();
   expect(nativeBridge.sendSms).not.toHaveBeenCalled();
   expect(nativeBridge.placeCall).not.toHaveBeenCalled();
+});
+
+it("returns typed failures when native role or phone status cannot be read", async () => {
+  nativeBridge.getSystemStatus.mockRejectedValueOnce(
+    new Error("ROLE_SERVICE_UNAVAILABLE"),
+  );
+  const messages = await invoke(ChannelType.DM, "messages", "list-threads");
+  expect(messages.success).toBe(false);
+
+  nativeBridge.getPhoneStatus.mockRejectedValueOnce(
+    new Error("TELECOM_SERVICE_UNAVAILABLE"),
+  );
+  const phone = await invoke(ChannelType.VOICE_DM, "phone", "phone-state");
+  expect(phone.success).toBe(false);
+  expect(dispatched).toEqual([]);
 });
 
 it("denies USER callers at the real HTTP interaction boundary", async () => {
