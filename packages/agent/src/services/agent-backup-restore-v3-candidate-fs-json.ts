@@ -39,6 +39,10 @@ export interface PublishAgentBackupRestoreV3CandidateDurableJsonOptions {
   readonly maximumBytes: number;
 }
 
+export interface ReadAgentBackupRestoreV3CandidateDurableJsonOptions {
+  readonly maximumBytes: number;
+}
+
 export function candidateFsCanonicalJson(value: unknown): string {
   const seen = new WeakSet<object>();
   let nodes = 0;
@@ -321,17 +325,7 @@ async function reconcileDurableJsonPublication(
   }
 }
 
-export async function readCandidateFsCanonicalJson(
-  authority: AgentBackupRestoreV3CandidateFsControl,
-  name: string,
-  maximumBytes: number,
-  control: Readonly<AgentBackupRestoreV3OperationControl>,
-): Promise<unknown | null> {
-  await reconcileDurableJsonPublication(authority, name, control);
-  await authority.syncAttemptRoot(control);
-  const filePath = authority.directPath(name, "durable JSON name");
-  const bytes = await readBoundRegularFile(filePath, maximumBytes, control);
-  if (bytes === null) return null;
+function decodeCandidateFsCanonicalJson(bytes: Uint8Array): unknown {
   try {
     let text: string;
     try {
@@ -368,6 +362,81 @@ export async function readCandidateFsCanonicalJson(
     return parsed;
   } finally {
     bytes.fill(0);
+  }
+}
+
+/** Descriptor-bound canonical read with no reconciliation or filesystem write. */
+export async function readCandidateFsCanonicalJsonReadOnly(
+  authority: AgentBackupRestoreV3CandidateFsControl,
+  name: string,
+  maximumBytes: number,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+): Promise<unknown | null> {
+  const filePath = authority.directPath(name, "durable JSON name");
+  const bytes = await readBoundRegularFile(filePath, maximumBytes, control);
+  return bytes === null ? null : decodeCandidateFsCanonicalJson(bytes);
+}
+
+export async function readCandidateFsCanonicalJson(
+  authority: AgentBackupRestoreV3CandidateFsControl,
+  name: string,
+  maximumBytes: number,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+): Promise<unknown | null> {
+  await reconcileDurableJsonPublication(authority, name, control);
+  await authority.syncAttemptRoot(control);
+  return readCandidateFsCanonicalJsonReadOnly(
+    authority,
+    name,
+    maximumBytes,
+    control,
+  );
+}
+
+/**
+ * Reads one canonical durable JSON value while holding the candidate inode
+ * lock. This public read path is strictly read-only and never reconciles,
+ * creates, links, unlinks, or fsyncs a durable binding.
+ */
+export async function readCandidateFsDurableJson(
+  authority: AgentBackupRestoreV3CandidateFsControl,
+  name: string,
+  options: Readonly<ReadAgentBackupRestoreV3CandidateDurableJsonOptions>,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  heldLock?: AgentBackupRestoreV3CandidateFsLock,
+): Promise<unknown | null> {
+  const maximumBytes = requirePositiveSafeInteger(
+    options?.maximumBytes,
+    "maximumBytes",
+  );
+  const exactName = requireControlName(name, "durable JSON name");
+  await authority.assertAuthority(control);
+  const operationLock = await authority.operationLock(
+    `.read-${createHash("sha256").update(exactName).digest("hex").slice(0, 16)}`,
+    control,
+    heldLock,
+  );
+  const activeLock = operationLock ?? heldLock;
+  if (!activeLock) {
+    candidateFsError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LOCK_INVALID",
+      "Candidate JSON read did not obtain an exact inode-lock lease",
+    );
+  }
+  try {
+    await authority.assertLockHeld(activeLock, control);
+    const result = await readCandidateFsCanonicalJsonReadOnly(
+      authority,
+      exactName,
+      maximumBytes,
+      control,
+    );
+    await authority.assertLockHeld(activeLock, control);
+    return result;
+  } finally {
+    if (operationLock) {
+      await operationLock.release(internalCleanupControl());
+    }
   }
 }
 

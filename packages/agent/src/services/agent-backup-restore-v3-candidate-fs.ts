@@ -15,14 +15,19 @@ import {
   type AgentBackupRestoreV3CandidateDurableJsonReceipt,
   type PublishAgentBackupRestoreV3CandidateDurableJsonOptions,
   publishCandidateFsDurableJson,
+  type ReadAgentBackupRestoreV3CandidateDurableJsonOptions,
+  readCandidateFsDurableJson,
 } from "./agent-backup-restore-v3-candidate-fs-json";
 import {
+  type AgentBackupRestoreV3CandidatePayloadRead,
   type AgentBackupRestoreV3CandidatePayloadReceipt,
   type AgentBackupRestoreV3CandidatePayloadWriter,
   type CreateAgentBackupRestoreV3CandidatePayloadOptions,
   createCandidateFsPayload,
   type ProveAgentBackupRestoreV3CandidatePayloadOptions,
   proveCandidateFsPayload,
+  type ReadAgentBackupRestoreV3CandidatePayloadOptions,
+  readCandidateFsPayload,
 } from "./agent-backup-restore-v3-candidate-fs-payload";
 import {
   type AgentBackupRestoreV3CandidateCleanupLimits,
@@ -44,11 +49,14 @@ export {
 export type {
   AgentBackupRestoreV3CandidateDurableJsonReceipt,
   PublishAgentBackupRestoreV3CandidateDurableJsonOptions,
+  ReadAgentBackupRestoreV3CandidateDurableJsonOptions,
 } from "./agent-backup-restore-v3-candidate-fs-json";
 export type {
+  AgentBackupRestoreV3CandidatePayloadRead,
   AgentBackupRestoreV3CandidatePayloadReceipt,
   CreateAgentBackupRestoreV3CandidatePayloadOptions,
   ProveAgentBackupRestoreV3CandidatePayloadOptions,
+  ReadAgentBackupRestoreV3CandidatePayloadOptions,
 } from "./agent-backup-restore-v3-candidate-fs-payload";
 export { AgentBackupRestoreV3CandidatePayloadWriter } from "./agent-backup-restore-v3-candidate-fs-payload";
 export type {
@@ -145,6 +153,38 @@ export class AgentBackupRestoreV3CandidateFs {
       this.#control,
       name,
       expectedValue,
+      options,
+      control,
+      heldLock,
+    );
+  }
+
+  readPayload(
+    name: string,
+    expectedValue: Readonly<AgentBackupRestoreV3CandidatePayloadReceipt>,
+    options: Readonly<ReadAgentBackupRestoreV3CandidatePayloadOptions>,
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    heldLock?: AgentBackupRestoreV3CandidateFsLock,
+  ): Promise<Readonly<AgentBackupRestoreV3CandidatePayloadRead>> {
+    return readCandidateFsPayload(
+      this.#control,
+      name,
+      expectedValue,
+      options,
+      control,
+      heldLock,
+    );
+  }
+
+  readDurableJson(
+    name: string,
+    options: Readonly<ReadAgentBackupRestoreV3CandidateDurableJsonOptions>,
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    heldLock?: AgentBackupRestoreV3CandidateFsLock,
+  ): Promise<unknown | null> {
+    return readCandidateFsDurableJson(
+      this.#control,
+      name,
       options,
       control,
       heldLock,

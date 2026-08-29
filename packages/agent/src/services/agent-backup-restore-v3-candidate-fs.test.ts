@@ -16,7 +16,12 @@ import {
 
 const roots = new Set<string>();
 const candidates = new Set<AgentBackupRestoreV3CandidateFs>();
-const OWNER_TOKEN = "owner-token-for-candidate-fs-tests";
+const OWNER_TOKEN = new TextEncoder().encode(
+  "owner-capability-for-candidate-fs-tests",
+);
+const OTHER_OWNER_TOKEN = new TextEncoder().encode(
+  "other-owner-capability-for-fs-tests",
+);
 
 function operationControl(signal = new AbortController().signal) {
   return {
@@ -300,6 +305,67 @@ describe("restore-v3 candidate filesystem", () => {
     });
   });
 
+  it("reads an owned proved payload atomically from its bound descriptor", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const writer = await candidate.createPayload(
+      "record.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(Buffer.from("exact-record"), control);
+    const receipt = await writer.finalize(control);
+
+    const read = await candidate.readPayload(
+      "record.payload",
+      receipt,
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(read.receipt).toEqual(receipt);
+    expect(Buffer.from(read.payload).toString("utf8")).toBe("exact-record");
+    read.payload.fill(0);
+
+    await expect(
+      candidate.readPayload(
+        "record.payload",
+        receipt,
+        {
+          maximumBytes: 64,
+          ownerToken: OTHER_OWNER_TOKEN,
+        },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_CONFLICT",
+    });
+    await expect(
+      candidate.readPayload(
+        "record.payload",
+        receipt,
+        {
+          maximumBytes: 256 * 1024 + 1,
+          ownerToken: OWNER_TOKEN,
+        },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_READ_LIMIT",
+    });
+
+    await fs.writeFile(path.join(attemptRoot, "record.payload"), "changed");
+    await expect(
+      candidate.readPayload(
+        "record.payload",
+        receipt,
+        { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
+    });
+  });
+
   it("refuses payload symlinks, hardlinks, overflow, and pathname swaps", async () => {
     const { candidate, attemptRoot } = await fixture();
     const control = operationControl();
@@ -384,7 +450,7 @@ describe("restore-v3 candidate filesystem", () => {
         "recoverable.payload",
         {
           maximumBytes: 64,
-          ownerToken: "another-owner-token-for-candidate-fs-test",
+          ownerToken: OTHER_OWNER_TOKEN,
         },
         control,
       ),
@@ -465,6 +531,13 @@ describe("restore-v3 candidate filesystem", () => {
     await expect(
       fs.readFile(path.join(attemptRoot, "receipt.json")),
     ).resolves.toEqual(expectedBytes);
+    await expect(
+      candidate.readDurableJson(
+        "receipt.json",
+        { maximumBytes: 1_024 },
+        control,
+      ),
+    ).resolves.toEqual({ a: { enabled: true }, z: 2 });
 
     const staleLock = path.join(attemptRoot, ".receipt.json.publish.lock");
     await writePrivateFile(staleLock, "interrupted publisher");
