@@ -1,4 +1,4 @@
-/** Replay, drift, and fail-closed proofs for restore-v3 candidate migrations 0370/0371. */
+/** Replay, drift, and fail-closed proofs for restore-v3 candidate migrations 0370-0372. */
 
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -21,8 +21,10 @@ import { AGENT_BACKUP_RESTORE_V3_CANDIDATE_COMPONENTS } from "./schemas/agent-ba
 const MIGRATIONS_DIR = join(import.meta.dir, "migrations");
 const FOUNDATION_TAG = "0370_agent_backup_restore_v3_candidates";
 const GUARDS_TAG = "0371_agent_backup_restore_v3_candidate_guards";
+const POST_LOCK_CLOCK_TAG = "0372_agent_backup_restore_v3_candidate_post_lock_clock";
 const FOUNDATION = readFileSync(join(MIGRATIONS_DIR, `${FOUNDATION_TAG}.sql`), "utf8");
 const GUARDS = readFileSync(join(MIGRATIONS_DIR, `${GUARDS_TAG}.sql`), "utf8");
+const POST_LOCK_CLOCK = readFileSync(join(MIGRATIONS_DIR, `${POST_LOCK_CLOCK_TAG}.sql`), "utf8");
 const CANDIDATE_SCHEMA = readFileSync(
   join(import.meta.dir, "schemas", "agent-backup-restore-v3-candidates.ts"),
   "utf8",
@@ -206,6 +208,10 @@ async function applyFoundation(database: PGlite): Promise<void> {
 
 async function applyGuards(database: PGlite): Promise<void> {
   await database.exec(GUARDS);
+}
+
+async function applyPostLockClock(database: PGlite): Promise<void> {
+  await database.exec(POST_LOCK_CLOCK);
 }
 
 interface SeededAuthority {
@@ -416,7 +422,7 @@ async function expectBeginRejected(
   }
 }
 
-describe("0370/0371 restore-v3 candidate authority", () => {
+describe("0370-0372 restore-v3 candidate authority", () => {
   test("registers consecutive journal entries and exports the schema", () => {
     const journal = JSON.parse(
       readFileSync(join(MIGRATIONS_DIR, "meta", "_journal.json"), "utf8"),
@@ -429,13 +435,36 @@ describe("0370/0371 restore-v3 candidate authority", () => {
         breakpoints: boolean;
       }>;
     };
-    expect(journal.entries.slice(-2)).toEqual([
+    expect(journal.entries.slice(-3)).toEqual([
       { idx: 353, version: "7", when: 1794254400061, tag: FOUNDATION_TAG, breakpoints: true },
       { idx: 354, version: "7", when: 1794254400062, tag: GUARDS_TAG, breakpoints: true },
+      {
+        idx: 355,
+        version: "7",
+        when: 1794254400063,
+        tag: POST_LOCK_CLOCK_TAG,
+        breakpoints: true,
+      },
     ]);
     expect(readFileSync(join(import.meta.dir, "schemas", "index.ts"), "utf8")).toContain(
       'export * from "./agent-backup-restore-v3-candidates"',
     );
+  });
+
+  test("installs idempotent post-lock wall-clock expiry guards after 0371", async () => {
+    expect(POST_LOCK_CLOCK).toContain("clock_timestamp()");
+    expect(POST_LOCK_CLOCK).not.toContain("statement_timestamp()");
+    expect(POST_LOCK_CLOCK).toContain("zz_agent_backup_restore_v3_seal_auth_post_lock_clock_guard");
+    expect(POST_LOCK_CLOCK).toContain("zz_agent_backup_restore_v3_terminal_post_lock_clock_guard");
+    const database = await prerequisiteDatabase();
+    try {
+      await applyFoundation(database);
+      await applyGuards(database);
+      await applyPostLockClock(database);
+      await applyPostLockClock(database);
+    } finally {
+      await database.close();
+    }
   });
 
   test("shares the exact component contract and descriptor vocabulary", () => {
@@ -534,7 +563,9 @@ describe("0370/0371 restore-v3 candidate authority", () => {
     ])
       expect(FOUNDATION + GUARDS).toContain(proof);
     expect(GUARDS.match(/BEFORE TRUNCATE/g)).toHaveLength(6);
-    const oversizedIdentifiers = [...(FOUNDATION + GUARDS).matchAll(/"([A-Za-z0-9_]+)"/g)]
+    const oversizedIdentifiers = [
+      ...(FOUNDATION + GUARDS + POST_LOCK_CLOCK).matchAll(/"([A-Za-z0-9_]+)"/g),
+    ]
       .map((match) => match[1] as string)
       .filter((identifier) => identifier.length > 63);
     expect(oversizedIdentifiers).toEqual([]);
@@ -545,8 +576,10 @@ describe("0370/0371 restore-v3 candidate authority", () => {
     try {
       await applyFoundation(database);
       await applyGuards(database);
+      await applyPostLockClock(database);
       await applyFoundation(database);
       await applyGuards(database);
+      await applyPostLockClock(database);
       const authority = await seedCurrentAuthority(database);
       await expectBeginRejected(
         database,

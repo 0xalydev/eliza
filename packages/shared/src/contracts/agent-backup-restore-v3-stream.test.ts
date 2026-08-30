@@ -33,6 +33,7 @@ import {
   type AgentBackupRestoreV3SourceAuthority,
   canonicalizeAgentBackupRestoreV3AuthorityFence,
   canonicalizeAgentBackupRestoreV3CandidateReceipt,
+  canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationRequest,
   canonicalizeAgentBackupRestoreV3ExactReadReceiptProof,
   canonicalizeAgentBackupRestoreV3SourceAuthority,
   computeAgentBackupRestoreV3ExactReadReceiptSha256,
@@ -679,6 +680,20 @@ describe("agent backup restore-v3 stream contract", () => {
     expect(validated.binding.objectCount).toBe(6);
     expect(validated.binding.candidateReceiptSha256).toMatch(/^[0-9a-f]{64}$/);
     expect(request.candidate).toEqual(validated.binding);
+    const reorderedRequest = {
+      candidate: request.candidate,
+      sessionExecutionToken: request.sessionExecutionToken,
+      authority: request.authority,
+    };
+    expect(
+      canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationRequest(
+        request,
+      ),
+    ).toBe(
+      canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationRequest(
+        reorderedRequest,
+      ),
+    );
     expect(Object.isFrozen(validated.sourceAuthority.objects)).toBe(true);
     const canonical = canonicalizeAgentBackupRestoreV3SourceAuthority(
       validated.sourceAuthority,
