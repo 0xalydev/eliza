@@ -120,6 +120,15 @@ export interface ReadAgentBackupRestoreV3CandidateRecordInput {
   readonly componentIndex: number;
   readonly dataIndex: number;
   readonly control: Readonly<AgentBackupRestoreV3OperationControl>;
+  /** Exact caller-held attempt lock for bounded component materialization. */
+  readonly heldLock?: AgentBackupRestoreV3CandidateFsLock;
+}
+
+export interface BindAgentBackupRestoreV3CandidateRecordSessionInput {
+  readonly candidateFs: AgentBackupRestoreV3CandidateFs;
+  readonly session: Readonly<AgentBackupRestoreV3StagingSession>;
+  readonly control: Readonly<AgentBackupRestoreV3OperationControl>;
+  readonly heldLock?: AgentBackupRestoreV3CandidateFsLock;
 }
 
 export class AgentBackupRestoreV3CandidateRecordError extends ElizaError {
@@ -427,6 +436,22 @@ function buildSessionJournal(
     ...body,
     sessionSha256: sha256Utf8(candidateFsCanonicalJson(body)),
   });
+}
+
+/** Privacy-safe binding shared by downstream candidate materializers. */
+export function snapshotAgentBackupRestoreV3CandidateSession(
+  sessionInput: Readonly<AgentBackupRestoreV3StagingSession>,
+): Readonly<AgentBackupRestoreV3StagingSession> {
+  return snapshotSession(sessionInput);
+}
+
+/** Privacy-safe binding shared by downstream candidate materializers. */
+export function computeAgentBackupRestoreV3CandidateSessionSha256(
+  sessionInput: Readonly<AgentBackupRestoreV3StagingSession>,
+): string {
+  return buildSessionJournal(
+    snapshotAgentBackupRestoreV3CandidateSession(sessionInput),
+  ).sessionSha256;
 }
 
 function validateSessionJournal(
@@ -1264,6 +1289,56 @@ export function stageAgentBackupRestoreV3CandidateRecord(
   });
 }
 
+/** Creates or exactly replays the durable inbox binding, including for 0 records. */
+export async function bindAgentBackupRestoreV3CandidateRecordSession(
+  input: Readonly<BindAgentBackupRestoreV3CandidateRecordSessionInput>,
+): Promise<string> {
+  const session = snapshotSession(input.session);
+  const ownsLock = input.heldLock === undefined;
+  let lock: AgentBackupRestoreV3CandidateFsLock | null = null;
+  let result: string | null = null;
+  let primaryFailure: unknown;
+  try {
+    lock =
+      input.heldLock ??
+      (await input.candidateFs.acquireLock(RECORD_LOCK_NAME, input.control));
+    await input.candidateFs.assertLockHeld(lock, input.control);
+    const journal = await createOrReplaySessionJournal(
+      input.candidateFs,
+      session,
+      input.control,
+      lock,
+    );
+    result = journal.sessionSha256;
+  } catch (cause) {
+    primaryFailure = cause;
+  }
+  let cleanupFailure: unknown;
+  if (lock && ownsLock) {
+    try {
+      await lock.release(input.control);
+    } catch (cause) {
+      cleanupFailure = cause;
+    }
+  }
+  if (primaryFailure !== undefined && cleanupFailure !== undefined) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CLEANUP_FAILED",
+      "Candidate record session binding and bounded cleanup both failed",
+      new AggregateError([primaryFailure, cleanupFailure]),
+    );
+  }
+  if (primaryFailure !== undefined) throw primaryFailure;
+  if (cleanupFailure !== undefined) throw cleanupFailure;
+  if (!result) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_SESSION_INVALID",
+      "Candidate record session binding ended without an exact digest",
+    );
+  }
+  return result;
+}
+
 /** Reads one immutable record and its already-proved FD-bound payload. */
 export async function readAgentBackupRestoreV3CandidateRecord(
   input: Readonly<ReadAgentBackupRestoreV3CandidateRecordInput>,
@@ -1282,12 +1357,16 @@ export async function readAgentBackupRestoreV3CandidateRecord(
     );
   }
   let lock: AgentBackupRestoreV3CandidateFsLock | null = null;
+  const ownsLock = input.heldLock === undefined;
   let payload: Uint8Array | null = null;
   let receipt: Readonly<AgentBackupRestoreV3CandidateRecordReceipt> | null =
     null;
   let primaryFailure: unknown;
   try {
-    lock = await input.candidateFs.acquireLock(RECORD_LOCK_NAME, input.control);
+    lock =
+      input.heldLock ??
+      (await input.candidateFs.acquireLock(RECORD_LOCK_NAME, input.control));
+    await input.candidateFs.assertLockHeld(lock, input.control);
     const sessionJournal = await requireExistingSessionJournal(
       input.candidateFs,
       session,
@@ -1330,7 +1409,7 @@ export async function readAgentBackupRestoreV3CandidateRecord(
 
   let cleanupFailure: unknown;
   try {
-    if (lock) {
+    if (lock && ownsLock) {
       await lock.release(input.control);
       lock = null;
     }

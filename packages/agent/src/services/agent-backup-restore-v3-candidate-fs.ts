@@ -6,6 +6,16 @@
 
 import type { AgentBackupRestoreV3OperationControl } from "@elizaos/shared";
 import {
+  type AgentBackupRestoreV3CandidateFileTreeFileProof,
+  type AgentBackupRestoreV3CandidateFileTreeFileSpec,
+  type AgentBackupRestoreV3CandidateFileTreeLimits,
+  type AgentBackupRestoreV3CandidateFileTreeProof,
+  type AgentBackupRestoreV3CandidateFileTreeWriter,
+  createCandidateFsFileTreeFile,
+  ensureCandidateFsFileTreeDirectory,
+  proveCandidateFsFileTree,
+} from "./agent-backup-restore-v3-candidate-file-tree";
+import {
   AgentBackupRestoreV3CandidateFsControl,
   type AgentBackupRestoreV3CandidateFsIdentity,
   type AgentBackupRestoreV3CandidateFsLock,
@@ -38,6 +48,16 @@ import {
   proveCandidateFsTree,
 } from "./agent-backup-restore-v3-candidate-fs-tree";
 
+export type {
+  AgentBackupRestoreV3CandidateFileTreeFileProof,
+  AgentBackupRestoreV3CandidateFileTreeFileSpec,
+  AgentBackupRestoreV3CandidateFileTreeLimits,
+  AgentBackupRestoreV3CandidateFileTreeProof,
+} from "./agent-backup-restore-v3-candidate-file-tree";
+export {
+  AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS,
+  AgentBackupRestoreV3CandidateFileTreeWriter,
+} from "./agent-backup-restore-v3-candidate-file-tree";
 export type {
   AgentBackupRestoreV3CandidateFsIdentity,
   OpenAgentBackupRestoreV3CandidateFsInput,
@@ -217,6 +237,57 @@ export class AgentBackupRestoreV3CandidateFs {
     return proveCandidateFsTree(
       this.#control,
       relativeDirectory,
+      limitsValue,
+      control,
+      heldLock,
+    );
+  }
+
+  ensureFileTreeDirectory(
+    relativeDirectory: string,
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    heldLock?: AgentBackupRestoreV3CandidateFsLock,
+  ): Promise<void> {
+    return ensureCandidateFsFileTreeDirectory(
+      this.#control,
+      relativeDirectory,
+      control,
+      heldLock,
+    );
+  }
+
+  createFileTreeFile(
+    relativeDirectory: string,
+    spec: Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec>,
+    limitsValue:
+      | Partial<AgentBackupRestoreV3CandidateFileTreeLimits>
+      | undefined,
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    heldLock?: AgentBackupRestoreV3CandidateFsLock,
+  ): Promise<AgentBackupRestoreV3CandidateFileTreeWriter> {
+    return createCandidateFsFileTreeFile(
+      this.#control,
+      relativeDirectory,
+      spec,
+      limitsValue,
+      control,
+      heldLock,
+    );
+  }
+
+  proveFileTree(
+    relativeDirectory: string,
+    expected: readonly Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>[],
+    limitsValue:
+      | Partial<AgentBackupRestoreV3CandidateFileTreeLimits>
+      | undefined,
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    heldLock?: AgentBackupRestoreV3CandidateFsLock,
+  ): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeProof>> {
+    return proveCandidateFsFileTree(
+      this.#control,
+      relativeDirectory,
+      expected,
       limitsValue,
       control,
       heldLock,
