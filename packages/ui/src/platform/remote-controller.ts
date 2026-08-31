@@ -82,14 +82,14 @@ function isOpenedStartReceipt(
   );
 }
 
-let nativeRemoteController: NativeRemoteControllerPlugin | null = null;
+let cachedNativeRemoteController: NativeRemoteControllerPlugin | undefined;
 
-function getNativeRemoteController(): NativeRemoteControllerPlugin {
-  nativeRemoteController ??=
+function nativeRemoteController(): NativeRemoteControllerPlugin {
+  cachedNativeRemoteController ??=
     Capacitor.registerPlugin<NativeRemoteControllerPlugin>(
       "RemoteControllerIdentity",
     );
-  return nativeRemoteController;
+  return cachedNativeRemoteController;
 }
 
 function isNativeController(): boolean {
@@ -126,7 +126,7 @@ export async function getOrCreateRemoteControllerIdentity(input: {
     );
   }
   if (isNativeController()) {
-    const identity = await getNativeRemoteController().getOrCreateIdentity({
+    const identity = await nativeRemoteController().getOrCreateIdentity({
       ownerId: input.ownerId,
       displayName: input.displayName ?? "My iPhone",
       platform: Capacitor.getPlatform(),
@@ -183,7 +183,7 @@ export async function createRemoteCommand(input: {
   bindingDigest: string;
 }> {
   if (isNativeController()) {
-    const result = await getNativeRemoteController().createCommand({
+    const result = await nativeRemoteController().createCommand({
       ownerId: input.ownerId,
       grantId: input.grantId,
       grantRevision: input.grantRevision,
@@ -236,7 +236,7 @@ export async function acknowledgeRemoteCommandEnqueue(input: {
   bindingDigest: string;
 }): Promise<boolean> {
   if (isNativeController()) {
-    const result = await getNativeRemoteController().acknowledgeEnqueue(input);
+    const result = await nativeRemoteController().acknowledgeEnqueue(input);
     if (!isRecord(result) || typeof result.acknowledged !== "boolean") {
       throw new Error("Secure mobile enqueue acknowledgement is unavailable.");
     }
@@ -260,7 +260,7 @@ export async function openRemoteCommandResult(input: {
   targetIdentity: RemoteTargetPublicIdentity;
 }): Promise<{ status: string; result?: RemoteJsonValue; errorCode?: string }> {
   if (isNativeController()) {
-    const result = await getNativeRemoteController().openResult(input);
+    const result = await nativeRemoteController().openResult(input);
     if (!isOpenedResult(result))
       throw new Error("Secure mobile result decryption is unavailable.");
     return result;
@@ -287,7 +287,7 @@ export async function openRemoteCommandStartReceipt(input: {
   targetIdentity: RemoteTargetPublicIdentity;
 }): Promise<{ startedAt: number; executionId: string }> {
   if (isNativeController()) {
-    const result = await getNativeRemoteController().openStartReceipt(input);
+    const result = await nativeRemoteController().openStartReceipt(input);
     if (!isOpenedStartReceipt(result))
       throw new Error(
         "Secure mobile start receipt verification is unavailable.",
@@ -314,7 +314,7 @@ export async function clearRemoteControllerSessionState(input: {
   sessionId: string;
 }): Promise<boolean> {
   if (isNativeController()) {
-    const result = await getNativeRemoteController().clearSessionState(input);
+    const result = await nativeRemoteController().clearSessionState(input);
     if (!isRecord(result) || typeof result.cleared !== "boolean") {
       throw new Error("Secure mobile session cleanup is unavailable.");
     }

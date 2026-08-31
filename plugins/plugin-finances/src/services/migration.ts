@@ -24,6 +24,7 @@
  */
 
 import { type IAgentRuntime, logger, Service } from "@elizaos/core";
+import { runCarveOutMigration } from "@elizaos/plugin-sql";
 
 export const FINANCES_LOG_PREFIX = "[Finances]";
 export const FINANCES_MIGRATION_SERVICE_TYPE = "finances_migration";
@@ -54,7 +55,12 @@ export type SqlExecutor = (
 export interface TableMigrationResult {
   table: MigratedFinanceTable;
   /** `"copied"` ran the INSERT; otherwise the reason it was skipped. */
-  outcome: "copied" | "source-missing" | "target-non-empty";
+  outcome:
+    | "copied"
+    | "source-missing"
+    | "target-non-empty"
+    | "already-migrated"
+    | "migration-in-progress";
 }
 
 function quoteIdent(name: string): string {
@@ -124,7 +130,23 @@ export async function migrateFinanceTables(
   await exec(`CREATE SCHEMA IF NOT EXISTS ${TARGET_SCHEMA}`);
   const results: TableMigrationResult[] = [];
   for (const table of MIGRATED_FINANCE_TABLES) {
-    results.push(await migrateFinanceTable(exec, table));
+    const receipt = await runCarveOutMigration(exec, {
+      key: `finances/${table}/v1`,
+      run: () => migrateFinanceTable(exec, table),
+      outcome: (result) => result.outcome,
+      shouldComplete: (result) => result.outcome !== "source-missing",
+    });
+    results.push(
+      receipt.status === "completed"
+        ? receipt.value
+        : {
+            table,
+            outcome:
+              receipt.status === "already-completed"
+                ? "already-migrated"
+                : "migration-in-progress",
+          },
+    );
   }
   return results;
 }

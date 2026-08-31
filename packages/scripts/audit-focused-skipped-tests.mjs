@@ -1036,6 +1036,26 @@ export function findConditionalSkipSites(filePath, content) {
         ) {
           record(node, `conditional-${modifier}`);
         }
+      } else if (isRunnerReference(chain)) {
+        for (const argument of node.arguments) {
+          const options = unwrapExpression(argument);
+          if (!ts.isObjectLiteralExpression(options)) continue;
+          for (const property of options.properties) {
+            if (
+              !ts.isPropertyAssignment(property) ||
+              !(
+                ts.isIdentifier(property.name) ||
+                ts.isStringLiteralLike(property.name)
+              ) ||
+              !["skip", "todo"].includes(property.name.text)
+            ) {
+              continue;
+            }
+            if (staticTruthiness(property.initializer) === undefined) {
+              record(property, `conditional-option-${property.name.text}`);
+            }
+          }
+        }
       }
       if (modifier === null && isRunnerReference(chain)) {
         for (const argument of node.arguments) {
@@ -1311,6 +1331,11 @@ function selfTest() {
       name: "conditional: skipIf with a runtime condition is a site",
       src: 'describe.skipIf(!hasBackend)("store", () => {});',
       expect: ["skipIf"],
+    },
+    {
+      name: "conditional: runtime skip option is a site",
+      src: 'test("platform contract", { skip: process.platform !== "win32" ? "Windows only" : false }, () => {});',
+      expect: ["conditional-option-skip"],
     },
     {
       name: "conditional: statically-true skipIf is not runtime-conditional",
