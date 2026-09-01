@@ -1,7 +1,10 @@
 /** Behavioral contract for the /auth/bridge route component — role switching by injected hostname, the mint leg's referrer gate + session gate + challenge-bound code mint + cross-origin bounce, and the exchange leg's state-nonce/verifier verification with burn-on-refusal — jsdom + real render, hand-rolled fetch/navigation stubs. */
 // @vitest-environment jsdom
 
-import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
+import {
+  registerStewardTokenPersistence,
+  STEWARD_TOKEN_KEY,
+} from "@elizaos/shared/steward-session-client";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import {
@@ -95,6 +98,10 @@ function renderBridge(hostname: string, search: string): void {
     <MemoryRouter initialEntries={[`/auth/bridge${search}`]}>
       <Routes>
         <Route path="/login" element={<LocationProbe id="login-page" />} />
+        <Route
+          path="/auth/error"
+          element={<LocationProbe id="auth-error-page" />}
+        />
         <Route path="/" element={<LocationProbe id="home-page" />} />
         <Route
           path="/auth/bridge"
@@ -410,6 +417,30 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
     expect(
       fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/mint")),
     ).toHaveLength(1);
+    expect(
+      fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/burn")),
+    ).toHaveLength(1);
+    expect(JSON.parse(String(fetchLog[1].init?.body))).toEqual({ code: CODE });
+  });
+
+  it("burns once and exposes an unexpected handoff failure distinctly", async () => {
+    setReferrer("https://cloud.eliza.app/");
+    localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
+    stubNetwork((url) =>
+      url.endsWith("/api/auth/sso-bridge/mint")
+        ? json(200, { ok: true, code: CODE })
+        : new Response(null, { status: 204 }),
+    );
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+      throw new Error("Unexpected navigation adapter failure");
+    };
+
+    renderBridge("eliza.app", MINT_QS);
+
+    expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
+      "/auth/error?reason=auth_failed",
+    );
     expect(
       fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/burn")),
     ).toHaveLength(1);
@@ -750,6 +781,33 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
       `?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
     );
     expect(await screen.findByTestId("login-page")).toBeTruthy();
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("surfaces an unexpected token-persistence failure distinctly", async () => {
+    armHandshake();
+    stubNetwork((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token: liveToken() })
+        : json(200, { ok: true }),
+    );
+    const unregister = registerStewardTokenPersistence(async () => {
+      throw new Error("secure-store persistence failed");
+    });
+
+    try {
+      renderBridge(
+        "cloud.eliza.app",
+        `?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
+      );
+      expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
+        "/auth/error?reason=sync_failed",
+      );
+    } finally {
+      unregister();
+    }
+
+    expect(screen.queryByTestId("login-page")).toBeNull();
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
   });
 

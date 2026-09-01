@@ -112,6 +112,21 @@ describe("JoinPage managed-app SSO handoff", () => {
     await waitFor(() => expect(replacedUrls).toHaveLength(1));
   });
 
+  it("surfaces an unexpected bridge-start failure instead of disguising it as login", async () => {
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+      throw new Error("Unexpected navigation adapter failure");
+    };
+
+    render(<JoinPage />);
+
+    expect((await screen.findByTestId("navigate")).textContent).toBe(
+      "/auth/error?reason=auth_failed",
+    );
+    expect(replacedUrls).toHaveLength(1);
+    expect(runJoinFlowMock).not.toHaveBeenCalled();
+  });
+
   it("resolves identity exactly once after the bridge restores authentication", async () => {
     authenticatedRef.current = true;
     runJoinFlowMock.mockResolvedValue({ agentId: "agent-1" });

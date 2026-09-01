@@ -79,6 +79,11 @@ function LoginProbe(): React.JSX.Element {
   return <div data-testid="login-page">{location.search}</div>;
 }
 
+function AuthErrorProbe(): React.JSX.Element {
+  const location = useLocation();
+  return <div data-testid="auth-error-page">{location.search}</div>;
+}
+
 function renderEntry(initialPath = "/"): void {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -88,6 +93,7 @@ function renderEntry(initialPath = "/"): void {
       <MemoryRouter initialEntries={[initialPath]}>
         <Routes>
           <Route path="/login" element={<LoginProbe />} />
+          <Route path="/auth/error" element={<AuthErrorProbe />} />
           <Route path="/join" element={<div data-testid="join-page" />} />
           <Route
             path="*"
@@ -188,6 +194,21 @@ describe("AppModeEntryRoute — SSO auto-bridge (managed app origin)", () => {
 
     // The fallback render must not start a second bridge attempt.
     await waitFor(() => expect(replacedUrls).toHaveLength(1));
+  });
+
+  it("surfaces an unexpected bridge-start failure instead of disguising it as login", async () => {
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+      throw new Error("Unexpected navigation adapter failure");
+    };
+
+    renderEntry("/chat?x=1");
+
+    expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
+      "?reason=auth_failed",
+    );
+    expect(screen.queryByTestId("login-page")).toBeNull();
+    expect(replacedUrls).toHaveLength(1);
   });
 
   it("an authenticated rerender cannot erase an in-flight logout marker", async () => {

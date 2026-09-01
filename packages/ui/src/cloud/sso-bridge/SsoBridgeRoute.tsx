@@ -18,15 +18,18 @@
  *  - every other hostname (localhost, previews, per-agent subdomains): inert —
  *    an immediate local redirect home, no bridge code paths reachable.
  *
- * Every failure path lands on the app origin's OWN /login (the loop-guard
- * marker set at initiation keeps that login from bouncing back here), and the
- * transient legs use replace-style navigation so Back never re-enters the
- * handshake.
+ * Expected handshake failures land on the app origin's OWN /login (the
+ * loop-guard marker set at initiation keeps that login from bouncing back
+ * here). Unexpected lifecycle failures use the distinct local /auth/error
+ * surface, and the transient legs use replace-style navigation so Back never
+ * re-enters the handshake.
  */
 
+import { ElizaError } from "@elizaos/core";
 import { useEffect, useRef, useState } from "react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { Card } from "../../components/ui/card";
+import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { hasHydratableStewardToken } from "../lib/steward-session";
 import {
@@ -179,12 +182,7 @@ async function runMintLegOperation(
     if (!mintedCode) return;
     const code = mintedCode;
     mintedCode = null;
-    try {
-      burnSsoBridgeCode(code, hostname);
-    } catch {
-      // error-policy:J6 the abandoned code still expires after its short
-      // server TTL; clearing local custody keeps this teardown exactly-once.
-    }
+    burnSsoBridgeCode(code, hostname);
   };
 
   try {
@@ -210,10 +208,16 @@ async function runMintLegOperation(
       kind: "redirect",
       url,
     };
-  } catch {
-    // A late failure after mint must not leave a live code without a consumer.
+  } catch (error) {
+    // error-policy:J2 a late failure after mint first relinquishes local code
+    // custody, then reaches the UI boundary as a typed failure with its cause.
     burnMintedCodeOnce();
-    return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
+    throw new ElizaError("SSO mint handoff failed after code issuance", {
+      code: "SSO_BRIDGE_MINT_HANDOFF_FAILED",
+      cause: error,
+      severity: "fatal",
+      context: { hostname },
+    });
   }
 }
 
@@ -235,6 +239,7 @@ function MintLeg({
   } | null>(null);
   const effectGenerationRef = useRef(0);
   const [notInitiated, setNotInitiated] = useState(false);
+  const [unexpectedFailure, setUnexpectedFailure] = useState(false);
 
   useEffect(() => {
     const effectGeneration = effectGenerationRef.current + 1;
@@ -254,15 +259,22 @@ function MintLeg({
     operationRef.current = operation;
     operation.activeEffects.add(effectGeneration);
 
-    const redirectToAppLogin = (): void => {
+    const redirectToAppLogin = (): boolean => {
       const appOrigin = pairedAppOrigin(hostname);
       try {
         appModeNavigation.replace(
           appOrigin ? appLoginUrl(appOrigin, returnTo) : "/",
         );
-      } catch {
-        // error-policy:J6 navigation is unavailable; any owned code has already
-        // been burned and its short server TTL remains the final boundary.
+        return true;
+      } catch (error) {
+        // error-policy:J1 the UI navigation boundary reports the browser error;
+        // its caller renders the distinct authentication-error route.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.login-navigation",
+          error,
+          severity: "error",
+        });
+        return false;
       }
     };
 
@@ -285,15 +297,35 @@ function MintLeg({
         try {
           appModeNavigation.replace(outcome.url);
           outcome.handoff?.transfer();
-        } catch {
+        } catch (error) {
+          // error-policy:J1 report the failed handoff navigation at the UI
+          // boundary before burning custody. Only the expected browser-policy
+          // rejection degrades to the safe login path.
+          reportRendererDiagnostic({
+            scope: "steward.sso-bridge.handoff-navigation",
+            error,
+            severity: "error",
+          });
           outcome.handoff?.burn();
-          redirectToAppLogin();
+          if (
+            !(
+              error instanceof DOMException && error.name === "SecurityError"
+            ) ||
+            !redirectToAppLogin()
+          ) {
+            setUnexpectedFailure(true);
+          }
         }
       })
-      .catch(() => {
-        // error-policy:J4 an unforeseen operation failure must still leave the
-        // current user on a recoverable terminal surface.
-        if (effectIsCurrent()) redirectToAppLogin();
+      .catch((error) => {
+        // error-policy:J1 an unforeseen lifecycle rejection is reported and
+        // becomes a visibly distinct error route rather than ordinary login.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.mint-lifecycle",
+          error,
+          severity: "error",
+        });
+        if (effectIsCurrent()) setUnexpectedFailure(true);
       });
 
     return () => {
@@ -304,6 +336,9 @@ function MintLeg({
     };
   }, [hostname, state, challenge, returnTo]);
 
+  if (unexpectedFailure) {
+    return <Navigate to="/auth/error?reason=auth_failed" replace />;
+  }
   if (notInitiated) {
     return <Navigate to="/" replace />;
   }
@@ -372,6 +407,9 @@ function ExchangeLeg({
   const [failedOperationKey, setFailedOperationKey] = useState<string | null>(
     null,
   );
+  const [unexpectedFailureKey, setUnexpectedFailureKey] = useState<
+    string | null
+  >(null);
 
   useEffect(() => {
     const effectGeneration = effectGenerationRef.current + 1;
@@ -409,10 +447,15 @@ function ExchangeLeg({
         }
         setFailedOperationKey(operationKey);
       })
-      .catch(() => {
-        // error-policy:J4 an unforeseen operation failure leaves only the
-        // current generation on the ordinary recoverable login path.
-        if (effectIsCurrent()) setFailedOperationKey(operationKey);
+      .catch((error) => {
+        // error-policy:J1 an unforeseen exchange lifecycle rejection is
+        // reported and translated to the distinct auth-error route.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.exchange-lifecycle",
+          error,
+          severity: "error",
+        });
+        if (effectIsCurrent()) setUnexpectedFailureKey(operationKey);
       });
 
     return () => {
@@ -423,6 +466,9 @@ function ExchangeLeg({
     };
   }, [hostname, code, state, returnTo, navigate, operationKey]);
 
+  if (unexpectedFailureKey === operationKey) {
+    return <Navigate to="/auth/error?reason=sync_failed" replace />;
+  }
   if (failedOperationKey === operationKey) {
     return (
       <Navigate

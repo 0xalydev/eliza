@@ -51,6 +51,7 @@ import {
   writeStoredStewardTokenIfCurrent,
 } from "@elizaos/shared/steward-session-client";
 import { shellLocalStorage } from "../../surface-realm-channel";
+import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { decodeJwtPayload } from "../lib/jwt";
 import {
@@ -417,8 +418,22 @@ export async function redirectToSsoBridge(
   );
   if (!url) return false;
   markSsoBridgeAttempt();
-  appModeNavigation.replace(url);
-  return true;
+  try {
+    appModeNavigation.replace(url);
+    return true;
+  } catch (error) {
+    // error-policy:J4 only the expected browser navigation-policy rejection
+    // degrades to local login; every other failure remains exceptional.
+    if (!(error instanceof DOMException && error.name === "SecurityError")) {
+      throw error;
+    }
+    reportRendererDiagnostic({
+      scope: "steward.sso-bridge.start-navigation",
+      error,
+      severity: "warning",
+    });
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -458,8 +473,9 @@ export async function mintSsoCode(
   }
   const token = readStoredStewardToken();
   if (!token) return { ok: false, error: "No local session" };
+  let res: Response;
   try {
-    const res = await fetchFn(`${base}/api/auth/sso-bridge/mint`, {
+    res = await fetchFn(`${base}/api/auth/sso-bridge/mint`, {
       method: "POST",
       credentials: "include",
       headers: {
@@ -468,16 +484,6 @@ export async function mintSsoCode(
       },
       body: JSON.stringify({ codeChallenge: challenge }),
     });
-    if (!res.ok)
-      return { ok: false, error: `Mint failed (HTTP ${res.status})` };
-    const body = (await res.json().catch(() => null)) as {
-      code?: unknown;
-    } | null;
-    const code = typeof body?.code === "string" ? body.code : null;
-    if (!code || !isWellFormedSsoCode(code)) {
-      return { ok: false, error: "Mint returned no usable code" };
-    }
-    return { ok: true, code };
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
     // bridge route turns into its fall-back-to-login redirect.
@@ -486,6 +492,25 @@ export async function mintSsoCode(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+  if (!res.ok) return { ok: false, error: `Mint failed (HTTP ${res.status})` };
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    // error-policy:J3 a malformed upstream response is explicit invalid input,
+    // never a fabricated empty success envelope.
+    return { ok: false, error: "Mint returned no usable code" };
+  }
+  const code =
+    body && typeof body === "object" && "code" in body
+      ? typeof body.code === "string"
+        ? body.code
+        : null
+      : null;
+  if (!code || !isWellFormedSsoCode(code)) {
+    return { ok: false, error: "Mint returned no usable code" };
+  }
+  return { ok: true, code };
 }
 
 export type SsoExchangeResult = { ok: true } | { ok: false; error: string };
@@ -503,12 +528,14 @@ const SSO_COOKIE_SYNC_TIMEOUT_MS = 10_000;
 function serializeSsoExchangeFinalization<T>(
   operation: () => Promise<T>,
 ): Promise<T> {
-  const result = ssoExchangeFinalizationTail
-    .catch(() => undefined)
-    .then(operation);
+  const result = ssoExchangeFinalizationTail.then(operation);
   ssoExchangeFinalizationTail = result.then(
     () => undefined,
-    () => undefined,
+    () => {
+      // error-policy:J5 the originating caller observes `result`; this tail
+      // handler only releases the queue so one failed generation cannot strand
+      // every later login or logout operation.
+    },
   );
   return result;
 }
@@ -549,84 +576,13 @@ export async function performSsoExchange(
     return { ok: false, error: "Malformed code verifier" };
   }
   const logoutEpochAtStart = ssoLogoutEpoch;
+  let res: Response;
   try {
-    const res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
+    res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
       method: "POST",
       credentials: "include",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code, codeVerifier: verifier }),
-    });
-    if (!res.ok) {
-      return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
-    }
-    const body = (await res.json().catch(() => null)) as {
-      token?: unknown;
-    } | null;
-    const token = typeof body?.token === "string" ? body.token : null;
-    if (!token || !tokenLooksHydratable(token)) {
-      return { ok: false, error: "Exchange returned no usable session" };
-    }
-    if (!isCurrent()) {
-      return { ok: false, error: "SSO exchange superseded" };
-    }
-
-    return await serializeSsoExchangeFinalization(async () => {
-      const persisted = await writeStoredStewardTokenIfCurrent(
-        token,
-        () => logoutEpochAtStart === ssoLogoutEpoch && isCurrent(),
-      );
-      if (
-        !persisted ||
-        logoutEpochAtStart !== ssoLogoutEpoch ||
-        readStoredStewardToken() !== token
-      ) {
-        return { ok: false, error: "SSO exchange superseded" };
-      }
-
-      const sessionEndpoint = configuredSessionEndpoint();
-      const cookieSyncAbortController = new AbortController();
-      activeSsoCookieSyncAbortController = cookieSyncAbortController;
-      const cookieSyncTimeout = window.setTimeout(
-        () => cookieSyncAbortController.abort(),
-        SSO_COOKIE_SYNC_TIMEOUT_MS,
-      );
-      let cookieSyncResponse: Response | null = null;
-      try {
-        cookieSyncResponse = await fetchFn(sessionEndpoint, {
-          method: "POST",
-          credentials: "include",
-          signal: cookieSyncAbortController.signal,
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ token }),
-        });
-      } catch {
-        // error-policy:J6 best-effort cookie sync; the committed local session
-        // remains authoritative and AuthTokenSync retries on its own cadence.
-      } finally {
-        window.clearTimeout(cookieSyncTimeout);
-        if (activeSsoCookieSyncAbortController === cookieSyncAbortController) {
-          activeSsoCookieSyncAbortController = null;
-        }
-      }
-
-      const stillOwnsFinalization =
-        logoutEpochAtStart === ssoLogoutEpoch &&
-        readStoredStewardToken() === token;
-      if (!stillOwnsFinalization) {
-        return { ok: false, error: "SSO exchange superseded" };
-      }
-      if (cookieSyncResponse?.ok) {
-        markStewardServerCookieSynced(token, sessionEndpoint);
-      }
-      clearSsoBridgeAttempt();
-      clearSsoLoggedOut();
-      try {
-        window.dispatchEvent(new CustomEvent("steward-token-sync"));
-      } catch {
-        // error-policy:J6 best-effort notification; storage listeners re-read
-        // on their own triggers.
-      }
-      return { ok: true };
     });
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
@@ -636,6 +592,102 @@ export async function performSsoExchange(
       error: err instanceof Error ? err.message : String(err),
     };
   }
+  if (!res.ok) {
+    return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
+  }
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch {
+    // error-policy:J3 a malformed upstream response is explicit invalid input,
+    // never a fabricated empty success envelope.
+    return { ok: false, error: "Exchange returned no usable session" };
+  }
+  const token =
+    body && typeof body === "object" && "token" in body
+      ? typeof body.token === "string"
+        ? body.token
+        : null
+      : null;
+  if (!token || !tokenLooksHydratable(token)) {
+    return { ok: false, error: "Exchange returned no usable session" };
+  }
+  if (!isCurrent()) {
+    return { ok: false, error: "SSO exchange superseded" };
+  }
+
+  // Persistence/finalization errors are deliberately outside the transport
+  // catch above. They reach the route boundary as unexpected failures instead
+  // of being disguised as an ordinary expired/replayed-code login recovery.
+  return await serializeSsoExchangeFinalization(async () => {
+    const persisted = await writeStoredStewardTokenIfCurrent(
+      token,
+      () => logoutEpochAtStart === ssoLogoutEpoch && isCurrent(),
+    );
+    if (
+      !persisted ||
+      logoutEpochAtStart !== ssoLogoutEpoch ||
+      readStoredStewardToken() !== token
+    ) {
+      return { ok: false, error: "SSO exchange superseded" };
+    }
+
+    const sessionEndpoint = configuredSessionEndpoint();
+    const cookieSyncAbortController = new AbortController();
+    activeSsoCookieSyncAbortController = cookieSyncAbortController;
+    const cookieSyncTimeout = window.setTimeout(
+      () => cookieSyncAbortController.abort(),
+      SSO_COOKIE_SYNC_TIMEOUT_MS,
+    );
+    let cookieSyncResponse: Response | null = null;
+    try {
+      cookieSyncResponse = await fetchFn(sessionEndpoint, {
+        method: "POST",
+        credentials: "include",
+        signal: cookieSyncAbortController.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token }),
+      });
+    } catch (error) {
+      // error-policy:J6 best-effort cookie sync; the committed local session
+      // remains authoritative and AuthTokenSync retries on its own cadence.
+      // Report the failed teardown/sync attempt instead of swallowing it.
+      reportRendererDiagnostic({
+        scope: "steward.sso-bridge.cookie-sync",
+        error,
+        severity: "warning",
+      });
+    } finally {
+      window.clearTimeout(cookieSyncTimeout);
+      if (activeSsoCookieSyncAbortController === cookieSyncAbortController) {
+        activeSsoCookieSyncAbortController = null;
+      }
+    }
+
+    const stillOwnsFinalization =
+      logoutEpochAtStart === ssoLogoutEpoch &&
+      readStoredStewardToken() === token;
+    if (!stillOwnsFinalization) {
+      return { ok: false, error: "SSO exchange superseded" };
+    }
+    if (cookieSyncResponse?.ok) {
+      markStewardServerCookieSynced(token, sessionEndpoint);
+    }
+    clearSsoBridgeAttempt();
+    clearSsoLoggedOut();
+    try {
+      window.dispatchEvent(new CustomEvent("steward-token-sync"));
+    } catch (error) {
+      // error-policy:J7 the durable token is already authoritative; report a
+      // failed optional renderer notification without changing the result.
+      reportRendererDiagnostic({
+        scope: "steward.sso-bridge.session-notification",
+        error,
+        severity: "warning",
+      });
+    }
+    return { ok: true };
+  });
 }
 
 /**
@@ -651,16 +703,31 @@ export function burnSsoBridgeCode(
 ): void {
   const base = apiBaseForHostname(hostname);
   if (!base || !isWellFormedSsoCode(code)) return;
-  void fetchFn(`${base}/api/auth/sso-bridge/burn`, {
-    method: "POST",
-    credentials: "include",
-    keepalive: true,
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ code }),
-  }).catch(() => {
-    // error-policy:J6 best-effort destruction of an already-abandoned code;
-    // the code still dies on its own 60s TTL.
-  });
+  try {
+    void fetchFn(`${base}/api/auth/sso-bridge/burn`, {
+      method: "POST",
+      credentials: "include",
+      keepalive: true,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+    }).catch((error) => {
+      // error-policy:J6 best-effort destruction of an already-abandoned code;
+      // report the failure while the code's 60s TTL remains the final boundary.
+      reportRendererDiagnostic({
+        scope: "steward.sso-bridge.code-burn",
+        error,
+        severity: "warning",
+      });
+    });
+  } catch (error) {
+    // error-policy:J6 a fetch adapter may reject synchronously during teardown;
+    // report it and rely on the same short server-side expiry boundary.
+    reportRendererDiagnostic({
+      scope: "steward.sso-bridge.code-burn",
+      error,
+      severity: "warning",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------

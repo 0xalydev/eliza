@@ -421,6 +421,33 @@ describe("performSsoExchange", () => {
     expect(isSsoLoggedOut()).toBe(false);
   });
 
+  it("propagates an unexpected token-persistence failure", async () => {
+    const persistenceFailure = new Error("secure-store persistence failed");
+    const unregister = registerStewardTokenPersistence(async () => {
+      throw persistenceFailure;
+    });
+    const { fn, calls } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token: liveToken() })
+        : json(200, { ok: true }),
+    );
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).rejects.toMatchObject({
+        name: "StewardTokenPersistenceError",
+        message: persistenceFailure.message,
+        cause: persistenceFailure,
+      });
+    } finally {
+      unregister();
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
   it("refuses a superseded exchange while token persistence is queued without follow-up effects", async () => {
     markSsoBridgeAttempt();
     markSsoLoggedOut();

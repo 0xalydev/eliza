@@ -22,6 +22,7 @@ import {
   savePersistedActiveServer,
   savePersistedFirstRunComplete,
 } from "../../state/persistence";
+import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { publishPersonalEntryHandoff } from "../app-mode/use-personal-entry";
 import { useCloudT } from "../shell/CloudI18nProvider";
@@ -57,6 +58,7 @@ export default function JoinPage(): React.JSX.Element {
       : resolveApexJoinHandoff(window.location.hostname);
   const ssoDecisionRef = useRef(false);
   const [ssoBridging, setSsoBridging] = useState<boolean | null>(null);
+  const [ssoBridgeFailed, setSsoBridgeFailed] = useState(false);
   // Guard so React StrictMode's double-mount does not duplicate identity reads.
   const startedRef = useRef(false);
   const activeAttemptRef = useRef<{
@@ -133,16 +135,20 @@ export default function JoinPage(): React.JSX.Element {
         setSsoBridging(false);
         return;
       }
-      void redirectToSsoBridge("/join").then(
-        (started) => {
+      void redirectToSsoBridge("/join")
+        .then((started) => {
           setSsoBridging(started);
-        },
-        () => {
-          // error-policy:J4 a browser policy may block the full-page navigation;
-          // reveal the ordinary login/recovery route instead of spinning forever.
-          setSsoBridging(false);
-        },
-      );
+        })
+        .catch((error) => {
+          // error-policy:J1 an unexpected bridge-start failure is reported at
+          // the UI boundary and rendered as a distinct authentication error.
+          reportRendererDiagnostic({
+            scope: "steward.sso-bridge.join-entry",
+            error,
+            severity: "error",
+          });
+          setSsoBridgeFailed(true);
+        });
       return;
     }
     if (appHandoff) {
@@ -204,6 +210,9 @@ export default function JoinPage(): React.JSX.Element {
   );
 
   // Signed out → send to login, returning here once authenticated.
+  if (session.ready && !session.authenticated && ssoBridgeFailed) {
+    return <Navigate to="/auth/error?reason=auth_failed" replace />;
+  }
   if (session.ready && !session.authenticated && ssoBridging === false) {
     return <Navigate to="/login?returnTo=/join" replace />;
   }

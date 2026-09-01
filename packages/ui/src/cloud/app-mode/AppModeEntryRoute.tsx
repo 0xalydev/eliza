@@ -24,6 +24,7 @@
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Navigate, useLocation } from "react-router-dom";
 import { loadPersistedActiveServer } from "../../state/persistence";
+import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
 import { useAgents } from "../instances/lib/data/eliza-agents";
 import { useSessionAuth } from "../lib/use-session-auth";
 import {
@@ -80,6 +81,7 @@ export function AppModeEntryRoute({
   // cookies/storage/clock, and it is single-shot per mount.
   const ssoDecisionRef = useRef(false);
   const [ssoBridging, setSsoBridging] = useState<boolean | null>(null);
+  const [ssoBridgeFailed, setSsoBridgeFailed] = useState(false);
   useEffect(() => {
     if (!ready) return;
     if (authenticated) return;
@@ -91,14 +93,18 @@ export function AppModeEntryRoute({
     }
     // Async because the handshake hashes the PKCE verifier before leaving;
     // `ssoBridging` stays null (holding the notice) until it resolves.
-    void redirectToSsoBridge(`${location.pathname}${location.search}`).then(
-      (started) => setSsoBridging(started),
-      () => {
-        // error-policy:J4 a browser policy may block the full-page navigation;
-        // reveal the ordinary login/recovery route instead of spinning forever.
-        setSsoBridging(false);
-      },
-    );
+    void redirectToSsoBridge(`${location.pathname}${location.search}`)
+      .then((started) => setSsoBridging(started))
+      .catch((error) => {
+        // error-policy:J1 an unexpected bridge-start failure is reported at the
+        // UI boundary and rendered as a distinct authentication error.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.app-entry",
+          error,
+          severity: "error",
+        });
+        setSsoBridgeFailed(true);
+      });
   }, [ready, authenticated, location]);
 
   if (!ready) {
@@ -106,6 +112,9 @@ export function AppModeEntryRoute({
   }
 
   if (!authenticated) {
+    if (ssoBridgeFailed) {
+      return <Navigate to="/auth/error?reason=auth_failed" replace />;
+    }
     if (ssoBridging !== false) {
       // Decision pending (first paint before the effect) or the full-page
       // bounce to the auth-origin mint leg is in flight — hold a notice, never
