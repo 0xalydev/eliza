@@ -41,6 +41,7 @@ import {
   pairedAppOrigin,
   performSsoExchange,
   SSO_BRIDGE_PATH,
+  type SsoBridgeFetch,
   sanitizeBridgeReturnTo,
   ssoBridgeRoleForHostname,
 } from "./sso-bridge";
@@ -309,6 +310,46 @@ function MintLeg({
   return <BridgeNotice label="Connecting to the Eliza app" />;
 }
 
+/** Consume and validate one app-origin handshake before exchanging its code. */
+async function runExchangeLegOperation(
+  hostname: string,
+  code: string | null,
+  state: string | null,
+  operationIsCurrent: () => boolean,
+): Promise<boolean> {
+  // State nonce first, before ANY network call: the stored value is consumed
+  // single-shot, and only an exact echo of what THIS origin created may
+  // proceed. A well-formed code refused before exchange is burned so it cannot
+  // remain redeemable in the address bar or request logs for the rest of its
+  // TTL.
+  const stored = consumeSsoBridgeState();
+  const verifier = consumeSsoBridgeVerifier();
+  const stateOk =
+    stored !== null && isWellFormedSsoState(state) && stored === state;
+  if (!stateOk || !isWellFormedSsoCode(code) || verifier === null) {
+    if (isWellFormedSsoCode(code)) burnSsoBridgeCode(code, hostname);
+    return false;
+  }
+
+  const generationBoundFetch: SsoBridgeFetch = async (input, init) => {
+    const response = await fetch(input, init);
+    if (!operationIsCurrent()) {
+      // Reject the response before performSsoExchange can publish its token.
+      // Its transport boundary maps this superseded leg to a typed failure.
+      throw new Error("SSO exchange operation is no longer current");
+    }
+    return response;
+  };
+  const result = await performSsoExchange(
+    code,
+    verifier,
+    hostname,
+    generationBoundFetch,
+    operationIsCurrent,
+  );
+  return result.ok;
+}
+
 function ExchangeLeg({
   hostname,
   code,
@@ -320,40 +361,69 @@ function ExchangeLeg({
   state: string | null;
   returnTo: string;
 }): React.JSX.Element {
-  const startedRef = useRef(false);
+  const operationKey = JSON.stringify([hostname, code, state]);
+  const operationRef = useRef<{
+    activeEffects: Set<number>;
+    key: string;
+    promise: Promise<boolean>;
+  } | null>(null);
+  const effectGenerationRef = useRef(0);
   const navigate = useNavigate();
-  const [failed, setFailed] = useState(false);
+  const [failedOperationKey, setFailedOperationKey] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
-    if (startedRef.current) return;
-    startedRef.current = true;
+    const effectGeneration = effectGenerationRef.current + 1;
+    effectGenerationRef.current = effectGeneration;
+    const effectIsCurrent = () =>
+      effectGenerationRef.current === effectGeneration;
+    const previousOperation = operationRef.current;
+    const operation =
+      previousOperation?.key === operationKey
+        ? previousOperation
+        : (() => {
+            const activeEffects = new Set<number>();
+            return {
+              activeEffects,
+              key: operationKey,
+              promise: runExchangeLegOperation(
+                hostname,
+                code,
+                state,
+                () =>
+                  operationRef.current?.activeEffects === activeEffects &&
+                  activeEffects.size > 0,
+              ),
+            };
+          })();
+    operationRef.current = operation;
+    operation.activeEffects.add(effectGeneration);
 
-    // State nonce first, before ANY network call: the stored value is
-    // consumed single-shot, and only an exact echo of what THIS origin
-    // created may proceed. Missing/mismatched state (a handshake this origin
-    // never initiated — login CSRF) aborts to the local login; the code is
-    // never EXCHANGED, but a well-formed one is BURNED so it cannot sit live
-    // in the address bar and request logs for the rest of its TTL.
-    const stored = consumeSsoBridgeState();
-    const verifier = consumeSsoBridgeVerifier();
-    const stateOk =
-      stored !== null && isWellFormedSsoState(state) && stored === state;
-    if (!stateOk || !isWellFormedSsoCode(code) || verifier === null) {
-      if (isWellFormedSsoCode(code)) burnSsoBridgeCode(code, hostname);
-      setFailed(true);
-      return;
-    }
+    void operation.promise
+      .then((ok) => {
+        if (!effectIsCurrent()) return;
+        if (ok) {
+          navigate(returnTo, { replace: true });
+          return;
+        }
+        setFailedOperationKey(operationKey);
+      })
+      .catch(() => {
+        // error-policy:J4 an unforeseen operation failure leaves only the
+        // current generation on the ordinary recoverable login path.
+        if (effectIsCurrent()) setFailedOperationKey(operationKey);
+      });
 
-    void performSsoExchange(code, verifier, hostname).then((result) => {
-      if (result.ok) {
-        navigate(returnTo, { replace: true });
-        return;
+    return () => {
+      operation.activeEffects.delete(effectGeneration);
+      if (effectIsCurrent()) {
+        effectGenerationRef.current = effectGeneration + 1;
       }
-      setFailed(true);
-    });
-  }, [hostname, code, state, returnTo, navigate]);
+    };
+  }, [hostname, code, state, returnTo, navigate, operationKey]);
 
-  if (failed) {
+  if (failedOperationKey === operationKey) {
     return (
       <Navigate
         to={`/login?returnTo=${encodeURIComponent(returnTo)}`}

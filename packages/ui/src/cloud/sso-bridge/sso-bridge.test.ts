@@ -1,8 +1,12 @@
 /** Pure-logic contract for the SSO bridge client module: hostname role table, returnTo sanitation, state-nonce + PKCE-verifier lifecycle, loop guard, logged-out marker, URL builders, and the mint/exchange/burn fetch wrappers — jsdom storage + hand-rolled fetch stubs, nothing mocked at module level. */
 // @vitest-environment jsdom
 
-import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  registerStewardTokenPersistence,
+  STEWARD_TOKEN_KEY,
+  writeStoredStewardToken,
+} from "@elizaos/shared/steward-session-client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   peekPendingOnboardingSession,
   storePendingOnboardingSession,
@@ -32,6 +36,7 @@ import {
   pairedAppOrigin,
   performSsoExchange,
   prepareSsoAccountSwitch,
+  type SsoBridgeFetch,
   sanitizeBridgeReturnTo,
   shouldAttemptSsoBridge,
   shouldAutoBridgeToSso,
@@ -43,6 +48,7 @@ const STATE = "a".repeat(64);
 const CHALLENGE = "c".repeat(64);
 const VERIFIER = "d".repeat(64);
 const CODE = `esso_${"b".repeat(64)}`;
+const NEXT_CODE = `esso_${"f".repeat(64)}`;
 
 async function sha256Hex(input: string): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest(
@@ -69,8 +75,8 @@ function jwt(payload: Record<string, unknown>): string {
   ].join(".");
 }
 
-function liveToken(): string {
-  return jwt({ userId: "u1", exp: Math.floor(Date.now() / 1000) + 3600 });
+function liveToken(userId: string = "u1"): string {
+  return jwt({ userId, exp: Math.floor(Date.now() / 1000) + 3600 });
 }
 
 function clearCookies(): void {
@@ -409,11 +415,76 @@ describe("performSsoExchange", () => {
       code: CODE,
       codeVerifier: VERIFIER,
     });
-    // The session-cookie sync rides the same call the login flow makes.
     expect(calls[1].url).toContain("/api/auth/steward-session");
     expect(events).toEqual(["steward-token-sync"]);
     expect(shouldAttemptSsoBridge()).toBe(true);
     expect(isSsoLoggedOut()).toBe(false);
+  });
+
+  it("refuses a superseded exchange while token persistence is queued without follow-up effects", async () => {
+    markSsoBridgeAttempt();
+    markSsoLoggedOut();
+    let releaseQueueOwner: () => void = () => {};
+    const queueOwnerPersistence = new Promise<void>((resolve) => {
+      releaseQueueOwner = resolve;
+    });
+    let markQueueOwned: () => void = () => {};
+    const queueOwned = new Promise<void>((resolve) => {
+      markQueueOwned = resolve;
+    });
+    const persistedTokens: string[] = [];
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      persistedTokens.push(token);
+      if (token === "queue-owner-token") {
+        markQueueOwned();
+        await queueOwnerPersistence;
+      }
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+    });
+    const { fn, calls } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token: liveToken() })
+        : json(200, { ok: true }),
+    );
+    const events: string[] = [];
+    const listener = () => events.push("steward-token-sync");
+    window.addEventListener("steward-token-sync", listener);
+    let current = true;
+    const isCurrent = vi.fn(() => current);
+
+    try {
+      const queueOwner = writeStoredStewardToken("queue-owner-token");
+      await queueOwned;
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+        isCurrent,
+      );
+      await vi.waitFor(() => expect(calls).toHaveLength(1));
+      await Promise.resolve();
+      expect(isCurrent).not.toHaveBeenCalled();
+
+      current = false;
+      releaseQueueOwner();
+      await queueOwner;
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+    } finally {
+      releaseQueueOwner();
+      unregister();
+      window.removeEventListener("steward-token-sync", listener);
+    }
+
+    expect(persistedTokens).toEqual(["queue-owner-token"]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("queue-owner-token");
+    expect(calls).toHaveLength(1);
+    expect(events).toEqual([]);
+    expect(shouldAttemptSsoBridge()).toBe(false);
+    expect(isSsoLoggedOut()).toBe(true);
   });
 
   it("establishes bridged auth without sending or consuming a Telegram claim", async () => {
@@ -432,9 +503,8 @@ describe("performSsoExchange", () => {
       performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
     ).resolves.toEqual({ ok: true });
 
-    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({
-      token,
-    });
+    expect(calls).toHaveLength(2);
+    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({ token });
     expect(peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE)).toBe(
       "opaque-telegram-claim-token",
     );
@@ -446,10 +516,10 @@ describe("performSsoExchange", () => {
       "opaque-telegram-claim-token",
       TELEGRAM_ACCOUNT_CLAIM_PURPOSE,
     );
-    const { fn } = fetchStub((url) =>
+    const { fn, calls } = fetchStub((url) =>
       url.includes("/sso-bridge/exchange")
         ? json(200, { ok: true, token: liveToken() })
-        : json(409, { code: "telegram_claim_conflict" }),
+        : json(500, { error: "unexpected session mutation" }),
     );
 
     const result = await performSsoExchange(
@@ -460,10 +530,375 @@ describe("performSsoExchange", () => {
     );
 
     expect(result).toEqual({ ok: true });
+    expect(calls).toHaveLength(2);
     expect(peekPendingOnboardingSession(TELEGRAM_ACCOUNT_CLAIM_PURPOSE)).toBe(
       "opaque-telegram-claim-token",
     );
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeTruthy();
+  });
+
+  it("does not let a late stale exchange preempt the current cookie sync", async () => {
+    const staleToken = liveToken("stale-user");
+    const currentToken = liveToken("current-user");
+    let resolveStaleExchange: (response: Response) => void = () => {};
+    const staleExchange = new Promise<Response>((resolve) => {
+      resolveStaleExchange = resolve;
+    });
+    let resolveCurrentSession: (response: Response) => void = () => {};
+    const currentSession = new Promise<Response>((resolve) => {
+      resolveCurrentSession = resolve;
+    });
+    const currentSessionSignals: AbortSignal[] = [];
+    const fn: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      const body = JSON.parse(String(init?.body)) as {
+        code?: string;
+        token?: string;
+      };
+      if (url.includes("/sso-bridge/exchange")) {
+        return body.code === CODE
+          ? staleExchange
+          : Promise.resolve(json(200, { ok: true, token: currentToken }));
+      }
+      if (init?.signal instanceof AbortSignal) {
+        currentSessionSignals.push(init.signal);
+      }
+      return currentSession;
+    };
+    let staleIsCurrent = true;
+
+    const stale = performSsoExchange(
+      CODE,
+      VERIFIER,
+      "cloud.eliza.app",
+      fn,
+      () => staleIsCurrent,
+    );
+    const current = performSsoExchange(
+      NEXT_CODE,
+      VERIFIER,
+      "cloud.eliza.app",
+      fn,
+      () => true,
+    );
+    await vi.waitFor(() => expect(currentSessionSignals).toHaveLength(1));
+
+    staleIsCurrent = false;
+    resolveStaleExchange(json(200, { ok: true, token: staleToken }));
+    await expect(stale).resolves.toEqual({
+      ok: false,
+      error: "SSO exchange superseded",
+    });
+    expect(currentSessionSignals[0].aborted).toBe(false);
+
+    resolveCurrentSession(json(200, { ok: true }));
+    await expect(current).resolves.toEqual({ ok: true });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(currentToken);
+  });
+
+  it("serializes cookie finalization so the newer generation always posts last", async () => {
+    const firstToken = liveToken("first-user");
+    const secondToken = liveToken("second-user");
+    const calls: FetchCall[] = [];
+    const sessionPostSignals: AbortSignal[] = [];
+    const fn: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes("/sso-bridge/exchange")) {
+        const body = JSON.parse(String(init?.body)) as { code: string };
+        return Promise.resolve(
+          json(200, {
+            ok: true,
+            token: body.code === CODE ? firstToken : secondToken,
+          }),
+        );
+      }
+      const body = JSON.parse(String(init?.body)) as { token: string };
+      const signal = init?.signal;
+      if (!(signal instanceof AbortSignal)) {
+        return Promise.reject(new Error("missing cookie-sync abort signal"));
+      }
+      sessionPostSignals.push(signal);
+      if (body.token === secondToken) {
+        return Promise.resolve(json(200, { ok: true }));
+      }
+      return new Promise<Response>((_resolve, reject) => {
+        const rejectAborted = () =>
+          reject(new DOMException("cookie sync aborted", "AbortError"));
+        if (signal.aborted) rejectAborted();
+        else signal.addEventListener("abort", rejectAborted, { once: true });
+      });
+    };
+    let firstIsCurrent = true;
+    vi.useFakeTimers();
+
+    try {
+      const first = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+        () => firstIsCurrent,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sessionPostSignals).toHaveLength(1);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(firstToken);
+
+      firstIsCurrent = false;
+      const second = performSsoExchange(
+        NEXT_CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+        () => true,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(
+        calls.filter(({ url }) => url.includes("/sso-bridge/exchange")),
+      ).toHaveLength(2);
+      expect(sessionPostSignals).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(sessionPostSignals[0].aborted).toBe(true);
+      expect(sessionPostSignals).toHaveLength(2);
+
+      await expect(first).resolves.toEqual({ ok: true });
+      await expect(second).resolves.toEqual({ ok: true });
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(secondToken);
+      expect(
+        calls
+          .filter(({ url }) => url.includes("/api/auth/steward-session"))
+          .map(({ init }) => JSON.parse(String(init?.body))),
+      ).toEqual([{ token: firstToken }, { token: secondToken }]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the last valid finalization when a queued generation becomes stale", async () => {
+    markSsoBridgeAttempt();
+    markSsoLoggedOut();
+    const firstToken = liveToken("first-user");
+    const secondToken = liveToken("second-user");
+    let resolveFirstSession: (response: Response) => void = () => {};
+    const firstSession = new Promise<Response>((resolve) => {
+      resolveFirstSession = resolve;
+    });
+    const calls: FetchCall[] = [];
+    const fn: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes("/sso-bridge/exchange")) {
+        const body = JSON.parse(String(init?.body)) as { code: string };
+        return Promise.resolve(
+          json(200, {
+            ok: true,
+            token: body.code === CODE ? firstToken : secondToken,
+          }),
+        );
+      }
+      return firstSession;
+    };
+    let secondIsCurrent = true;
+    const secondGuard = vi.fn(() => secondIsCurrent);
+    const events: string[] = [];
+    const listener = () => events.push("steward-token-sync");
+    window.addEventListener("steward-token-sync", listener);
+
+    try {
+      const first = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+      await vi.waitFor(() =>
+        expect(
+          calls.filter(({ url }) => url.includes("/api/auth/steward-session")),
+        ).toHaveLength(1),
+      );
+      const second = performSsoExchange(
+        NEXT_CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+        secondGuard,
+      );
+      await vi.waitFor(() => expect(secondGuard).toHaveBeenCalledTimes(1));
+      secondIsCurrent = false;
+      resolveFirstSession(json(200, { ok: true }));
+
+      await expect(first).resolves.toEqual({ ok: true });
+      await expect(second).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+    } finally {
+      resolveFirstSession(json(200, { ok: true }));
+      window.removeEventListener("steward-token-sync", listener);
+    }
+
+    expect(secondGuard).toHaveBeenCalledTimes(2);
+    expect(
+      calls.filter(({ url }) => url.includes("/api/auth/steward-session")),
+    ).toHaveLength(1);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(firstToken);
+    expect(events).toEqual(["steward-token-sync"]);
+    expect(shouldAttemptSsoBridge()).toBe(true);
+    expect(isSsoLoggedOut()).toBe(false);
+  });
+
+  it("releases cookie finalization after a rejected POST", async () => {
+    const firstToken = liveToken("first-user");
+    const secondToken = liveToken("second-user");
+    let rejectFirstPost: (error: Error) => void = () => {};
+    const firstPost = new Promise<Response>((_resolve, reject) => {
+      rejectFirstPost = reject;
+    });
+    let sessionPostCount = 0;
+    const fn: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      if (url.includes("/sso-bridge/exchange")) {
+        const body = JSON.parse(String(init?.body)) as { code: string };
+        return Promise.resolve(
+          json(200, {
+            ok: true,
+            token: body.code === CODE ? firstToken : secondToken,
+          }),
+        );
+      }
+      sessionPostCount += 1;
+      return sessionPostCount === 1
+        ? firstPost
+        : Promise.resolve(json(200, { ok: true }));
+    };
+
+    const first = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    await vi.waitFor(() => expect(sessionPostCount).toBe(1));
+    const second = performSsoExchange(
+      NEXT_CODE,
+      VERIFIER,
+      "cloud.eliza.app",
+      fn,
+    );
+    rejectFirstPost(new Error("cookie sync transport failed"));
+
+    await expect(first).resolves.toEqual({ ok: true });
+    await expect(second).resolves.toEqual({ ok: true });
+    expect(sessionPostCount).toBe(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(secondToken);
+  });
+
+  it("orders logout after an active cookie sync without clearing the logout marker", async () => {
+    const token = liveToken();
+    const sessionSignals: AbortSignal[] = [];
+    const exchangeFetch: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      if (url.includes("/sso-bridge/exchange")) {
+        return Promise.resolve(json(200, { ok: true, token }));
+      }
+      const signal = init?.signal;
+      if (!(signal instanceof AbortSignal)) {
+        return Promise.reject(new Error("missing cookie-sync abort signal"));
+      }
+      sessionSignals.push(signal);
+      return new Promise<Response>((_resolve, reject) => {
+        const rejectAborted = () =>
+          reject(new DOMException("cookie sync aborted", "AbortError"));
+        if (signal.aborted) rejectAborted();
+        else signal.addEventListener("abort", rejectAborted, { once: true });
+      });
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+    const logout = fetchStub(() => json(200, { success: true }));
+    const eventTokens: Array<string | null> = [];
+    const listener = () =>
+      eventTokens.push(localStorage.getItem(STEWARD_TOKEN_KEY));
+    window.addEventListener("steward-token-sync", listener);
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        exchangeFetch,
+      );
+      await vi.waitFor(() => expect(sessionSignals).toHaveLength(1));
+      const signOut = signOutFromSsoBridgedHost("cloud.eliza.app", logout.fn);
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+      await signOut;
+    } finally {
+      window.removeEventListener("steward-token-sync", listener);
+      globalThis.fetch = realFetch;
+    }
+
+    expect(sessionSignals[0].aborted).toBe(true);
+    expect(logout.calls).toHaveLength(1);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(isSsoLoggedOut()).toBe(true);
+    expect(eventTokens.every((eventToken) => eventToken === null)).toBe(true);
+  });
+
+  it("does not start cookie sync when logout lands during token persistence", async () => {
+    const token = liveToken();
+    let releasePersistence: () => void = () => {};
+    const persistence = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let markPersistenceStarted: () => void = () => {};
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const unregister = registerStewardTokenPersistence(async (nextToken) => {
+      markPersistenceStarted();
+      await persistence;
+      localStorage.setItem(STEWARD_TOKEN_KEY, nextToken);
+    });
+    const exchangeCalls: string[] = [];
+    const exchangeFetch: SsoBridgeFetch = (input) => {
+      const url = String(input);
+      exchangeCalls.push(url);
+      return Promise.resolve(
+        url.includes("/sso-bridge/exchange")
+          ? json(200, { ok: true, token })
+          : json(200, { ok: true }),
+      );
+    };
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+    const logout = fetchStub(() => json(200, { success: true }));
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        exchangeFetch,
+      );
+      await persistenceStarted;
+      const signOut = signOutFromSsoBridgedHost("cloud.eliza.app", logout.fn);
+      expect(isSsoLoggedOut()).toBe(true);
+      releasePersistence();
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+      await signOut;
+    } finally {
+      releasePersistence();
+      unregister();
+      globalThis.fetch = realFetch;
+    }
+
+    expect(
+      exchangeCalls.filter((url) => url.includes("/steward-session")),
+    ).toEqual([]);
+    expect(logout.calls).toHaveLength(1);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(isSsoLoggedOut()).toBe(true);
   });
 
   it("refuses a malformed verifier without calling out", async () => {

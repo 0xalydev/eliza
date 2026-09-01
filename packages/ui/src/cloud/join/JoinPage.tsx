@@ -133,9 +133,16 @@ export default function JoinPage(): React.JSX.Element {
         setSsoBridging(false);
         return;
       }
-      void redirectToSsoBridge("/join").then((started) => {
-        setSsoBridging(started);
-      });
+      void redirectToSsoBridge("/join").then(
+        (started) => {
+          setSsoBridging(started);
+        },
+        () => {
+          // error-policy:J4 a browser policy may block the full-page navigation;
+          // reveal the ordinary login/recovery route instead of spinning forever.
+          setSsoBridging(false);
+        },
+      );
       return;
     }
     if (appHandoff) {

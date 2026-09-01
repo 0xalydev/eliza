@@ -48,12 +48,15 @@
 import { ELIZA_DOMAIN_CONTRACTS } from "@elizaos/shared/elizacloud";
 import {
   readStoredStewardToken,
-  writeStoredStewardToken,
+  writeStoredStewardTokenIfCurrent,
 } from "@elizaos/shared/steward-session-client";
 import { shellLocalStorage } from "../../surface-realm-channel";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { decodeJwtPayload } from "../lib/jwt";
-import { invalidateStewardServerCookieSyncMarker } from "../lib/steward-session-cookie-sync-marker";
+import {
+  invalidateStewardServerCookieSyncMarker,
+  markStewardServerCookieSynced,
+} from "../lib/steward-session-cookie-sync-marker";
 import {
   clearStaleStewardSession,
   configuredSessionEndpoint,
@@ -291,6 +294,8 @@ export function clearSsoBridgeAttempt(): void {
 // ---------------------------------------------------------------------------
 
 const SSO_LOGGED_OUT_KEY = "eliza_sso_logged_out";
+let ssoLogoutEpoch = 0;
+let activeSsoCookieSyncAbortController: AbortController | null = null;
 
 /**
  * Persistent (localStorage) "the user explicitly signed out here" marker. It
@@ -309,6 +314,8 @@ export function isSsoLoggedOut(): boolean {
 }
 
 export function markSsoLoggedOut(): void {
+  ssoLogoutEpoch += 1;
+  activeSsoCookieSyncAbortController?.abort();
   try {
     // Reserved shell key: raw localStorage writes throw SurfaceRealmDeniedError
     // while a view scope is foreground (surface-realm-broker guard, #13452).
@@ -483,6 +490,29 @@ export async function mintSsoCode(
 
 export type SsoExchangeResult = { ok: true } | { ok: false; error: string };
 
+/** Fetch call signature used by bridge wrappers without runtime statics. */
+export type SsoBridgeFetch = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Promise<Response>;
+
+let ssoExchangeFinalizationTail: Promise<void> = Promise.resolve();
+const SSO_COOKIE_SYNC_TIMEOUT_MS = 10_000;
+
+/** Keep token/cookie finalization ordered so the newest generation wins. */
+function serializeSsoExchangeFinalization<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  const result = ssoExchangeFinalizationTail
+    .catch(() => undefined)
+    .then(operation);
+  ssoExchangeFinalizationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 function tokenLooksHydratable(token: string): boolean {
   const claims = decodeJwtPayload(token);
   const id = claims?.userId ?? claims?.sub;
@@ -496,20 +526,29 @@ function tokenLooksHydratable(token: string): boolean {
  * this origin's sessionStorage) and hydrate this origin's localStorage
  * mirror. After this the app origin is indistinguishable from one the user
  * logged into directly: same storage key, same `steward-token-sync` event,
- * and the existing AuthTokenSync loop takes over cookie sync + refresh (the
- * HttpOnly refresh cookie is domain-wide and already present).
+ * an explicit cookie-sync POST, and the existing AuthTokenSync loop available
+ * for retries + refresh.
+ *
+ * The guard immediately before durable persistence is the commit point.
+ * Supersession before it returns a typed failure without publishing; once the
+ * write starts, it finishes, and any later queued generation wins in order.
+ * Cookie sync is abortable and finalization is serialized, so generation B
+ * cannot publish or POST until A has stopped and B remains the last authority
+ * committed by this browser realm.
  */
 export async function performSsoExchange(
   code: string,
   verifier: string,
   hostname: string,
-  fetchFn: typeof fetch = fetch,
+  fetchFn: SsoBridgeFetch = fetch,
+  isCurrent: () => boolean = () => true,
 ): Promise<SsoExchangeResult> {
   const base = apiBaseForHostname(hostname);
   if (!base) return { ok: false, error: "Host cannot exchange SSO codes" };
   if (!isWellFormedSsoChallenge(verifier)) {
     return { ok: false, error: "Malformed code verifier" };
   }
+  const logoutEpochAtStart = ssoLogoutEpoch;
   try {
     const res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
       method: "POST",
@@ -527,35 +566,68 @@ export async function performSsoExchange(
     if (!token || !tokenLooksHydratable(token)) {
       return { ok: false, error: "Exchange returned no usable session" };
     }
-
-    await writeStoredStewardToken(token);
-
-    // Same call the login flow makes: sets the HttpOnly steward cookies + the
-    // authed marker for this environment. It stays best-effort for an ordinary
-    // bridge because AuthTokenSync retries. Account-link authority is never
-    // discovered here: a pending Telegram claim remains inert until the user
-    // returns to /get-started and confirms the preview explicitly.
-    try {
-      await fetchFn(configuredSessionEndpoint(), {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
-      });
-    } catch {
-      // error-policy:J6 best-effort cookie sync; the localStorage session is
-      // established and AuthTokenSync re-syncs on its own cadence.
+    if (!isCurrent()) {
+      return { ok: false, error: "SSO exchange superseded" };
     }
 
-    clearSsoBridgeAttempt();
-    clearSsoLoggedOut();
-    try {
-      window.dispatchEvent(new CustomEvent("steward-token-sync"));
-    } catch {
-      // error-policy:J6 best-effort notification; storage listeners re-read
-      // on their own triggers.
-    }
-    return { ok: true };
+    return await serializeSsoExchangeFinalization(async () => {
+      const persisted = await writeStoredStewardTokenIfCurrent(
+        token,
+        () => logoutEpochAtStart === ssoLogoutEpoch && isCurrent(),
+      );
+      if (
+        !persisted ||
+        logoutEpochAtStart !== ssoLogoutEpoch ||
+        readStoredStewardToken() !== token
+      ) {
+        return { ok: false, error: "SSO exchange superseded" };
+      }
+
+      const sessionEndpoint = configuredSessionEndpoint();
+      const cookieSyncAbortController = new AbortController();
+      activeSsoCookieSyncAbortController = cookieSyncAbortController;
+      const cookieSyncTimeout = window.setTimeout(
+        () => cookieSyncAbortController.abort(),
+        SSO_COOKIE_SYNC_TIMEOUT_MS,
+      );
+      let cookieSyncResponse: Response | null = null;
+      try {
+        cookieSyncResponse = await fetchFn(sessionEndpoint, {
+          method: "POST",
+          credentials: "include",
+          signal: cookieSyncAbortController.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+        });
+      } catch {
+        // error-policy:J6 best-effort cookie sync; the committed local session
+        // remains authoritative and AuthTokenSync retries on its own cadence.
+      } finally {
+        window.clearTimeout(cookieSyncTimeout);
+        if (activeSsoCookieSyncAbortController === cookieSyncAbortController) {
+          activeSsoCookieSyncAbortController = null;
+        }
+      }
+
+      const stillOwnsFinalization =
+        logoutEpochAtStart === ssoLogoutEpoch &&
+        readStoredStewardToken() === token;
+      if (!stillOwnsFinalization) {
+        return { ok: false, error: "SSO exchange superseded" };
+      }
+      if (cookieSyncResponse?.ok) {
+        markStewardServerCookieSynced(token, sessionEndpoint);
+      }
+      clearSsoBridgeAttempt();
+      clearSsoLoggedOut();
+      try {
+        window.dispatchEvent(new CustomEvent("steward-token-sync"));
+      } catch {
+        // error-policy:J6 best-effort notification; storage listeners re-read
+        // on their own triggers.
+      }
+      return { ok: true };
+    });
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
     // bridge route turns into its fall-back-to-login redirect.
@@ -602,16 +674,15 @@ export function burnSsoBridgeCode(
  * marker, and the paired origin's surviving session would silently undo it
  * (re-planting the domain cookies via its background session sync). Order
  * matters: the local logged-out marker lands synchronously first (auto-bridge
- * is suppressed even if the network never answers), the server logout request
- * is ISSUED while the session cookies are still in the jar (it ends the
- * server-side sessions AND stamps the server logout marker that blocks
- * minting, exchanging, and cookie re-planting for pre-logout tokens), and the
- * local scrub stays synchronous so the login page never renders over a
- * half-signed-out session. On hostnames outside the deployed map (local dev)
- * the server call is skipped and this degrades to the local scrub, exactly
- * the previous local behavior. A hosted non-success response or transport
- * failure rejects so explicit sign-out cannot claim success over a server
- * session that may still be live.
+ * is suppressed even if the network never answers) and aborts an active
+ * bridge cookie sync. The queued server logout then runs after that earlier
+ * cookie mutation has settled, while the session cookies are still in the jar;
+ * it ends the server-side sessions and stamps the marker that blocks minting,
+ * exchanging, and cookie re-planting for pre-logout tokens. The local scrub
+ * shares that ordered teardown. On hostnames outside the deployed map (local
+ * dev) the server call is skipped and this degrades to the local scrub. A
+ * hosted non-success response or transport failure rejects so explicit
+ * sign-out cannot claim success over a server session that may still be live.
  */
 export async function signOutFromSsoBridgedHost(
   hostname: string = window.location.hostname,
@@ -624,25 +695,29 @@ export async function signOutFromSsoBridgedHost(
   invalidateStewardServerCookieSyncMarker();
   markSsoLoggedOut();
   const base = apiBaseForHostname(hostname);
-  const serverLogout = base
-    ? fetchFn(`${base}/api/auth/logout`, {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-          ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-        },
-      })
-    : // error-policy:J6 best-effort server teardown — the local marker is
-      // already set and the local scrub below always runs.
-      Promise.resolve(undefined);
-  await clearStaleStewardSession();
-  const response = await serverLogout;
-  if (response && !response.ok) {
-    throw new Error(
-      `Eliza Cloud could not end the browser session (${response.status}).`,
-    );
-  }
+  await serializeSsoExchangeFinalization(async () => {
+    const serverLogout = base
+      ? fetchFn(`${base}/api/auth/logout`, {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            ...(stewardToken
+              ? { Authorization: `Bearer ${stewardToken}` }
+              : {}),
+          },
+        })
+      : // error-policy:J6 best-effort server teardown — the local marker is
+        // already set and the local scrub below always runs.
+        Promise.resolve(undefined);
+    await clearStaleStewardSession();
+    const response = await serverLogout;
+    if (response && !response.ok) {
+      throw new Error(
+        `Eliza Cloud could not end the browser session (${response.status}).`,
+      );
+    }
+  });
 }
 
 /**
@@ -664,19 +739,21 @@ export async function prepareSsoAccountSwitch(
       "Eliza Cloud account switching is unavailable on this host.",
     );
   }
-  const serverLogout = fetchFn(`${base}/api/auth/logout`, {
-    method: "POST",
-    credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-    },
+  await serializeSsoExchangeFinalization(async () => {
+    const serverLogout = fetchFn(`${base}/api/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
+      },
+    });
+    await clearStaleStewardSession();
+    const response = await serverLogout;
+    if (!response.ok) {
+      throw new Error(
+        `Eliza Cloud could not end the previous browser session (${response.status}).`,
+      );
+    }
   });
-  await clearStaleStewardSession();
-  const response = await serverLogout;
-  if (!response.ok) {
-    throw new Error(
-      `Eliza Cloud could not end the previous browser session (${response.status}).`,
-    );
-  }
 }

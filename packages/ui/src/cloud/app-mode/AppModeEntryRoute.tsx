@@ -93,6 +93,11 @@ export function AppModeEntryRoute({
     // `ssoBridging` stays null (holding the notice) until it resolves.
     void redirectToSsoBridge(`${location.pathname}${location.search}`).then(
       (started) => setSsoBridging(started),
+      () => {
+        // error-policy:J4 a browser policy may block the full-page navigation;
+        // reveal the ordinary login/recovery route instead of spinning forever.
+        setSsoBridging(false);
+      },
     );
   }, [ready, authenticated, location]);
 

@@ -436,6 +436,33 @@ export async function writeStoredStewardToken(token: string): Promise<void> {
 }
 
 /**
+ * Persists a token only while the caller still owns the login operation.
+ * The guard runs inside the canonical mutation queue immediately before the
+ * durable write. That check is the commit point: an operation superseded while
+ * waiting behind another mutation cannot publish credentials or an event;
+ * once persistence starts, the write completes and later queued authority
+ * wins in order.
+ */
+export async function writeStoredStewardTokenIfCurrent(
+  token: string,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  return serializeStewardTokenMutation(async () => {
+    const requiredScope = configuredLoopbackStewardScope();
+    const wasCurrent =
+      window.localStorage.getItem(STEWARD_TOKEN_KEY) === token &&
+      (!requiredScope ||
+        window.localStorage.getItem(STEWARD_TOKEN_SCOPE_KEY) === requiredScope);
+    if (!isCurrent()) return false;
+    if (!stewardTokenPersistence && wasCurrent) return true;
+    await persistStoredStewardToken(token, requiredScope);
+    if (!wasCurrent) dispatchStewardSessionChange("present");
+    return true;
+  });
+}
+
+/**
  * Replaces a token only while `expectedToken` still owns session authority.
  * The comparison, durable write, and event share the canonical mutation queue,
  * so a refresh response that arrives after logout cannot resurrect the session.

@@ -172,6 +172,24 @@ describe("AppModeEntryRoute — SSO auto-bridge (managed app origin)", () => {
     expect(replacedUrls).toEqual([]);
   });
 
+  it("falls through to login exactly once when the full-page bridge navigation is blocked", async () => {
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+      throw new DOMException("Navigation blocked", "SecurityError");
+    };
+
+    renderEntry("/chat?x=1");
+
+    const login = await screen.findByTestId("login-page");
+    expect(login.textContent).toBe("?returnTo=%2Fchat%3Fx%3D1");
+    expect(replacedUrls).toHaveLength(1);
+    expect(screen.queryByText("Signing you in")).toBeNull();
+    expect(fetchLog.filter((entry) => entry.startsWith("POST "))).toEqual([]);
+
+    // The fallback render must not start a second bridge attempt.
+    await waitFor(() => expect(replacedUrls).toHaveLength(1));
+  });
+
   it("an authenticated rerender cannot erase an in-flight logout marker", async () => {
     localStorage.setItem(SSO_LOGGED_OUT_KEY, "1");
     signIn();

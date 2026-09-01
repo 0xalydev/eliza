@@ -5,9 +5,11 @@ import { STEWARD_TOKEN_KEY } from "@elizaos/shared/steward-session-client";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import {
+  createMemoryRouter,
   MemoryRouter,
   type NavigateFunction,
   Route,
+  RouterProvider,
   Routes,
   useLocation,
   useNavigate,
@@ -21,6 +23,8 @@ const OTHER_STATE = "c".repeat(64);
 const CHALLENGE = "e".repeat(64);
 const VERIFIER = "d".repeat(64);
 const CODE = `esso_${"b".repeat(64)}`;
+const NEXT_VERIFIER = "1".repeat(64);
+const NEXT_CODE = `esso_${"f".repeat(64)}`;
 const SSO_STATE_KEY = "eliza_sso_bridge_state";
 const SSO_VERIFIER_KEY = "eliza_sso_bridge_verifier";
 
@@ -31,10 +35,10 @@ function base64url(value: unknown): string {
     .replace(/=+$/, "");
 }
 
-function liveToken(): string {
+function liveToken(userId: string = "u1"): string {
   return [
     base64url({ alg: "none", typ: "JWT" }),
-    base64url({ userId: "u1", exp: Math.floor(Date.now() / 1000) + 3600 }),
+    base64url({ userId, exp: Math.floor(Date.now() / 1000) + 3600 }),
     "sig",
   ].join(".");
 }
@@ -440,9 +444,55 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
 });
 
 describe("SsoBridgeRoute — exchange leg (app host)", () => {
-  function armHandshake(state: string = STATE): void {
+  function armHandshake(
+    state: string = STATE,
+    verifier: string = VERIFIER,
+  ): void {
     sessionStorage.setItem(SSO_STATE_KEY, state);
-    sessionStorage.setItem(SSO_VERIFIER_KEY, VERIFIER);
+    sessionStorage.setItem(SSO_VERIFIER_KEY, verifier);
+  }
+
+  function stubDeferredExchanges(): Array<(response: Response) => void> {
+    const resolveExchanges: Array<(response: Response) => void> = [];
+    fetchLog = [];
+    globalThis.fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      fetchLog.push({ url, init });
+      if (url.endsWith("/api/auth/sso-bridge/exchange")) {
+        return new Promise<Response>((resolve) => {
+          resolveExchanges.push(resolve);
+        });
+      }
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+    replacedUrls = [];
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+    };
+    return resolveExchanges;
+  }
+
+  function exchangePath(
+    code: string = CODE,
+    state: string = STATE,
+    returnTo: string = "/chat",
+  ): string {
+    return `/auth/bridge?code=${code}&state=${state}&returnTo=${encodeURIComponent(returnTo)}`;
+  }
+
+  function createExchangeRouterForTest() {
+    return createMemoryRouter(
+      [
+        { path: "/", element: <LocationProbe id="home-page" /> },
+        { path: "/login", element: <LocationProbe id="login-page" /> },
+        {
+          path: "/auth/bridge",
+          element: <SsoBridgeRoute hostname="cloud.eliza.app" />,
+        },
+        { path: "*", element: <LocationProbe id="landed" /> },
+      ],
+      { initialEntries: [exchangePath()] },
+    );
   }
 
   /** The refusal paths burn the abandoned code: one verifier-less POST. */
@@ -526,6 +576,170 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
       code: CODE,
       codeVerifier: VERIFIER,
     });
+  });
+
+  it("keeps an in-flight exchange single-shot when only returnTo changes and lands on the current intent", async () => {
+    armHandshake();
+    const resolveExchanges = stubDeferredExchanges();
+    const router = createExchangeRouterForTest();
+    render(<RouterProvider router={router} />);
+    await waitFor(() => expect(resolveExchanges).toHaveLength(1));
+
+    await act(async () => {
+      await router.navigate(exchangePath(CODE, STATE, "/messages"));
+    });
+    expect(resolveExchanges).toHaveLength(1);
+
+    await act(async () => {
+      resolveExchanges[0](json(200, { ok: true, token: liveToken() }));
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe("/messages"),
+    );
+    expect(
+      fetchLog.filter(({ url }) =>
+        url.endsWith("/api/auth/sso-bridge/exchange"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("starts a new generation for new code/state and ignores the old generation's failure", async () => {
+    armHandshake();
+    const resolveExchanges = stubDeferredExchanges();
+    const router = createExchangeRouterForTest();
+    render(<RouterProvider router={router} />);
+    await waitFor(() => expect(resolveExchanges).toHaveLength(1));
+
+    armHandshake(OTHER_STATE, NEXT_VERIFIER);
+    await act(async () => {
+      await router.navigate(exchangePath(NEXT_CODE, OTHER_STATE, "/messages"));
+    });
+    await waitFor(() => expect(resolveExchanges).toHaveLength(2));
+
+    await act(async () => {
+      resolveExchanges[0](json(401, { error: "invalid_code" }));
+      await Promise.resolve();
+    });
+    expect(router.state.location.pathname).toBe("/auth/bridge");
+    expect(screen.getByText("Signing you in")).toBeTruthy();
+
+    await act(async () => {
+      resolveExchanges[1](json(200, { ok: true, token: liveToken() }));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe("/messages"),
+    );
+    expect(
+      fetchLog
+        .filter(({ url }) => url.endsWith("/api/auth/sso-bridge/exchange"))
+        .map(({ init }) => JSON.parse(String(init?.body))),
+    ).toEqual([
+      { code: CODE, codeVerifier: VERIFIER },
+      { code: NEXT_CODE, codeVerifier: NEXT_VERIFIER },
+    ]);
+  });
+
+  it("does not let an older exchange navigate after a newer generation resolves first", async () => {
+    armHandshake();
+    const resolveExchanges = stubDeferredExchanges();
+    const currentToken = liveToken("current-user");
+    const staleToken = liveToken("stale-user");
+    const router = createExchangeRouterForTest();
+    render(<RouterProvider router={router} />);
+    await waitFor(() => expect(resolveExchanges).toHaveLength(1));
+
+    armHandshake(OTHER_STATE, NEXT_VERIFIER);
+    await act(async () => {
+      await router.navigate(exchangePath(NEXT_CODE, OTHER_STATE, "/messages"));
+    });
+    await waitFor(() => expect(resolveExchanges).toHaveLength(2));
+
+    await act(async () => {
+      resolveExchanges[1](json(200, { ok: true, token: currentToken }));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(router.state.location.pathname).toBe("/messages"),
+    );
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(currentToken);
+
+    await act(async () => {
+      resolveExchanges[0](json(200, { ok: true, token: staleToken }));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(router.state.location.pathname).toBe("/messages");
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(currentToken);
+  });
+
+  it("does not navigate when an exchange resolves after the route unmounts", async () => {
+    armHandshake();
+    const resolveExchanges = stubDeferredExchanges();
+    const router = createExchangeRouterForTest();
+    const view = render(<RouterProvider router={router} />);
+    await waitFor(() => expect(resolveExchanges).toHaveLength(1));
+
+    view.unmount();
+    await act(async () => {
+      resolveExchanges[0](json(200, { ok: true, token: liveToken() }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(router.state.location.pathname).toBe("/auth/bridge");
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(fetchLog).toHaveLength(1);
+  });
+
+  it("keeps a successful exchange single-shot through StrictMode effect replay", async () => {
+    armHandshake();
+    stubNetwork((url) =>
+      url.endsWith("/api/auth/sso-bridge/exchange")
+        ? json(200, { ok: true, token: liveToken() })
+        : json(200, { ok: true }),
+    );
+    const router = createExchangeRouterForTest();
+
+    render(
+      <StrictMode>
+        <RouterProvider router={router} />
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/chat"));
+    expect(
+      fetchLog.filter(({ url }) =>
+        url.endsWith("/api/auth/sso-bridge/exchange"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("burns a refused well-formed code once through StrictMode effect replay", async () => {
+    armHandshake(OTHER_STATE);
+    stubNetwork(() => new Response(null, { status: 204 }));
+    const router = createExchangeRouterForTest();
+
+    render(
+      <StrictMode>
+        <RouterProvider router={router} />
+      </StrictMode>,
+    );
+
+    await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
+    expect(
+      fetchLog.filter(({ url }) => url.endsWith("/api/auth/sso-bridge/burn")),
+    ).toHaveLength(1);
+    expect(
+      fetchLog.filter(({ url }) =>
+        url.endsWith("/api/auth/sso-bridge/exchange"),
+      ),
+    ).toHaveLength(0);
   });
 
   it("a denied exchange (replayed/expired code) falls back to the local login", async () => {

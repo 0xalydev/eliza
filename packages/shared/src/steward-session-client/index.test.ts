@@ -22,6 +22,7 @@ import {
   stewardAuthedCookieName,
   syncStewardSession,
   writeStoredStewardToken,
+  writeStoredStewardTokenIfCurrent,
 } from "./index";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -221,6 +222,117 @@ describe("Steward session storage transitions", () => {
     expect(transitions[1]?.sessionEpoch).toBeGreaterThan(
       transitions[0]?.sessionEpoch ?? 0,
     );
+  });
+
+  it("refuses a guarded write invalidated while an earlier persistence owns the queue", async () => {
+    let releaseFirstPersistence: () => void = () => {};
+    const firstPersistence = new Promise<void>((resolve) => {
+      releaseFirstPersistence = resolve;
+    });
+    let markFirstPersistenceStarted: () => void = () => {};
+    const firstPersistenceStarted = new Promise<void>((resolve) => {
+      markFirstPersistenceStarted = resolve;
+    });
+    const persistedTokens: string[] = [];
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      persistedTokens.push(token);
+      if (token === "queue-owner-token") {
+        markFirstPersistenceStarted();
+        await firstPersistence;
+      }
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    let current = true;
+    const isCurrent = vi.fn(() => current);
+
+    try {
+      const queueOwner = writeStoredStewardToken("queue-owner-token");
+      await firstPersistenceStarted;
+      const guarded = writeStoredStewardTokenIfCurrent(
+        "superseded-token",
+        isCurrent,
+      );
+      await Promise.resolve();
+
+      expect(isCurrent).not.toHaveBeenCalled();
+      current = false;
+      releaseFirstPersistence();
+
+      await queueOwner;
+      await expect(guarded).resolves.toBe(false);
+    } finally {
+      releaseFirstPersistence();
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(isCurrent).toHaveBeenCalledTimes(1);
+    expect(persistedTokens).toEqual(["queue-owner-token"]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("queue-owner-token");
+    expect(transitions.map(({ state }) => state)).toEqual(["present"]);
+  });
+
+  it("lets a later guarded write win when authority changes after persistence starts", async () => {
+    let releasePersistence: () => void = () => {};
+    const persistence = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let markPersistenceStarted: () => void = () => {};
+    const persistenceStarted = new Promise<void>((resolve) => {
+      markPersistenceStarted = resolve;
+    });
+    const persistedTokens: string[] = [];
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      persistedTokens.push(token);
+      if (token === "committed-token") {
+        markPersistenceStarted();
+        await persistence;
+      }
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+    });
+    const transitions: StewardSessionChangeDetail[] = [];
+    const listener = (event: Event) => {
+      transitions.push(
+        (event as CustomEvent<StewardSessionChangeDetail>).detail,
+      );
+    };
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    let firstIsCurrent = true;
+
+    try {
+      const first = writeStoredStewardTokenIfCurrent(
+        "committed-token",
+        () => firstIsCurrent,
+      );
+      await persistenceStarted;
+      firstIsCurrent = false;
+      const second = writeStoredStewardTokenIfCurrent(
+        "newer-token",
+        () => true,
+      );
+      releasePersistence();
+
+      await expect(first).resolves.toBe(true);
+      await expect(second).resolves.toBe(true);
+    } finally {
+      releasePersistence();
+      unregister();
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, listener);
+    }
+
+    expect(persistedTokens).toEqual(["committed-token", "newer-token"]);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("newer-token");
+    expect(transitions.map(({ state }) => state)).toEqual([
+      "present",
+      "present",
+    ]);
   });
 
   it("does not advance authority when the same token is persisted again", async () => {

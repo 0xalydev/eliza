@@ -93,6 +93,25 @@ describe("JoinPage managed-app SSO handoff", () => {
     expect(runJoinFlowMock).not.toHaveBeenCalled();
   });
 
+  it("falls back to login exactly once when the full-page bridge navigation is blocked", async () => {
+    appModeNavigation.replace = (url: string) => {
+      replacedUrls.push(url);
+      throw new DOMException("Navigation blocked", "SecurityError");
+    };
+
+    render(<JoinPage />);
+
+    expect((await screen.findByTestId("navigate")).textContent).toBe(
+      "/login?returnTo=/join",
+    );
+    expect(replacedUrls).toHaveLength(1);
+    expect(runJoinFlowMock).not.toHaveBeenCalled();
+
+    // The fallback render remains mounted in this harness, proving the
+    // single-shot guard prevents a bridge loop after the rejected navigation.
+    await waitFor(() => expect(replacedUrls).toHaveLength(1));
+  });
+
   it("resolves identity exactly once after the bridge restores authentication", async () => {
     authenticatedRef.current = true;
     runJoinFlowMock.mockResolvedValue({ agentId: "agent-1" });
