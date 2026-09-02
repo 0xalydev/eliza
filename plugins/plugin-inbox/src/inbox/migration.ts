@@ -49,8 +49,7 @@ export interface TableMigrationResult {
     | "copied"
     | "source-missing"
     | "target-non-empty"
-    | "already-migrated"
-    | "migration-in-progress";
+    | "already-migrated";
 }
 
 function quoteIdent(name: string): string {
@@ -194,13 +193,7 @@ export async function migrateInboxTables(
     results.push(
       receipt.status === "completed"
         ? receipt.value
-        : {
-            table,
-            outcome:
-              receipt.status === "already-completed"
-                ? "already-migrated"
-                : "migration-in-progress",
-          },
+        : { table, outcome: "already-migrated" },
     );
   }
   return results;
