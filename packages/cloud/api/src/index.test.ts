@@ -222,7 +222,7 @@ test("answers crypto payment confirmation preflight before shard loading", async
 });
 
 test("dispatches provider webhooks without full-app bootstrap", async () => {
-  const traceId = "11111111-1111-4111-8111-111111111111";
+  const traceId = "11111111111141118111111111111111";
   const env = {
     ENVIRONMENT: "test",
     NODE_ENV: "test",
@@ -301,7 +301,7 @@ test("matches only the managed Discord gateway route", () => {
 });
 
 test("dispatches managed Discord turns without full-app bootstrap", async () => {
-  const traceId = "33333333-3333-4333-8333-333333333333";
+  const traceId = "33333333333343338333333333333333";
   const env = {
     ENVIRONMENT: "test",
     NODE_ENV: "test",
@@ -417,7 +417,7 @@ test("preserves provider authentication on the thin webhook path", async () => {
 });
 
 test("correlates and times dispatch outside full-app middleware", async () => {
-  const traceId = "22222222-2222-4222-8222-222222222222";
+  const traceId = "22222222222242228222222222222222";
   const env = {
     ENVIRONMENT: "test",
     NODE_ENV: "test",

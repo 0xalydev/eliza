@@ -72,6 +72,7 @@ mock.module("@/lib/services/ai-pricing-definitions", () => ({
           defaultParameters: { durationSeconds: 8, audio: true },
         }
       : undefined,
+  DEFAULT_VIDEO_MODEL_IDS: [MODEL],
   SUPPORTED_VIDEO_MODEL_IDS: [MODEL],
 }));
 
