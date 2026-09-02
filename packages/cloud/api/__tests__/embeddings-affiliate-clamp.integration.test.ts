@@ -156,6 +156,7 @@ mock.module("@/lib/services/organization-inference-admission", () => ({
       },
       params.estimatedInputTokens,
       params.estimatedOutputTokens,
+      { subscriptionFunded: false },
     );
     const settle = createCreditReservationSettler(reservation);
     return {

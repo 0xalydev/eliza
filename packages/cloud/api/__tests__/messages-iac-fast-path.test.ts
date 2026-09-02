@@ -104,6 +104,7 @@ mock.module("@/lib/services/ai-billing", () => ({
   estimateInputTokens,
   getAffiliatePayoutSourceId: (context: { requestId?: string | null }) =>
     `affiliate:${context.requestId ?? "missing"}`,
+  isSubscriptionFundedOrganization: mock(async () => false),
   normalizeUsage: (
     usage:
       | {
@@ -385,6 +386,7 @@ describe("/v1/messages IAC fast path", () => {
       }),
       expect.any(Number),
       16,
+      { subscriptionFunded: false },
     );
     expect(generateText).toHaveBeenCalledTimes(1);
   });
