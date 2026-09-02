@@ -272,6 +272,18 @@ const SMOKE_AGENT = {
   status: "running",
 } as const;
 
+export const UI_SMOKE_CPU_ONLY_HARDWARE = {
+  totalRamGb: 8,
+  freeRamGb: 4,
+  gpu: null,
+  cpuCores: 4,
+  platform: "linux",
+  arch: "x64",
+  appleSilicon: false,
+  recommendedBucket: "small",
+  source: "os-fallback",
+} as const;
+
 export async function seedAppStorage(
   page: Page,
   overrides: Record<string, string> = {},
@@ -1745,6 +1757,18 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     });
   });
 
+  await page.route("**/api/local-inference/device/stream**", async (route) => {
+    if (route.request().method() !== "GET") {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "text/event-stream",
+      body: "",
+    });
+  });
+
   // BrowserWorkspaceView reads the persisted Agent Browser session list on
   // mount. A fresh smoke fixture has no sessions; model that designed-empty
   // state explicitly so the all-views audit reviews the browser view rather
@@ -2763,6 +2787,23 @@ export async function installDefaultAppRoutes(page: Page): Promise<void> {
     }
 
     await route.fallback();
+  });
+
+  await page.route("**/api/lifeops/calendar/sources**", async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (
+      request.method() !== "GET" ||
+      url.pathname !== "/api/lifeops/calendar/sources"
+    ) {
+      await route.fallback();
+      return;
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ sources: [] }),
+    });
   });
 
   await page.route("**/api/lifeops/calendar/feed**", async (route) => {
