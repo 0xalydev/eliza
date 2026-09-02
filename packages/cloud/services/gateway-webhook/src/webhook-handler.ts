@@ -39,6 +39,11 @@ import {
   resolveAgentServer,
   resolveIdentity,
 } from "./server-router";
+import {
+  isCanonicalTelegramProject,
+  requireCanonicalTelegramIdentity,
+  telegramIdentityNotReadyResponse,
+} from "./telegram-identity";
 import { resolveWebhookConfig } from "./webhook-config";
 
 const PERSONAL_SHARED_DELIVERY_LEASE_MS = 90_000;
@@ -553,6 +558,19 @@ export async function handleWebhook(
       status: 401,
       headers: { "Content-Type": "application/json" },
     });
+  }
+
+  if (
+    adapter.platform === "telegram" &&
+    isCanonicalTelegramProject(project, agentId)
+  ) {
+    try {
+      await requireCanonicalTelegramIdentity(config);
+    } catch (error) {
+      // error-policy:J1 the authenticated provider boundary returns a
+      // value-safe failure before parsing, deduplication, or provider work.
+      return telegramIdentityNotReadyResponse(error);
+    }
   }
 
   const event = await adapter.extractEvent(rawBody, config);
