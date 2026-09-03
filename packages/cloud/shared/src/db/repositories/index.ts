@@ -122,6 +122,7 @@ export * from "./organizations";
 export * from "./phone-message-logs";
 export * from "./phone-metadata-readers";
 export * from "./press-releases";
+export * from "./primary-database-clock";
 export * from "./provider-health";
 // ============================================
 // Referrals & Rewards
@@ -131,6 +132,14 @@ export * from "./seo-artifacts";
 export * from "./seo-provider-calls";
 export * from "./seo-requests";
 export * from "./service-pricing";
+// ============================================
+// Subscription Billing Authority
+// ============================================
+export * from "./subscription-allowance";
+export * from "./subscription-authority";
+export * from "./subscription-billing-operations";
+export * from "./subscription-entitlements";
+export * from "./subscription-funding-reservations";
 export * from "./synthetic-environment-leases";
 export * from "./synthetic-world-commands";
 // ============================================

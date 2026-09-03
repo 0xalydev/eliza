@@ -62,6 +62,10 @@ interface LeaseRequest {
   recovery: InferenceAdmissionRecoveryContext;
 }
 
+interface AuthorizedLeaseRequest extends LeaseRequest {
+  credential: CredentialCheckRequest;
+}
+
 interface HydrateRequest {
   balanceUsd: number;
   balanceRevision: string;
@@ -81,6 +85,10 @@ interface LeaseIdentityRequest {
 }
 
 interface RateLimitRequest {
+  /** Stable across an internal transport retry so one arrival consumes once. */
+  operationId?: string;
+  /** Rejects an acknowledgement-ambiguous retry after its caller stopped waiting. */
+  operationDeadlineAt?: number;
   endpointType: string;
   windowMs: number;
   maxRequests: number;
@@ -145,6 +153,22 @@ interface RateLimitWindow {
   windowMs: number;
   maxRequests: number;
   count: number;
+  receipts?: RateLimitReceipt[];
+}
+
+interface RateLimitReceipt {
+  operationId: string;
+  operationDeadlineAt: number;
+  expiresAt: number;
+  windowStartedAt: number;
+  windowMs: number;
+  maxRequests: number;
+  decision: {
+    allowed: boolean;
+    remaining: number;
+    resetAt: number;
+    retryAfter?: number;
+  };
 }
 
 type RateLimitWindows = Record<string, RateLimitWindow>;
@@ -164,6 +188,11 @@ const MAX_LEASE_AGE_MS = 20 * 60_000;
 const RECOVERY_RETRY_MS = 60_000;
 const MAX_ACTIVE_LEASES = 2_048;
 const MAX_SETTLED_REQUEST_IDS = 2_048;
+const RATE_LIMIT_OPERATION_VALIDITY_MS = 3_000;
+// Both internal attempts finish within three seconds. Retaining every receipt
+// for ten seconds covers all retryable in-flight operations without imposing a
+// concurrency-sensitive FIFO cap; the next request prunes expired receipts.
+const RATE_LIMIT_RECEIPT_TTL_MS = 10_000;
 const MAX_ALARM_LEASE_MUTATIONS = 32;
 const MAX_RECOVERY_CONTEXT_BYTES = 32_768;
 // 512 KiB fits only because this class is SQLite-backed (wrangler migration
@@ -351,7 +380,15 @@ function cloneRateLimitWindows(windows: RateLimitWindows): RateLimitWindows {
   return Object.fromEntries(
     Object.entries(windows).map(([endpointType, window]) => [
       endpointType,
-      { ...window },
+      {
+        ...window,
+        ...(window.receipts && {
+          receipts: window.receipts.map((receipt) => ({
+            ...receipt,
+            decision: { ...receipt.decision },
+          })),
+        }),
+      },
     ]),
   );
 }
@@ -831,6 +868,20 @@ export class InferenceAdmissionGate {
     });
   }
 
+  private async authorizedLease(
+    request: AuthorizedLeaseRequest,
+  ): Promise<Response> {
+    if (
+      !request.credential ||
+      request.credential.organizationId !== request.organizationId
+    ) {
+      return jsonError("Invalid authorized inference admission lease", 400);
+    }
+    const denial = await this.credentialDenial(request.credential);
+    if (denial) return denial;
+    return await this.lease(request);
+  }
+
   private async hydrate(request: HydrateRequest): Promise<Response> {
     if (
       !nonNegativeFinite(request.balanceUsd) ||
@@ -1011,6 +1062,14 @@ export class InferenceAdmissionGate {
 
   private async rateLimit(request: RateLimitRequest): Promise<Response> {
     if (
+      (request.operationId === undefined) !==
+        (request.operationDeadlineAt === undefined) ||
+      (request.operationId !== undefined &&
+        (!validTrimmedId(request.operationId) ||
+          request.operationId.length > 128)) ||
+      (request.operationDeadlineAt !== undefined &&
+        (!Number.isSafeInteger(request.operationDeadlineAt) ||
+          request.operationDeadlineAt <= 0)) ||
       !RATE_LIMIT_ENDPOINTS.has(request.endpointType) ||
       !Number.isSafeInteger(request.windowMs) ||
       request.windowMs <= 0 ||
@@ -1035,6 +1094,45 @@ export class InferenceAdmissionGate {
     const windowStartedAt = request.windowStartedAt ?? currentWindowStartedAt;
     const windows = cloneRateLimitWindows(this.loadRateLimitWindows());
     const existing = windows[request.endpointType];
+    const activeReceipts =
+      existing?.receipts?.filter((candidate) => candidate.expiresAt > now) ??
+      [];
+    const receipt = request.operationId
+      ? activeReceipts.find(
+          (candidate) => candidate.operationId === request.operationId,
+        )
+      : undefined;
+    if (receipt) {
+      if (
+        receipt.operationDeadlineAt !== request.operationDeadlineAt ||
+        receipt.windowStartedAt !== windowStartedAt ||
+        receipt.windowMs !== request.windowMs ||
+        receipt.maxRequests !== request.maxRequests
+      ) {
+        return jsonError(
+          "Inference rate-limit operation was reused with a different policy",
+          409,
+        );
+      }
+      return Response.json(receipt.decision, {
+        status: receipt.decision.allowed ? 200 : 429,
+      });
+    }
+    if (
+      request.operationDeadlineAt !== undefined &&
+      (request.operationDeadlineAt <= now ||
+        request.operationDeadlineAt > now + RATE_LIMIT_OPERATION_VALIDITY_MS)
+    ) {
+      return Response.json(
+        {
+          success: false,
+          code: "inference_rate_limit_operation_expired",
+          error:
+            "Inference rate-limit operation is outside its validity window",
+        },
+        { status: 409 },
+      );
+    }
     if (existing && existing.windowStartedAt > windowStartedAt) {
       const resetAt = existing.windowStartedAt + existing.windowMs;
       return Response.json(
@@ -1051,35 +1149,52 @@ export class InferenceAdmissionGate {
       existing &&
       existing.windowStartedAt === windowStartedAt &&
       existing.windowMs === request.windowMs
-        ? { ...existing, maxRequests: request.maxRequests }
+        ? {
+            windowStartedAt: existing.windowStartedAt,
+            windowMs: existing.windowMs,
+            maxRequests: request.maxRequests,
+            count: existing.count,
+            ...(activeReceipts.length > 0 && { receipts: activeReceipts }),
+          }
         : {
             windowStartedAt,
             windowMs: request.windowMs,
             maxRequests: request.maxRequests,
             count: 0,
+            ...(activeReceipts.length > 0 && { receipts: activeReceipts }),
           };
     current.count = Math.min(current.count + 1, Number.MAX_SAFE_INTEGER);
+    const allowed = current.count <= request.maxRequests;
+    const resetAt = windowStartedAt + request.windowMs;
+    const decision = {
+      allowed,
+      remaining: Math.max(0, request.maxRequests - current.count),
+      resetAt,
+      retryAfter: allowed
+        ? undefined
+        : Math.max(1, Math.ceil((resetAt - now) / 1_000)),
+    };
+    if (request.operationId && request.operationDeadlineAt !== undefined) {
+      current.receipts ??= [];
+      current.receipts.push({
+        operationId: request.operationId,
+        operationDeadlineAt: request.operationDeadlineAt,
+        expiresAt: now + RATE_LIMIT_RECEIPT_TTL_MS,
+        windowStartedAt,
+        windowMs: request.windowMs,
+        maxRequests: request.maxRequests,
+        decision,
+      });
+    }
     windows[request.endpointType] = current;
     this.saveRateLimitWindows(windows);
 
-    const allowed = current.count <= request.maxRequests;
-    const resetAt = windowStartedAt + request.windowMs;
-    return Response.json(
-      {
-        allowed,
-        remaining: Math.max(0, request.maxRequests - current.count),
-        resetAt,
-        retryAfter: allowed
-          ? undefined
-          : Math.max(1, Math.ceil((resetAt - now) / 1_000)),
-      },
-      { status: allowed ? 200 : 429 },
-    );
+    return Response.json(decision, { status: allowed ? 200 : 429 });
   }
 
-  private async credentialCheck(
+  private async credentialDenial(
     request: CredentialCheckRequest,
-  ): Promise<Response> {
+  ): Promise<Response | null> {
     if (
       !validTrimmedId(request.organizationId) ||
       !validTrimmedId(request.userId) ||
@@ -1131,7 +1246,7 @@ export class InferenceAdmissionGate {
             { allowed: false, reason: "credential_revoked" },
             { status: 403 },
           )
-        : Response.json({ allowed: true });
+        : null;
     }
 
     if (revocations.get(credentialKeys[0] ?? "") === true) {
@@ -1148,7 +1263,15 @@ export class InferenceAdmissionGate {
           { allowed: false, reason: "session_revoked" },
           { status: 403 },
         )
-      : Response.json({ allowed: true });
+      : null;
+  }
+
+  private async credentialCheck(
+    request: CredentialCheckRequest,
+  ): Promise<Response> {
+    return (
+      (await this.credentialDenial(request)) ?? Response.json({ allowed: true })
+    );
   }
 
   private async revokeCredential(
@@ -1245,6 +1368,7 @@ export class InferenceAdmissionGate {
     }
     let body:
       | LeaseRequest
+      | AuthorizedLeaseRequest
       | HydrateRequest
       | SettleRequest
       | LeaseIdentityRequest
@@ -1259,6 +1383,7 @@ export class InferenceAdmissionGate {
     try {
       body = (await request.json()) as
         | LeaseRequest
+        | AuthorizedLeaseRequest
         | HydrateRequest
         | SettleRequest
         | LeaseIdentityRequest
@@ -1278,6 +1403,13 @@ export class InferenceAdmissionGate {
     const path = new URL(request.url).pathname;
     if (path === "/lease") {
       return await this.serialize(() => this.lease(body as LeaseRequest));
+    }
+    if (path === "/lease-authorized") {
+      return await this.serializeRevocation(() =>
+        this.serialize(() =>
+          this.authorizedLease(body as AuthorizedLeaseRequest),
+        ),
+      );
     }
     if (path === "/hydrate") {
       return await this.serialize(() => this.hydrate(body as HydrateRequest));

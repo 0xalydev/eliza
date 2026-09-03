@@ -4,11 +4,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  isCloudflarePlacement,
   parseArgs,
   parseAuthServerTiming,
   parseAuthTrace,
   probeAuthGuardSample,
   probeAuthSample,
+  runAuthProbes,
   sanitizeInferenceAuthTail,
   sanitizeInferenceAuthTelemetry,
   summarizeAuthSamples,
@@ -17,6 +19,15 @@ import {
 } from "./inference-auth-latency.mjs";
 
 const SHA = "a".repeat(40);
+
+test("Cloudflare placement values retain only documented local and remote colos", () => {
+  assert.equal(isCloudflarePlacement("local-ORD"), true);
+  assert.equal(isCloudflarePlacement("remote-FRA"), true);
+  assert.equal(isCloudflarePlacement("local"), false);
+  assert.equal(isCloudflarePlacement("remote"), false);
+  assert.equal(isCloudflarePlacement("LOCAL-ORD"), false);
+  assert.equal(isCloudflarePlacement(null), false);
+});
 
 function authHeader(phase) {
   return phase === "hit"
@@ -77,6 +88,75 @@ test("parseArgs requires exact HTTPS deployment provenance and sample counts", (
       ]),
     /HTTPS/,
   );
+  const withoutSuspended = parseArgs([
+    "--base-url",
+    "https://preview.example",
+    "--api-key-env",
+    "AUTH_KEY",
+    "--probe-token-env",
+    "PROBE_TOKEN",
+    "--deploy-sha",
+    SHA,
+  ]);
+  assert.equal(withoutSuspended.suspendedApiKeyEnv, "");
+});
+
+test("auth probe omits suspended credentials and records not_requested explicitly", async () => {
+  const emitted = [];
+  const fetchImpl = async (url, init) => {
+    if (url.endsWith("/api/health")) {
+      return Response.json({ commit: SHA, environment: "staging" });
+    }
+    const key = init.headers["X-API-Key"];
+    const traceId = init.headers["X-Eliza-Trace-Id"];
+    const probe = init.headers["X-Eliza-Auth-Probe"];
+    const invalid = key !== "eliza_valid";
+    const forcedMiss =
+      typeof probe === "string" && !probe.startsWith("invalid-control:");
+    const auth = invalid
+      ? "v=1;credential=x_api_key;probe=off;available=available;backend=cloudflare_kv;read=miss;authoritative=rejected;write=not_run;result=rejected"
+      : forcedMiss
+        ? authHeader("miss")
+        : authHeader("hit");
+    const timings = invalid
+      ? "auth_extract;dur=0.1, auth_cache_available;dur=0.1, auth_cache_read;dur=1, auth_key_lookup;dur=3, auth_resolve;dur=5"
+      : timingHeader(forcedMiss ? "miss" : "hit");
+    return new Response(null, {
+      status: invalid ? 401 : 400,
+      headers: {
+        "X-Eliza-Trace-Id": traceId,
+        "X-Eliza-Auth-Trace": auth,
+        "Server-Timing": timings,
+      },
+    });
+  };
+
+  const result = await runAuthProbes(
+    {
+      baseUrl: "https://preview.example",
+      apiKeyEnv: "AUTH_KEY",
+      suspendedApiKeyEnv: "",
+      probeTokenEnv: "PROBE_TOKEN",
+      deploySha: SHA,
+      hitCount: 1,
+      missCount: 1,
+      timeoutMs: 1_000,
+      intervalMs: 0,
+    },
+    {
+      env: { AUTH_KEY: "eliza_valid", PROBE_TOKEN: "private-probe" },
+      fetchImpl,
+      emit: (record) => emitted.push(record),
+      sleep: async () => {},
+    },
+  );
+
+  assert.deepEqual(
+    result.guards.map((record) => record.guard),
+    ["invalid_key", "forged_probe"],
+  );
+  assert.equal(result.summary.suspendedGuard, "not_requested");
+  assert.equal(JSON.stringify(emitted).includes("private-probe"), false);
 });
 
 test("auth parsers accept only bounded enums and finite auth durations", () => {
@@ -105,7 +185,7 @@ test("auth parsers accept only bounded enums and finite auth durations", () => {
 });
 
 test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
-  const traceId = "0190f2f1-8b5a-7000-8000-000000000001";
+  const traceId = "0190f2f18b5a70008000000000000001";
   const telemetry = {
     v: 1,
     traceId,
@@ -148,7 +228,7 @@ test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
               "[InferenceAuth] trace",
               {
                 ...telemetry,
-                traceId: "0190f2f1-8b5a-7000-8000-000000000099",
+                traceId: "0190f2f18b5a70008000000000000099",
                 result: "unbounded-private-result",
                 userId: "private-user",
               },
@@ -204,11 +284,7 @@ test("Worker Tail sanitizer retains only correlated bounded telemetry", () => {
   );
   assert.throws(
     () =>
-      sanitizeInferenceAuthTail(
-        raw,
-        ["0190f2f1-8b5a-7000-8000-000000000002"],
-        SHA,
-      ),
+      sanitizeInferenceAuthTail(raw, ["0190f2f18b5a70008000000000000002"], SHA),
     /omitted 1/,
   );
 });
@@ -217,6 +293,7 @@ test("live sample retains timings and correlation but no credential, probe token
   const apiKey = "eliza_private_api_key_material";
   const probeToken = "private_probe_control_token";
   let sentProbeHeader = "";
+  let sentTraceId = "";
   let sentBody = "";
   const record = await probeAuthSample({
     baseUrl: "https://preview.example",
@@ -232,6 +309,7 @@ test("live sample retains timings and correlation but no credential, probe token
     })(),
     fetchImpl: async (_url, init) => {
       sentProbeHeader = init.headers["X-Eliza-Auth-Probe"];
+      sentTraceId = init.headers["X-Eliza-Trace-Id"];
       sentBody = init.body;
       return new Response(null, {
         status: 400,
@@ -247,6 +325,7 @@ test("live sample retains timings and correlation but no credential, probe token
   });
 
   assert.match(sentProbeHeader, /^private_probe_control_token:[0-9a-f]{32}$/);
+  assert.match(sentTraceId, /^[0-9a-f]{32}$/);
   assert.equal(sentBody, "{}");
   assert.equal(record.phase, "miss");
   assert.equal(record.totalMs, 12);
@@ -452,6 +531,7 @@ test("guard probes retain 401 taxonomy and reject forged probe controls", async 
   });
   assert.equal(invalid.status, 401);
   assert.equal(invalid.auth.result, "rejected");
+  assert.match(invalid.traceId, /^[0-9a-f]{32}$/);
 
   const suspended = await probeAuthGuardSample({
     baseUrl: "https://preview.example",
@@ -464,6 +544,7 @@ test("guard probes retain 401 taxonomy and reject forged probe controls", async 
   });
   assert.equal(suspended.status, 403);
   assert.equal(suspended.auth.result, "suspended");
+  assert.match(suspended.traceId, /^[0-9a-f]{32}$/);
   assert.equal(
     JSON.stringify(suspended).includes("private_probe_control_token"),
     false,
@@ -503,6 +584,7 @@ test("summary reports sample volume and latency distributions without thresholds
   ];
   const summary = summarizeAuthSamples(passing, SHA);
   assert.deepEqual(summary.counts, { hit: 30, miss: 10 });
+  assert.equal(summary.suspendedGuard, "not_requested");
   assert.deepEqual(summary.hitAuthResolveMs, {
     p50: 10,
     p90: 10,

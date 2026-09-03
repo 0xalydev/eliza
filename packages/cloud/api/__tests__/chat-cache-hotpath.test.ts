@@ -256,6 +256,35 @@ beforeEach(() => {
 });
 
 describe("/v1/chat Worker cache hot path", () => {
+  test("malformed request resolves auth once without deferral or provider admission", async () => {
+    const executionCtx = {
+      waitUntil() {},
+      passThroughOnException() {},
+      props: {},
+    } as unknown as ExecutionContext;
+    const response = await chatRoute.fetch(
+      new Request("https://api.test/", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer eliza_cached",
+        },
+        body: JSON.stringify({ messages: [] }),
+      }),
+      {} as never,
+      executionCtx,
+    );
+
+    expect(response.status).toBe(400);
+    expect(resolveInferenceAuthContext).toHaveBeenCalledTimes(1);
+    expect(resolveInferenceAuthContext).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ deferStrongCredentialCheck: false }),
+    );
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
   test("enabled Worker admission rejects a missing execution context without database fallback", async () => {
     const response = await chatRoute.fetch(
       new Request("https://api.test/", {
@@ -275,6 +304,79 @@ describe("/v1/chat Worker cache hot path", () => {
     expect(resolveInferenceAuthContext).not.toHaveBeenCalled();
     expect(getCurrentUser).not.toHaveBeenCalled();
     expect(getAnonymousUser).not.toHaveBeenCalled();
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
+  test("preserves a cached standing 503 before admission or provider dispatch", async () => {
+    authResolutionImpl = async () => ({
+      kind: "rejected" as const,
+      status: 503 as const,
+    });
+    const executionCtx = {
+      waitUntil() {},
+      passThroughOnException() {},
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const response = await chatRoute.fetch(
+      new Request("https://api.test/", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer eliza_cached",
+        },
+        body: JSON.stringify({
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+      {} as never,
+      executionCtx,
+    );
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("1");
+    await expect(response.json()).resolves.toMatchObject({
+      code: "service_unavailable",
+      reason: "authorization_unavailable",
+    });
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
+  test("returns a typed cached standing reason before provider dispatch", async () => {
+    authResolutionImpl = async () => ({
+      kind: "rejected" as const,
+      status: 403 as const,
+      reason: "credential_inactive" as const,
+    });
+    const executionCtx = {
+      waitUntil() {},
+      passThroughOnException() {},
+      props: {},
+    } as unknown as ExecutionContext;
+
+    const response = await chatRoute.fetch(
+      new Request("https://api.test/", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer eliza_cached",
+        },
+        body: JSON.stringify({
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+      {} as never,
+      executionCtx,
+    );
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: "API key is inactive",
+      code: "access_denied",
+      reason: "credential_inactive",
+    });
     expect(admitOrganizationInference).not.toHaveBeenCalled();
     expect(streamText).not.toHaveBeenCalled();
   });
