@@ -2449,42 +2449,77 @@
       "idx": 349,
       "version": "7",
       "when": 1794254400057,
-      "tag": "0366_agent_backup_admission_recovery_cursor",
+      "tag": "0366_agent_backup_admission_enrollment_source_indexes",
       "breakpoints": true
     },
     {
       "idx": 350,
       "version": "7",
       "when": 1794254400058,
-      "tag": "0367_agent_sandbox_replacement_restore_locator",
+      "tag": "0367_agent_backup_admission_enrollment_watermark_guard",
       "breakpoints": true
     },
     {
       "idx": 351,
       "version": "7",
       "when": 1794254400059,
-      "tag": "0368_agent_vault_key_seed_receipts_per_replacement",
+      "tag": "0368_agent_backup_admission_enrollment_source_stamp",
       "breakpoints": true
     },
     {
       "idx": 352,
       "version": "7",
       "when": 1794254400060,
-      "tag": "0369_agent_backup_restore_exact_image_authority",
+      "tag": "0369_agent_backup_admission_recovery_cursor",
       "breakpoints": true
     },
     {
       "idx": 353,
       "version": "7",
       "when": 1794254400061,
-      "tag": "0370_agent_backup_restore_v3_candidates",
+      "tag": "0370_agent_sandbox_replacement_restore_locator",
       "breakpoints": true
     },
     {
       "idx": 354,
       "version": "7",
       "when": 1794254400062,
-      "tag": "0371_agent_backup_restore_v3_candidate_guards",
+      "tag": "0371_agent_vault_key_seed_receipts_per_replacement",
+      "breakpoints": true
+    },
+    {
+      "idx": 355,
+      "version": "7",
+      "when": 1794254400063,
+      "tag": "0372_agent_backup_restore_exact_image_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 356,
+      "version": "7",
+      "when": 1796083200000,
+      "tag": "0373_subscription_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 357,
+      "version": "7",
+      "when": 1796083200001,
+      "tag": "0374_subscription_funding_transaction_uniqueness",
+      "breakpoints": true
+    },
+    {
+      "idx": 358,
+      "version": "7",
+      "when": 1796083200002,
+      "tag": "0375_agent_backup_restore_v3_candidates",
+      "breakpoints": true
+    },
+    {
+      "idx": 359,
+      "version": "7",
+      "when": 1796083200003,
+      "tag": "0376_agent_backup_restore_v3_candidate_guards",
       "breakpoints": true
     }
   ]

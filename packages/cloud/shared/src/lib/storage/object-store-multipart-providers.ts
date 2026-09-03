@@ -10,7 +10,9 @@ import {
 import type { ExactObjectStorageBackend } from "./object-store";
 import {
   lateAbortCreatedUpload,
+  type ProviderMutationRequestContext,
   type ProviderRequestContext,
+  registerMultipartCleanupWithoutMasking,
 } from "./object-store-multipart-control";
 import {
   isNoSuchUpload,
@@ -21,6 +23,7 @@ import {
   type MultipartObjectUploadHandle,
   normalizedEtag,
   type ProviderMultipartHandle,
+  providerStatus,
   requireUploadId,
   sha256HexToBase64,
   type ValidatedMultipartObjectUploadPlan,
@@ -30,6 +33,7 @@ import type {
   RuntimeR2MultipartUpload,
   RuntimeR2UploadedPart,
 } from "./r2-runtime-binding";
+import { isSingleAttemptObjectStorageClient } from "./s3-compatible-client";
 
 export type S3MultipartBackend = Extract<ExactObjectStorageBackend, { s3Client: unknown }>;
 
@@ -86,6 +90,30 @@ export function providerHandleForS3(
         }),
         { abortSignal: signal },
       );
+      try {
+        await backend.s3Client.send(
+          new ListPartsCommand({
+            Bucket: backend.locator.bucket,
+            Key: key,
+            UploadId: uploadId,
+            MaxParts: 1,
+          }),
+          { abortSignal: signal },
+        );
+      } catch (error) {
+        // error-policy:J2 accept only authoritative absence; otherwise retain
+        // the inventory failure under the public unconfirmed-abort code.
+        if (isNoSuchUpload(error)) return;
+        throw lifecycle(
+          "OBJECT_STORAGE_MULTIPART_ABORT_UNCONFIRMED",
+          "Multipart provider abort could not be confirmed by part inventory",
+          error,
+        );
+      }
+      throw lifecycle(
+        "OBJECT_STORAGE_MULTIPART_ABORT_UNCONFIRMED",
+        "Multipart provider still exposes the upload after abort",
+      );
     },
   };
 }
@@ -135,10 +163,21 @@ export function requireRuntimeMultipart(backend: ExactObjectStorageBackend): {
   };
 }
 
+/** Reject S3 transports whose SDK may invisibly repeat fenced provider mutations. */
+export function requireSingleAttemptS3Mutations(backend: ExactObjectStorageBackend): void {
+  if (backend.runtimeBucket) return;
+  if (!isSingleAttemptObjectStorageClient(backend.s3Client)) {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_INVALID",
+      "Multipart S3 mutations require a module-owned single-attempt client",
+    );
+  }
+}
+
 export async function createProviderHandle(input: {
   backend: ExactObjectStorageBackend;
   plan: ValidatedMultipartObjectUploadPlan;
-  context: ProviderRequestContext;
+  context: ProviderMutationRequestContext;
 }): Promise<ProviderMultipartHandle> {
   const expectedBase64 = sha256HexToBase64(input.plan.expectedSha256);
   if (input.backend.runtimeBucket) {
@@ -151,43 +190,87 @@ export async function createProviderHandle(input: {
     );
     const upload = await input.context.race(request, async (lateUpload) => {
       const lateHandle = providerHandleForRuntime(lateUpload);
-      requireUploadId(lateHandle.uploadId);
       await lateAbortCreatedUpload(lateHandle);
     });
     return providerHandleForRuntime(upload);
   }
 
   const s3Backend = input.backend as S3MultipartBackend;
-  const output = await input.context.race(
-    s3Backend.s3Client.send(
-      new CreateMultipartUploadCommand({
-        Bucket: s3Backend.locator.bucket,
-        Key: input.plan.key,
-        ContentType: input.plan.contentType,
-        Metadata: { [MULTIPART_SHA256_METADATA_KEY]: expectedBase64 },
-        ChecksumAlgorithm: "SHA256",
-      }),
-      { abortSignal: input.context.signal },
-    ),
-    async (lateOutput) => {
-      if (!lateOutput.UploadId) return;
-      await lateAbortCreatedUpload(
-        providerHandleForS3(s3Backend, input.plan.key, requireUploadId(lateOutput.UploadId)),
+  let output;
+  try {
+    output = await input.context.race(
+      s3Backend.s3Client.send(
+        new CreateMultipartUploadCommand({
+          Bucket: s3Backend.locator.bucket,
+          Key: input.plan.key,
+          ContentType: input.plan.contentType,
+          Metadata: { [MULTIPART_SHA256_METADATA_KEY]: expectedBase64 },
+          ChecksumAlgorithm: "SHA256",
+        }),
+        { abortSignal: input.context.signal },
+      ),
+      async (lateOutput) => {
+        const lateUploadId = lateOutput.UploadId;
+        if (typeof lateUploadId !== "string" || lateUploadId.length === 0) return;
+        await lateAbortCreatedUpload(providerHandleForS3(s3Backend, input.plan.key, lateUploadId));
+      },
+    );
+  } catch (error) {
+    // error-policy:J2 translate the authoritative unsupported response here;
+    // every other outcome is preserved for the facade's indeterminate wrapper.
+    if (providerStatus(error) === 501) {
+      throw lifecycle(
+        "OBJECT_STORAGE_MULTIPART_UNSUPPORTED",
+        "S3-compatible storage does not expose multipart upload operations",
+        error,
       );
-    },
-  );
-  const uploadId = requireUploadId(output.UploadId);
-  const provider = providerHandleForS3(s3Backend, input.plan.key, uploadId);
+    }
+    throw error;
+  }
+  const rawUploadId = output.UploadId;
+  const cleanupProvider =
+    typeof rawUploadId === "string" && rawUploadId.length > 0
+      ? providerHandleForS3(s3Backend, input.plan.key, rawUploadId)
+      : null;
+  let uploadId: string;
+  try {
+    uploadId = requireUploadId(rawUploadId);
+  } catch (error) {
+    if (cleanupProvider) {
+      const registrationError = registerMultipartCleanupWithoutMasking(
+        input.context,
+        lateAbortCreatedUpload(cleanupProvider),
+        "created-upload-invalid-id",
+      );
+      if (registrationError !== null) {
+        throw lifecycle(
+          "OBJECT_STORAGE_MULTIPART_CREATE_INDETERMINATE",
+          "Multipart storage returned an invalid upload handle",
+          new AggregateError(
+            [error, registrationError],
+            "Multipart handle validation and cleanup registration failed",
+          ),
+        );
+      }
+    }
+    throw error;
+  }
+  const provider = cleanupProvider ?? providerHandleForS3(s3Backend, input.plan.key, uploadId);
   if (
     (output.Key !== undefined && output.Key !== input.plan.key) ||
     (output.Bucket !== undefined && output.Bucket !== s3Backend.locator.bucket)
   ) {
     // The returned upload id is ours, but provider-echoed locator metadata is
     // inconsistent. Abort using the exact requested bucket/key before failing.
-    input.context.registerCleanup(lateAbortCreatedUpload(provider));
+    const registrationError = registerMultipartCleanupWithoutMasking(
+      input.context,
+      lateAbortCreatedUpload(provider),
+      "created-upload-locator-mismatch",
+    );
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_CREATE_INDETERMINATE",
       "Multipart storage returned a handle for another exact locator",
+      registrationError ?? undefined,
     );
   }
   return provider;
@@ -217,6 +300,8 @@ export async function verifyS3Resume(input: {
         ),
       );
     } catch (error) {
+      // error-policy:J3 only authoritative NoSuchUpload is normalized to the
+      // explicit missing state; every other provider response remains failure.
       if (isNoSuchUpload(error)) return "missing";
       throw error;
     }
