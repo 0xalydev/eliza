@@ -34,6 +34,7 @@ import {
   markSsoBridgeAttempt,
   markSsoLoggedOut,
   mintSsoCode,
+  pairedAppLoginUrlForMintHost,
   pairedAppOrigin,
   performSsoExchange,
   prepareSsoAccountSwitch,
@@ -177,6 +178,31 @@ describe("buildSsoBridgeErrorUrl", () => {
     expect(
       buildSsoBridgeErrorUrl("auth_failed", "https://evil.example/chat"),
     ).toBe("/auth/error?reason=auth_failed&returnTo=%2F");
+  });
+});
+
+describe("pairedAppLoginUrlForMintHost", () => {
+  it("restarts a mint-host recovery on the paired app and preserves its deep-link", () => {
+    expect(
+      pairedAppLoginUrlForMintHost(
+        "staging.eliza.app",
+        "/chat?thread=one#latest",
+      ),
+    ).toBe(
+      "https://cloud-staging.eliza.app/login?returnTo=%2Fchat%3Fthread%3Done%23latest",
+    );
+  });
+
+  it("is inert off a mint host and sanitizes an unsafe destination", () => {
+    expect(
+      pairedAppLoginUrlForMintHost("cloud-staging.eliza.app", "/chat"),
+    ).toBeNull();
+    expect(
+      pairedAppLoginUrlForMintHost(
+        "staging.eliza.app",
+        "https://evil.example/steal",
+      ),
+    ).toBe("https://cloud-staging.eliza.app/login?returnTo=%2F");
   });
 });
 

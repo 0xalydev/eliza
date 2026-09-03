@@ -9,9 +9,19 @@ import {
   waitFor,
 } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { appModeNavigation } from "../../../app-mode/app-mode";
 
 const navigateMock = vi.hoisted(() => vi.fn());
+const replaceMock = vi.hoisted(() => vi.fn());
 const searchParamsRef = vi.hoisted(() => ({
   current: new URLSearchParams(
     "reason=sync_failed&returnTo=%2Fchat%3Fthread%3Done",
@@ -35,16 +45,23 @@ vi.mock("../../../shell/CloudI18nProvider", () => ({
 
 vi.mock("../../lib/use-page-title", () => ({ usePageTitle: () => {} }));
 
-import AuthErrorPage from "./auth-error-page";
+import AuthErrorPage, { AuthErrorPageForHost } from "./auth-error-page";
+
+const realReplace = appModeNavigation.replace;
 
 beforeEach(() => {
   navigateMock.mockReset();
+  replaceMock.mockReset();
+  appModeNavigation.replace = replaceMock;
   searchParamsRef.current = new URLSearchParams(
     "reason=sync_failed&returnTo=%2Fchat%3Fthread%3Done",
   );
 });
 
 afterEach(cleanup);
+afterAll(() => {
+  appModeNavigation.replace = realReplace;
+});
 
 describe("AuthErrorPage", () => {
   it("announces the recovery surface by focusing its page heading", async () => {
@@ -65,6 +82,16 @@ describe("AuthErrorPage", () => {
     expect(navigateMock).toHaveBeenCalledWith(
       "/login?returnTo=%2Fchat%3Fthread%3Done",
     );
+  });
+
+  it("restarts mint-host recovery on the paired app login", () => {
+    render(<AuthErrorPageForHost hostname="staging.eliza.app" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Try Again" }));
+    expect(replaceMock).toHaveBeenCalledWith(
+      "https://cloud-staging.eliza.app/login?returnTo=%2Fchat%3Fthread%3Done",
+    );
+    expect(navigateMock).not.toHaveBeenCalled();
   });
 
   it("rejects a cross-origin retry target and falls back to join", () => {

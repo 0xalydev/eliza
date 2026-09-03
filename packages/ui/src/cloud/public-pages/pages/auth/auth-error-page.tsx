@@ -7,17 +7,26 @@ import { AlertCircle, Home, RefreshCw } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { Button } from "../../../../components/primitives";
+import { appModeNavigation } from "../../../app-mode/app-mode";
 import { useCloudT } from "../../../shell/CloudI18nProvider";
+import { pairedAppLoginUrlForMintHost } from "../../../sso-bridge/sso-bridge";
 import { resolveLoginReturnTo } from "../../lib/login-return-to";
 import { usePageTitle } from "../../lib/use-page-title";
 import { AuthResultShell } from "./auth-result-shell";
 
-export default function AuthErrorPage() {
+export function AuthErrorPageForHost({
+  hostname,
+}: {
+  /** Injectable for the mint-host recovery composition test. */
+  hostname: string;
+}) {
   const t = useCloudT();
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const reason = searchParams.get("reason") || "unknown";
   const returnTo = resolveLoginReturnTo(searchParams);
+  const localLoginUrl = `/login?returnTo=${encodeURIComponent(returnTo)}`;
+  const pairedAppLoginUrl = pairedAppLoginUrlForMintHost(hostname, returnTo);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
@@ -84,9 +93,13 @@ export default function AuthErrorPage() {
 
       <div className="w-full space-y-3">
         <Button
-          onClick={() =>
-            navigate(`/login?returnTo=${encodeURIComponent(returnTo)}`)
-          }
+          onClick={() => {
+            if (pairedAppLoginUrl) {
+              appModeNavigation.replace(pairedAppLoginUrl);
+              return;
+            }
+            navigate(localLoginUrl);
+          }}
           className="hosted-signin-focus-emphasis h-11 w-full bg-accent text-accent-foreground hover:bg-accent-hover"
         >
           <RefreshCw className="mr-2 size-4" aria-hidden="true" />
@@ -111,4 +124,10 @@ export default function AuthErrorPage() {
       </p>
     </AuthResultShell>
   );
+}
+
+export default function AuthErrorPage() {
+  const hostname =
+    typeof window === "undefined" ? "" : window.location.hostname;
+  return <AuthErrorPageForHost hostname={hostname} />;
 }

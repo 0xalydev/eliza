@@ -169,6 +169,22 @@ export function buildSsoBridgeErrorUrl(
   return `/auth/error?${params.toString()}`;
 }
 
+/**
+ * Recovery from a mint-host error must restart on the paired app host. A
+ * same-origin `/login` on the marketing host cannot restore app-only paths
+ * such as `/chat`: its authenticated catch-all intentionally hands users to
+ * `/cloud` instead. The hostname is resolved only through the fixed bridge
+ * pair allowlist, and the destination remains a sanitized app-local path.
+ */
+export function pairedAppLoginUrlForMintHost(
+  hostname: string,
+  returnTo: string,
+): string | null {
+  const appOrigin = pairedAppOrigin(hostname);
+  if (!appOrigin) return null;
+  return `${appOrigin}/login?returnTo=${encodeURIComponent(sanitizeBridgeReturnTo(returnTo))}`;
+}
+
 // ---------------------------------------------------------------------------
 // State nonce + PKCE verifier (defect fix: handshake binding + code theft)
 // ---------------------------------------------------------------------------
