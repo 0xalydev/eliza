@@ -514,7 +514,9 @@ describe("0375/0376 restore-v3 candidate authority", () => {
         breakpoints: boolean;
       }>;
     };
-    expect(journal.entries.filter(({ tag }) => tag === FOUNDATION_TAG || tag === GUARDS_TAG)).toEqual([
+    expect(
+      journal.entries.filter(({ tag }) => tag === FOUNDATION_TAG || tag === GUARDS_TAG),
+    ).toEqual([
       { idx: 358, version: "7", when: 1796083200002, tag: FOUNDATION_TAG, breakpoints: true },
       { idx: 359, version: "7", when: 1796083200003, tag: GUARDS_TAG, breakpoints: true },
     ]);
