@@ -10,12 +10,11 @@
  * still hold the owner's finance rows in `app_lifeops`, so on first boot we
  * copy them across — once, idempotently, and WITHOUT ever touching the source.
  *
- * Guards (per table, independently):
- *   1. Skip if the source table does not exist (fresh install / already dropped).
- *   2. Skip if the target table is non-empty (migration already ran, or the
- *      plugin owns live data).
- *   3. Otherwise copy every source row that is not already present in the
- *      target (a doubly-safe NOT EXISTS guard on the primary key).
+ * Each source table is reconciled by primary key even when the target already
+ * contains live data. Missing rows are copied, same-key value drift fails
+ * closed, and complete readback is required before receipt completion.
+ * Verification uses `/v2` receipts so unsafe completed `/v1` receipts trigger
+ * one repair pass without making later owner deletions replay from the source.
  *
  * The source table is never dropped. A security sweep does alter Plaid rows in
  * both schemas after copying: retired plaintext access tokens are removed and
@@ -24,7 +23,12 @@
  */
 
 import { type IAgentRuntime, logger, Service } from "@elizaos/core";
-import { runCarveOutMigration } from "@elizaos/plugin-sql";
+import {
+  assertCarveOutProjectionComplete,
+  type CarveOutDatabase,
+  createDrizzleCarveOutDatabase,
+  runCarveOutMigration,
+} from "@elizaos/plugin-sql";
 
 export const FINANCES_LOG_PREFIX = "[Finances]";
 export const FINANCES_MIGRATION_SERVICE_TYPE = "finances_migration";
@@ -55,11 +59,7 @@ export type SqlExecutor = (
 export interface TableMigrationResult {
   table: MigratedFinanceTable;
   /** `"copied"` ran the INSERT; otherwise the reason it was skipped. */
-  outcome:
-    | "copied"
-    | "source-missing"
-    | "target-non-empty"
-    | "already-migrated";
+  outcome: "copied" | "source-missing" | "already-migrated";
 }
 
 function quoteIdent(name: string): string {
@@ -78,16 +78,6 @@ async function sourceTableExists(
   return rows[0]?.present === true || rows[0]?.present === "true";
 }
 
-async function targetTableIsEmpty(
-  exec: SqlExecutor,
-  table: MigratedFinanceTable,
-): Promise<boolean> {
-  const rows = await exec(
-    `SELECT NOT EXISTS (SELECT 1 FROM ${TARGET_SCHEMA}.${quoteIdent(table)}) AS empty`,
-  );
-  return rows[0]?.empty === true || rows[0]?.empty === "true";
-}
-
 /**
  * Copy a single table from `app_lifeops` to `app_finances`, applying the three
  * guards. Pure aside from the injected executor — the unit tests drive this
@@ -100,10 +90,6 @@ export async function migrateFinanceTable(
   if (!(await sourceTableExists(exec, table))) {
     return { table, outcome: "source-missing" };
   }
-  if (!(await targetTableIsEmpty(exec, table))) {
-    return { table, outcome: "target-non-empty" };
-  }
-
   const target = `${TARGET_SCHEMA}.${quoteIdent(table)}`;
   const source = `${SOURCE_SCHEMA}.${quoteIdent(table)}`;
   // NOT EXISTS on the primary key is redundant given the empty-target guard,
@@ -113,8 +99,15 @@ export async function migrateFinanceTable(
        SELECT s.* FROM ${source} AS s
        WHERE NOT EXISTS (
          SELECT 1 FROM ${target} AS t WHERE t.id = s.id
-       )`,
+       )
+       ON CONFLICT (${quoteIdent("id")}) DO NOTHING`,
   );
+  await assertCarveOutProjectionComplete(exec, {
+    migrationKey: `finances/${table}/v2`,
+    source: { schema: SOURCE_SCHEMA, table },
+    target: { schema: TARGET_SCHEMA, table },
+    keyColumns: ["id"],
+  });
   return { table, outcome: "copied" };
 }
 
@@ -124,14 +117,15 @@ export async function migrateFinanceTable(
  * not yet applied. Returns the per-table outcome for observability/testing.
  */
 export async function migrateFinanceTables(
-  exec: SqlExecutor,
+  database: CarveOutDatabase,
 ): Promise<TableMigrationResult[]> {
-  await exec(`CREATE SCHEMA IF NOT EXISTS ${TARGET_SCHEMA}`);
+  await database.execute(`CREATE SCHEMA IF NOT EXISTS ${TARGET_SCHEMA}`);
   const results: TableMigrationResult[] = [];
   for (const table of MIGRATED_FINANCE_TABLES) {
-    const receipt = await runCarveOutMigration(exec, {
-      key: `finances/${table}/v1`,
-      run: () => migrateFinanceTable(exec, table),
+    const receipt = await runCarveOutMigration(database, {
+      key: `finances/${table}/v2`,
+      sourceTables: [{ schema: SOURCE_SCHEMA, table }],
+      run: (execute) => migrateFinanceTable(execute, table),
       outcome: (result) => result.outcome,
       shouldComplete: (result) => result.outcome !== "source-missing",
     });
@@ -213,6 +207,7 @@ export async function reconcileLegacyProviderTransactionDuplicates(
 
 type RuntimeDb = {
   execute: (query: unknown) => Promise<unknown>;
+  transaction<T>(operation: (transaction: RuntimeDb) => Promise<T>): Promise<T>;
 };
 
 function getRuntimeDb(runtime: IAgentRuntime): RuntimeDb {
@@ -223,25 +218,6 @@ function getRuntimeDb(runtime: IAgentRuntime): RuntimeDb {
     );
   }
   return db;
-}
-
-function extractRows(result: unknown): Array<Record<string, unknown>> {
-  if (Array.isArray(result)) {
-    return result.filter(
-      (row): row is Record<string, unknown> =>
-        typeof row === "object" && row !== null && !Array.isArray(row),
-    );
-  }
-  if (result && typeof result === "object" && "rows" in result) {
-    const rows = (result as { rows: unknown }).rows;
-    if (Array.isArray(rows)) {
-      return rows.filter(
-        (row): row is Record<string, unknown> =>
-          typeof row === "object" && row !== null && !Array.isArray(row),
-      );
-    }
-  }
-  return [];
 }
 
 /**
@@ -264,11 +240,9 @@ export class FinancesMigrationService extends Service {
 
   private async run(): Promise<void> {
     const db = getRuntimeDb(this.runtime);
-    const { sql } = await import("drizzle-orm");
-    const exec: SqlExecutor = async (statement) =>
-      extractRows(await db.execute(sql.raw(statement)));
-
-    const results = await migrateFinanceTables(exec);
+    const database = await createDrizzleCarveOutDatabase(db);
+    const results = await migrateFinanceTables(database);
+    const exec = database.execute;
     await scrubLegacyPlaidCredentials(exec);
     const reconciledProviderTransactionVersions =
       await reconcileLegacyProviderTransactionDuplicates(exec);
