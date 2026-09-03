@@ -66,7 +66,7 @@ describe("subscription authority migrations", () => {
       );
     }
   });
-  test("is the journal tail and seeds existing and future free entitlements", async () => {
+  test("is journaled consecutively and seeds existing and future free entitlements", async () => {
     const db = await database();
     await db.exec("INSERT INTO organizations VALUES ('10000000-0000-4000-8000-000000000002')");
     const rows = await db.query<{ plan_key: string; entitlement_effective: boolean }>(
@@ -79,10 +79,18 @@ describe("subscription authority migrations", () => {
     const journal = JSON.parse(
       await readFile(new URL("meta/_journal.json", import.meta.url), "utf8"),
     ) as { entries: Array<{ idx: number; tag: string }> };
-    expect(journal.entries.at(-1)).toMatchObject({
-      idx: 357,
-      tag: "0374_subscription_funding_transaction_uniqueness",
-    });
+    expect(
+      journal.entries
+        .filter(
+          ({ tag }) =>
+            tag === "0373_subscription_authority" ||
+            tag === "0374_subscription_funding_transaction_uniqueness",
+        )
+        .map(({ idx, tag }) => ({ idx, tag })),
+    ).toEqual([
+      { idx: 356, tag: "0373_subscription_authority" },
+      { idx: 357, tag: "0374_subscription_funding_transaction_uniqueness" },
+    ]);
   });
   test("tenant-fences revisions and excludes overlapping allowance periods", async () => {
     const db = await database();
