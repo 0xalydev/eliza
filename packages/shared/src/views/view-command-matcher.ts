@@ -228,6 +228,24 @@ const POSSESSIVES = [
 
 // Per-view multilingual noun synonyms. Order = match priority.
 const VIEW_NOUNS: Record<string, readonly string[]> = {
+  "pendant-transcript": [
+    "pendant transcript",
+    "pendant voice transcript",
+    "pendant recording transcript",
+  ],
+  files: [
+    "stored files",
+    "stored attachments",
+    "uploaded files",
+    "attachments",
+    "uploads",
+  ],
+  stream: [
+    "activity stream",
+    "live activity stream",
+    "media stream",
+    "live stream",
+  ],
   vault: [
     "vault",
     "secret vault",
@@ -866,12 +884,15 @@ const VIEW_NOUNS: Record<string, readonly string[]> = {
 const VIEW_PRIORITY = [
   "cockpit",
   "task-coordinator",
+  "pendant-transcript",
   "finances",
   "relationships",
   "automations",
+  "files",
   "documents",
   "memories",
   "transcripts",
+  "stream",
   "vault",
   "settings",
   "background",
@@ -1262,8 +1283,19 @@ function stripDiacritics(s: string): string {
  * signal (verb / possessive / view-word / whole-message).
  */
 export function matchViewCommand(text: string | undefined): string | null {
-  const raw = (text ?? "").trim();
+  let raw = (text ?? "").trim();
   if (!raw || raw.length > 160) return null; // commands are short
+  // Some clients deliver command text percent-encoded ("open%20notes",
+  // observed live from the LP3 renderer). A short command containing an
+  // escape decodes before matching; anything that fails to decode (a literal
+  // %, "50% off") matches as written.
+  if (/%[0-9A-Fa-f]{2}/.test(raw)) {
+    try {
+      raw = decodeURIComponent(raw).trim();
+    } catch {
+      // not actually percent-encoded — match the original text
+    }
+  }
   const lower = raw.toLowerCase();
   if (looksLikeCompanionActionRequest(lower)) return null;
   if (NEGATED_NAVIGATION_RE.test(lower)) return null;

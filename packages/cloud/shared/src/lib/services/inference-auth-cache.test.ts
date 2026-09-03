@@ -28,6 +28,7 @@ const {
 const KEY_HASH = hashApiKey("eliza_validator_test_key");
 const STEWARD_USER_ID = "steward-validator-1";
 const ADMISSION = {
+  subscriptionFunded: false,
   balance: { balanceUsd: 100, balanceAt: 1, balanceRevision: "1" },
   rateLimits: {
     completionsRpm: 60,
@@ -89,7 +90,14 @@ describe("session decision validators", () => {
       60,
     );
 
-    await expect(readInferenceSessionAuthDecision(STEWARD_USER_ID)).resolves.toBeNull();
+    const cleanup: Promise<unknown>[] = [];
+    await expect(
+      readInferenceSessionAuthDecision(STEWARD_USER_ID, {
+        waitUntil: (promise) => cleanup.push(promise),
+      }),
+    ).resolves.toBeNull();
+    expect(cleanup).toHaveLength(1);
+    await Promise.all(cleanup);
     // The malformed entry was evicted, not left behind for a later read.
     await expect(cache.get(key)).resolves.toBeNull();
   });
@@ -137,9 +145,37 @@ describe("api-key IAC validators", () => {
       60,
     );
 
+    const cleanup: Promise<unknown>[] = [];
+    await expect(
+      readInferenceAuthContextWithOutcome(KEY_HASH, undefined, {
+        waitUntil: (promise) => cleanup.push(promise),
+      }),
+    ).resolves.toMatchObject({ kind: "invalid" });
+    expect(cleanup).toHaveLength(1);
+    await Promise.all(cleanup);
+    await expect(cache.get(key)).resolves.toBeNull();
+  });
+
+  test("a positive entry without its subscription entitlement reads as invalid", async () => {
+    const key = CacheKeys.inference.authContext(KEY_HASH);
+    const { subscriptionFunded: _subscriptionFunded, ...incompleteAdmission } = ADMISSION;
+    await cache.set(
+      key,
+      {
+        v: INFERENCE_AUTH_CONTEXT_VERSION,
+        cachedAt: Date.now(),
+        userId: "user-1",
+        orgId: "org-1",
+        apiKeyId: "key-1",
+        keyHash: KEY_HASH,
+        appScopeId: null,
+        admission: incompleteAdmission,
+      },
+      60,
+    );
+
     await expect(readInferenceAuthContextWithOutcome(KEY_HASH)).resolves.toMatchObject({
       kind: "invalid",
     });
-    await expect(cache.get(key)).resolves.toBeNull();
   });
 });
