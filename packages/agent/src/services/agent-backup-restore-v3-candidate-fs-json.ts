@@ -4,6 +4,7 @@ import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
+import { types as utilTypes } from "node:util";
 import type { AgentBackupRestoreV3OperationControl } from "@elizaos/shared";
 import {
   type AgentBackupRestoreV3CandidateFsControl,
@@ -23,8 +24,10 @@ import {
   requireControlName,
   requirePositiveSafeInteger,
   requirePrivateSingleLinkFile,
+  runAllBoundedInternalCleanup,
   sameIdentity,
   sameStableFile,
+  snapshotOwnDataRecord,
   syncDirectory,
   writeAll,
 } from "./agent-backup-restore-v3-candidate-fs-control";
@@ -80,6 +83,12 @@ export function candidateFsCanonicalJson(value: unknown): string {
       candidateFsError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
         "Candidate durable JSON contains a cycle",
+      );
+    }
+    if (utilTypes.isProxy(current)) {
+      candidateFsError(
+        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
+        "Candidate durable JSON cannot contain proxies",
       );
     }
     seen.add(current);
@@ -257,6 +266,7 @@ async function reconcileDurableJsonPublication(
     if (!isErrno(cause, "ENOENT")) throw cause;
   }
   if (finalStats && finalStats.linkCount === 1) return;
+  if (!finalStats) return;
   if (finalStats) {
     if (
       !finalStats.file ||
@@ -270,30 +280,50 @@ async function reconcileDurableJsonPublication(
       );
     }
   }
-  const names = await controlled(
-    () => fs.readdir(authority.attemptAuthority.anchor),
+  const directory = await controlledAcquire(
+    () =>
+      fs.opendir(authority.attemptAuthority.anchor, {
+        encoding: "buffer" as BufferEncoding,
+      }),
+    (lateDirectory) => lateDirectory.close(),
     control,
   );
   const aliases: string[] = [];
-  for (const entry of names) {
-    if (!entry.startsWith(prefix) || !entry.endsWith(".tmp")) continue;
-    requireControlName(entry, "durable JSON temp name");
-    const aliasPath = authority.directPath(entry, "durable JSON temp name");
-    const aliasStats = await controlled(() => lstatExact(aliasPath), control);
-    if (
-      !aliasStats.file ||
-      aliasStats.symbolicLink ||
-      aliasStats.linkCount !== (finalStats ? 2 : 1) ||
-      (aliasStats.mode & 0o077) !== 0
-    ) {
-      candidateFsError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FILE_UNSAFE",
-        "Candidate durable JSON temp has an unsafe link topology",
+  try {
+    while (true) {
+      const directoryEntry = await controlled(() => directory.read(), control);
+      if (directoryEntry === null) break;
+      const rawName =
+        directoryEntry instanceof Uint8Array
+          ? directoryEntry
+          : directoryEntry.name;
+      if (!(rawName instanceof Uint8Array)) continue;
+      const encodedName = Buffer.from(
+        rawName.buffer,
+        rawName.byteOffset,
+        rawName.byteLength,
       );
+      const entry = encodedName.toString("utf8");
+      if (!Buffer.from(entry, "utf8").equals(encodedName)) continue;
+      if (!entry.startsWith(prefix) || !entry.endsWith(".tmp")) continue;
+      requireControlName(entry, "durable JSON temp name");
+      const aliasPath = authority.directPath(entry, "durable JSON temp name");
+      const aliasStats = await controlled(() => lstatExact(aliasPath), control);
+      if (
+        !aliasStats.file ||
+        aliasStats.symbolicLink ||
+        aliasStats.linkCount !== 2 ||
+        (aliasStats.mode & 0o7077) !== 0
+      ) {
+        candidateFsError(
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FILE_UNSAFE",
+          "Candidate durable JSON temp has an unsafe link topology",
+        );
+      }
+      if (sameIdentity(aliasStats, finalStats)) aliases.push(aliasPath);
     }
-    if (!finalStats || sameIdentity(aliasStats, finalStats)) {
-      aliases.push(aliasPath);
-    }
+  } finally {
+    await boundedInternalCleanup(() => directory.close());
   }
   if (finalStats && aliases.length !== 1) {
     candidateFsError(
@@ -405,8 +435,15 @@ export async function readCandidateFsDurableJson(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   heldLock?: AgentBackupRestoreV3CandidateFsLock,
 ): Promise<unknown | null> {
+  const readOptions = snapshotOwnDataRecord(
+    options,
+    ["maximumBytes"],
+    ["maximumBytes"],
+    "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    "Candidate durable JSON read options must be exact data properties",
+  );
   const maximumBytes = requirePositiveSafeInteger(
-    options?.maximumBytes,
+    readOptions.maximumBytes as number,
     "maximumBytes",
   );
   const exactName = requireControlName(name, "durable JSON name");
@@ -423,7 +460,9 @@ export async function readCandidateFsDurableJson(
       "Candidate JSON read did not obtain an exact inode-lock lease",
     );
   }
+  let releaseLockUse: (() => void) | null = null;
   try {
+    releaseLockUse = authority.beginLockUse(activeLock);
     await authority.assertLockHeld(activeLock, control);
     const result = await readCandidateFsCanonicalJsonReadOnly(
       authority,
@@ -434,9 +473,18 @@ export async function readCandidateFsDurableJson(
     await authority.assertLockHeld(activeLock, control);
     return result;
   } finally {
-    if (operationLock) {
-      await operationLock.release(internalCleanupControl());
+    const cleanupOperations: Array<() => Promise<void>> = [];
+    if (releaseLockUse) {
+      const releaseUse = releaseLockUse;
+      releaseLockUse = null;
+      cleanupOperations.push(async () => releaseUse());
     }
+    if (operationLock) {
+      cleanupOperations.push(() =>
+        operationLock.release(internalCleanupControl()),
+      );
+    }
+    await runAllBoundedInternalCleanup(cleanupOperations);
   }
 }
 
@@ -448,8 +496,15 @@ export async function publishCandidateFsDurableJson(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   heldLock?: AgentBackupRestoreV3CandidateFsLock,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateDurableJsonReceipt>> {
+  const publicationOptions = snapshotOwnDataRecord(
+    options,
+    ["maximumBytes"],
+    ["maximumBytes"],
+    "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    "Candidate durable JSON options must be exact data properties",
+  );
   const maximumBytes = requirePositiveSafeInteger(
-    options?.maximumBytes,
+    publicationOptions.maximumBytes as number,
     "maximumBytes",
   );
   const finalPath = authority.directPath(name, "durable JSON name");
@@ -490,6 +545,7 @@ export async function publishCandidateFsDurableJson(
   let operationLock: AgentBackupRestoreV3CandidateFsLock | null = null;
   let tempPath: string | null = null;
   let tempHandle: FileHandle | null = null;
+  let releaseLockUse: (() => void) | null = null;
   let primaryFailure: unknown;
   let result: Readonly<AgentBackupRestoreV3CandidateDurableJsonReceipt> | null =
     null;
@@ -507,6 +563,7 @@ export async function publishCandidateFsDurableJson(
         "Candidate JSON publication did not obtain an exact inode-lock lease",
       );
     }
+    releaseLockUse = authority.beginLockUse(activeLock);
     await authority.assertLockHeld(activeLock, control);
     await reconcileDurableJsonPublication(authority, name, control);
     await authority.syncAttemptRoot(control);
@@ -582,28 +639,42 @@ export async function publishCandidateFsDurableJson(
 
   let cleanupFailure: unknown;
   try {
-    await boundedInternalCleanup(async () => {
-      if (tempHandle) {
-        await tempHandle.close();
-        tempHandle = null;
-      }
-      if (tempPath) {
+    const cleanupOperations: Array<() => Promise<void>> = [];
+    if (tempHandle) {
+      const handle = tempHandle;
+      tempHandle = null;
+      cleanupOperations.push(() => handle.close());
+    }
+    if (tempPath) {
+      const pathToRemove = tempPath;
+      tempPath = null;
+      cleanupOperations.push(async () => {
         try {
-          await fs.unlink(tempPath);
+          await fs.unlink(pathToRemove);
         } catch (cause) {
           if (!isErrno(cause, "ENOENT")) throw cause;
         }
-        tempPath = null;
         await syncDirectory(
           authority.attemptAuthority,
           internalCleanupControl(),
         );
+      });
+    }
+    if (operationLock) {
+      if (releaseLockUse) {
+        const releaseUse = releaseLockUse;
+        releaseLockUse = null;
+        cleanupOperations.push(async () => releaseUse());
       }
-      if (operationLock) {
-        await operationLock.release(internalCleanupControl());
-        operationLock = null;
-      }
-    });
+      const lock = operationLock;
+      operationLock = null;
+      cleanupOperations.push(() => lock.release(internalCleanupControl()));
+    } else if (releaseLockUse) {
+      const releaseUse = releaseLockUse;
+      releaseLockUse = null;
+      cleanupOperations.push(async () => releaseUse());
+    }
+    await runAllBoundedInternalCleanup(cleanupOperations);
   } catch (cause) {
     cleanupFailure = cause;
   } finally {

@@ -26,6 +26,7 @@ import {
 } from "./object-store";
 import {
   createMultipartObjectUpload,
+  type MultipartObjectMutationControl,
   type MultipartObjectPartReceipt,
   type MultipartObjectRequestControl,
   type MultipartObjectUploadHandle,
@@ -90,7 +91,7 @@ export interface AgentBackupObjectStore {
    * must retain its durable single-writer fence until exact completion.
    */
   createMultipart(
-    input: MultipartObjectUploadPlan & { readonly control: MultipartObjectRequestControl },
+    input: MultipartObjectUploadPlan & { readonly control: MultipartObjectMutationControl },
   ): Promise<MultipartObjectUploadSession>;
   /** Rehydrate private durable columns against this exact configured backend. */
   rehydrateMultipartHandle(
@@ -341,12 +342,12 @@ export async function createAgentBackupObjectStore(
     putImmutable: (params: Parameters<AgentBackupObjectStore["putImmutable"]>[0]) =>
       putImmutableObjectAtBackend({ backend, ...params }),
     createMultipart: (input: Parameters<AgentBackupObjectStore["createMultipart"]>[0]) =>
-      createMultipartObjectUpload({ backend, ...input }),
+      createMultipartObjectUpload({ ...input, backend }),
     rehydrateMultipartHandle: (
       input: Parameters<AgentBackupObjectStore["rehydrateMultipartHandle"]>[0],
-    ) => rehydrateMultipartObjectUploadHandle({ backend, ...input }),
+    ) => rehydrateMultipartObjectUploadHandle({ ...input, backend }),
     resumeMultipart: (input: Parameters<AgentBackupObjectStore["resumeMultipart"]>[0]) =>
-      resumeMultipartObjectUpload({ backend, ...input }),
+      resumeMultipartObjectUpload({ ...input, backend }),
     delete: (target: ObjectDeleteTarget, control?: ObjectRequestControl) =>
       deleteObjectAtBackend({ backend, target, control }),
     listKeys,

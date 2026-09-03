@@ -22,7 +22,9 @@ import {
 } from "../agent-backup-restore-v3-candidate-cleanup";
 import { sha256Utf8 } from "../agent-backup-restore-v3-candidate-codec";
 import {
+  assertAgentBackupRestoreV3OperationControl,
   isAgentBackupRestoreV3AmbiguousCommitResponse,
+  snapshotAgentBackupRestoreV3OperationControl,
   throwIfAgentBackupRestoreV3DatabaseDeadline,
 } from "../agent-backup-restore-v3-candidate-database-control";
 import { createAgentBackupRestoreV3CandidateExecution } from "../agent-backup-restore-v3-candidate-execution";
@@ -74,6 +76,24 @@ afterAll(async () => {
 
 describe("restore-v3 candidate execution repository", () => {
   test("classifies only exact commit ambiguity and fails closed on database cancellation", async () => {
+    const originalAbort = new AbortController();
+    const mutableControl = {
+      signal: originalAbort.signal,
+      deadlineEpochMs: Date.now() + 300_000,
+    };
+    const snapshottedControl = snapshotAgentBackupRestoreV3OperationControl(mutableControl);
+    const originalDeadline = snapshottedControl.deadlineEpochMs;
+    mutableControl.signal = new AbortController().signal;
+    mutableControl.deadlineEpochMs += 300_000;
+    expect(snapshottedControl.signal).toBe(originalAbort.signal);
+    expect(snapshottedControl.deadlineEpochMs).toBe(originalDeadline);
+    originalAbort.abort();
+    expect(() =>
+      assertAgentBackupRestoreV3OperationControl(
+        snapshottedControl,
+        "Restore-v3 control snapshot test",
+      ),
+    ).toThrow();
     expect(isAgentBackupRestoreV3AmbiguousCommitResponse({ code: "08006" })).toBe(true);
     expect(isAgentBackupRestoreV3AmbiguousCommitResponse({ code: "57P01" })).toBe(true);
     expect(isAgentBackupRestoreV3AmbiguousCommitResponse({ code: "57014" })).toBe(false);
@@ -112,6 +132,23 @@ describe("restore-v3 candidate execution repository", () => {
   test("replays exact slots, keeps payload plaintext out of DB, aborts through a command, and fences cleanup", async () => {
     const execution = createAgentBackupRestoreV3CandidateExecution(fixture.sourceAuthority);
     const beginRequest = { authority: fixture.authority, manifest: fixture.manifest };
+    const originalAbort = new AbortController();
+    const mutableControl = {
+      signal: originalAbort.signal,
+      deadlineEpochMs: Date.now() + 300_000,
+    };
+    const cancelledBegin = execution.begin(beginRequest, mutableControl);
+    originalAbort.abort();
+    mutableControl.signal = new AbortController().signal;
+    mutableControl.deadlineEpochMs += 300_000;
+    await expect(cancelledBegin).rejects.toMatchObject({ name: "AbortError" });
+    const cancelledBeginRows = await getPgliteClientForTests().query<{ count: number }>(
+      `SELECT (
+        (SELECT count(*) FROM agent_backup_restore_v3_candidates) +
+        (SELECT count(*) FROM agent_backup_restore_v3_candidate_cleanup_outbox)
+      )::integer AS count`,
+    );
+    expect(cancelledBeginRows.rows[0]?.count).toBe(0);
     await expect(
       execution.begin(
         {
@@ -193,13 +230,7 @@ describe("restore-v3 candidate execution repository", () => {
         componentName: "character",
         dataIndex: 1,
         offsetBytes: first.payloadBytes,
-        entry: {
-          path: "character.json",
-          fileOffsetBytes: 0,
-          fileSizeBytes: secondPayload.byteLength,
-          mode: 0o600,
-          mtimeMs: 1_798_588_800_000,
-        },
+        entry: null,
         payload: secondPayload,
       },
       CONTROL,
@@ -264,6 +295,9 @@ describe("restore-v3 candidate execution repository", () => {
     expect(bearerRows.rows[0]?.execution_token_sha256).toBe(fixtureSha256(session.executionToken));
     expect(JSON.stringify(bearerRows.rows)).not.toContain(session.executionToken);
 
+    await expect(
+      execution.abort(session, "invalid-reason" as "staging-failed", CONTROL),
+    ).rejects.toThrow(/abort reason is invalid/);
     expect(await execution.abort(session, "staging-failed", CONTROL)).toBe(true);
     expect(await execution.abort(session, "staging-failed", CONTROL)).toBe(true);
     const terminal = await getPgliteClientForTests().query<{
@@ -321,11 +355,32 @@ describe("restore-v3 candidate execution repository", () => {
     const deferred = await deferAgentBackupRestoreV3CandidateCleanup({
       control: CONTROL,
       fence: cleanupFence(firstClaim),
-      delayMs: 1,
+      delayMs: 1_000,
     });
     expect(deferred.state).toBe("pending");
     expect(deferred.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(deferred.databaseNow.getTime());
-    await Bun.sleep(5);
+    await expect(
+      deferAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: cleanupFence(firstClaim),
+        delayMs: 1,
+      }),
+    ).rejects.toThrow(/exact live owner, generation, and attempt/);
+    await expect(
+      deferAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(firstClaim), ownerId: "cleanup-worker-forged" },
+        delayMs: 1,
+      }),
+    ).rejects.toThrow(/exact live owner, generation, and attempt/);
+    await expect(
+      deferAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(firstClaim), generation: CLAIM_GENERATION_B },
+        delayMs: 1,
+      }),
+    ).rejects.toThrow(/exact live owner, generation, and attempt/);
+    await Bun.sleep(1_050);
     const secondClaim = await claimAgentBackupRestoreV3CandidateCleanup({
       control: CONTROL,
       ownerId: "cleanup-worker-b",
@@ -349,6 +404,20 @@ describe("restore-v3 candidate execution repository", () => {
     });
     expect(settledReplay.state).toBe("completed");
     expect(settledReplay.replayed).toBe(true);
+    await expect(
+      settleAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(secondClaim), ownerId: "cleanup-worker-forged" },
+        cleanupReceiptSha256,
+      }),
+    ).rejects.toThrow(/fence or receipt differs/);
+    await expect(
+      settleAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(secondClaim), generation: CLAIM_GENERATION_C },
+        cleanupReceiptSha256,
+      }),
+    ).rejects.toThrow(/fence or receipt differs/);
     await expect(
       settleAgentBackupRestoreV3CandidateCleanup({
         control: CONTROL,
@@ -408,6 +477,20 @@ describe("restore-v3 candidate execution repository", () => {
         })
       ).replayed,
     ).toBe(true);
+    await expect(
+      quarantineAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(recovered), ownerId: "cleanup-worker-forged" },
+        reason: "provider-object-generation-diverged",
+      }),
+    ).rejects.toThrow(/fence or reason differs/);
+    await expect(
+      quarantineAgentBackupRestoreV3CandidateCleanup({
+        control: CONTROL,
+        fence: { ...cleanupFence(recovered), generation: CLAIM_GENERATION_A },
+        reason: "provider-object-generation-diverged",
+      }),
+    ).rejects.toThrow(/fence or reason differs/);
     await expect(
       quarantineAgentBackupRestoreV3CandidateCleanup({
         control: CONTROL,
