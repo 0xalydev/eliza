@@ -20,6 +20,7 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { appModeNavigation } from "../app-mode/app-mode";
 import { SsoBridgeRoute } from "./SsoBridgeRoute";
+import type { SsoBridgeLockManager } from "./sso-bridge";
 
 const STATE = "a".repeat(64);
 const OTHER_STATE = "c".repeat(64);
@@ -30,6 +31,37 @@ const NEXT_VERIFIER = "1".repeat(64);
 const NEXT_CODE = `esso_${"f".repeat(64)}`;
 const SSO_STATE_KEY = "eliza_sso_bridge_state";
 const SSO_VERIFIER_KEY = "eliza_sso_bridge_verifier";
+
+class SerialSsoBridgeLockManager implements SsoBridgeLockManager {
+  private tail: Promise<void> = Promise.resolve();
+
+  async request<T>(
+    _name: string,
+    options: { mode: "exclusive"; signal: AbortSignal },
+    callback: () => T | PromiseLike<T>,
+  ): Promise<T> {
+    const previous = this.tail;
+    let release: () => void = () => {};
+    this.tail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    if (options.signal.aborted) {
+      release();
+      throw new DOMException("Lock request aborted", "AbortError");
+    }
+    try {
+      return await callback();
+    } finally {
+      release();
+    }
+  }
+}
+
+Object.defineProperty(navigator, "locks", {
+  configurable: true,
+  value: new SerialSsoBridgeLockManager(),
+});
 
 function base64url(value: unknown): string {
   return btoa(JSON.stringify(value))
@@ -76,6 +108,14 @@ function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
+  });
+}
+
+function stewardSessionResponse(userId: string = "u1"): Response {
+  return json(200, {
+    ok: true,
+    userId,
+    stewardUserId: `steward-${userId}`,
   });
 }
 
@@ -247,7 +287,7 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
     expect(fetchLog).toHaveLength(1);
   });
 
-  it("burns a minted code when the bridge route unmounts before navigation", async () => {
+  it("aborts mint on unmount and ignores a late response", async () => {
     setReferrer("https://cloud.eliza.app/");
     localStorage.setItem(STEWARD_TOKEN_KEY, liveToken());
     let resolveMint!: (response: Response) => void;
@@ -278,7 +318,13 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
       </MemoryRouter>,
     );
     await waitFor(() => expect(fetchLog).toHaveLength(1));
+    const signal = fetchLog[0].init?.signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
     view.unmount();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(signal?.aborted).toBe(true);
 
     await act(async () => {
       resolveMint(json(200, { ok: true, code: CODE }));
@@ -286,12 +332,10 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
     });
 
     expect(replacedUrls).toEqual([]);
-    await waitFor(() => expect(fetchLog).toHaveLength(2));
-    expect(fetchLog[1].url).toBe("https://eliza.app/api/auth/sso-bridge/burn");
-    expect(JSON.parse(String(fetchLog[1].init?.body))).toEqual({ code: CODE });
+    expect(fetchLog).toHaveLength(1);
   });
 
-  it("burns a stale mint when the challenge changes and only hands off the current code", async () => {
+  it("aborts a stale mint when the challenge changes and only hands off the current code", async () => {
     const nextChallenge = "f".repeat(64);
     const nextCode = `esso_${"c".repeat(64)}`;
     setReferrer("https://cloud.eliza.app/");
@@ -337,6 +381,10 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
       );
     });
     await waitFor(() => expect(resolveMints).toHaveLength(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchLog[0].init?.signal?.aborted).toBe(true);
 
     await act(async () => {
       resolveMints[1](json(200, { ok: true, code: nextCode }));
@@ -352,12 +400,10 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
       resolveMints[0](json(200, { ok: true, code: CODE }));
       await Promise.resolve();
     });
-    await waitFor(() =>
-      expect(
-        fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/burn")),
-      ).toHaveLength(1),
-    );
-    expect(JSON.parse(String(fetchLog[2].init?.body))).toEqual({ code: CODE });
+    expect(
+      fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/burn")),
+    ).toHaveLength(0);
+    expect(fetchLog).toHaveLength(2);
   });
 
   it("does not burn after a successful handoff is transferred and then unmounted", async () => {
@@ -494,7 +540,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
           resolveExchanges.push(resolve);
         });
       }
-      return Promise.resolve(json(200, { ok: true }));
+      return Promise.resolve(stewardSessionResponse());
     }) as typeof fetch;
     replacedUrls = [];
     appModeNavigation.replace = (url: string) => {
@@ -574,6 +620,21 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     expectBurnOnly();
   });
 
+  it("malformed stored verifier aborts to login and burns the code without exchanging", async () => {
+    armHandshake(STATE, "not-a-verifier");
+    stubNetwork(() => new Response(null, { status: 204 }));
+    renderBridge(
+      "cloud.eliza.app",
+      `?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
+    );
+
+    expect(await screen.findByTestId("login-page")).toBeTruthy();
+    expectBurnOnly();
+    expect(
+      fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/exchange")),
+    ).toHaveLength(0);
+  });
+
   it("malformed code aborts to login without ANY network call", async () => {
     armHandshake();
     stubNetwork(() => json(200, { ok: true, token: liveToken() }));
@@ -591,7 +652,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     stubNetwork((url) =>
       url.includes("/sso-bridge/exchange")
         ? json(200, { ok: true, token })
-        : json(200, { ok: true }),
+        : stewardSessionResponse(),
     );
     renderBridge(
       "cloud.eliza.app",
@@ -717,7 +778,13 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     const view = render(<RouterProvider router={router} />);
     await waitFor(() => expect(resolveExchanges).toHaveLength(1));
 
+    const signal = fetchLog[0].init?.signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
     view.unmount();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(signal?.aborted).toBe(true);
     await act(async () => {
       resolveExchanges[0](json(200, { ok: true, token: liveToken() }));
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -733,7 +800,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     stubNetwork((url) =>
       url.endsWith("/api/auth/sso-bridge/exchange")
         ? json(200, { ok: true, token: liveToken() })
-        : json(200, { ok: true }),
+        : stewardSessionResponse(),
     );
     const router = createExchangeRouterForTest();
 
@@ -789,7 +856,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     stubNetwork((url) =>
       url.includes("/sso-bridge/exchange")
         ? json(200, { ok: true, token: liveToken() })
-        : json(200, { ok: true }),
+        : stewardSessionResponse(),
     );
     const unregister = registerStewardTokenPersistence(async () => {
       throw new Error("secure-store persistence failed");
@@ -816,7 +883,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
     stubNetwork((url) =>
       url.includes("/sso-bridge/exchange")
         ? json(200, { ok: true, token: liveToken() })
-        : json(200, { ok: true }),
+        : stewardSessionResponse(),
     );
     renderBridge(
       "cloud.eliza.app",

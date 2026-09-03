@@ -45,9 +45,18 @@ const verifyStewardTokenCached = mock(async (_env: unknown, token: string) => {
   }
   return null;
 });
+const verifyStewardTokenWithResult = mock(
+  async (env: unknown, token: string) => {
+    const claims = await verifyStewardTokenCached(env, token);
+    return claims
+      ? { kind: "valid" as const, claims }
+      : { kind: "invalid" as const };
+  },
+);
 
 mock.module("@/lib/auth/steward-client", () => ({
   verifyStewardTokenCached,
+  verifyStewardTokenWithResult,
 }));
 
 const syncUserFromSteward = mock(async () => ({

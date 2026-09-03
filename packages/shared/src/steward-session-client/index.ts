@@ -240,6 +240,31 @@ export interface StewardSessionResponse {
   welcomeBonusWithheldMessage?: string;
 }
 
+/** Versioned proof returned by the browser logout boundary. */
+export const STEWARD_LOGOUT_PROOF_VERSION = 1 as const;
+
+export type StewardLogoutBarrierState = "confirmed" | "already_absent";
+
+interface StewardLogoutResponseBase {
+  success: true;
+  logoutProofVersion: typeof STEWARD_LOGOUT_PROOF_VERSION;
+  message: string;
+}
+
+export type StewardLogoutResponse = StewardLogoutResponseBase &
+  (
+    | {
+        barrierState: "confirmed";
+        /** A verified presented lineage was stamped server-side. */
+        barrierConfirmed: true;
+      }
+    | {
+        /** No currently valid credential remained at this host boundary. */
+        barrierState: "already_absent";
+        barrierConfirmed: false;
+      }
+  );
+
 /**
  * Distinct outcomes the cloud-api route returns. The client uses these to
  * decide whether to wipe localStorage (`invalid_token`) or hold steady
@@ -481,6 +506,23 @@ export async function replaceStoredStewardTokenIfCurrent(
   });
 }
 
+async function removeStoredStewardToken(): Promise<void> {
+  try {
+    if (stewardTokenRemoval) {
+      await stewardTokenRemoval();
+    } else {
+      window.localStorage.removeItem(STEWARD_TOKEN_KEY);
+    }
+  } catch (error) {
+    // error-policy:J2 callers must distinguish canonical removal failure from
+    // obsolete refresh-key cleanup so they never publish a false logout.
+    throw new StewardTokenRemovalError(error);
+  }
+  dispatchStewardSessionChange("cleared");
+  window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
+  window.localStorage.removeItem(STEWARD_REFRESH_TOKEN_KEY);
+}
+
 /**
  * Clears canonical authority before draining the obsolete refresh-token key.
  * Once the canonical removal succeeds, invalidation is published even if the
@@ -488,21 +530,22 @@ export async function replaceStoredStewardTokenIfCurrent(
  */
 export async function clearStoredStewardToken(): Promise<void> {
   if (typeof window === "undefined") return;
-  await serializeStewardTokenMutation(async () => {
-    try {
-      if (stewardTokenRemoval) {
-        await stewardTokenRemoval();
-      } else {
-        window.localStorage.removeItem(STEWARD_TOKEN_KEY);
-      }
-    } catch (error) {
-      // error-policy:J2 callers must distinguish canonical removal failure from
-      // obsolete refresh-key cleanup so they never publish a false logout.
-      throw new StewardTokenRemovalError(error);
-    }
-    dispatchStewardSessionChange("cleared");
-    window.localStorage.removeItem(STEWARD_TOKEN_SCOPE_KEY);
-    window.localStorage.removeItem(STEWARD_REFRESH_TOKEN_KEY);
+  await serializeStewardTokenMutation(removeStoredStewardToken);
+}
+
+/**
+ * Clears only the token that still owns canonical session authority. The
+ * comparison and durable removal share the mutation queue so a newer login
+ * queued ahead of this rollback can never be erased by a stale caller.
+ */
+export async function clearStoredStewardTokenIfCurrent(
+  expectedToken: string,
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
+  return serializeStewardTokenMutation(async () => {
+    if (readStoredStewardToken() !== expectedToken) return false;
+    await removeStoredStewardToken();
+    return true;
   });
 }
 

@@ -11,10 +11,22 @@ const getCurrentUserMock = mock(
 );
 const readStewardSessionTokenMock = mock((): string | null => null);
 const endAllUserSessionsMock = mock(async () => undefined);
-const verifyStewardTokenMock = mock(async () => ({
-  userId: "steward-1",
-  issuedAt: 100,
-}));
+type StewardVerificationResult =
+  | {
+      kind: "valid";
+      claims: { userId: string; issuedAt: number };
+    }
+  | { kind: "invalid" }
+  | { kind: "unavailable"; error: unknown };
+const verifyStewardTokenWithResultMock = mock(
+  async (): Promise<StewardVerificationResult> => ({
+    kind: "valid",
+    claims: {
+      userId: "steward-1",
+      issuedAt: 100,
+    },
+  }),
+);
 const revokeInferenceSessionsThroughMock = mock(async () => undefined);
 const markSsoBridgeLogoutMock = mock(async () => undefined);
 
@@ -27,7 +39,7 @@ mock.module("@/lib/auth/workers-hono-auth", () => ({
   readStewardSessionToken: readStewardSessionTokenMock,
 }));
 mock.module("@/lib/auth/steward-client", () => ({
-  verifyStewardTokenCached: verifyStewardTokenMock,
+  verifyStewardTokenWithResult: verifyStewardTokenWithResultMock,
 }));
 
 mock.module("@/lib/middleware/rate-limit-hono-cloudflare", () => ({
@@ -76,12 +88,17 @@ function deletedCookieNames(res: Response): string[] {
 beforeEach(() => {
   getCurrentUserMock.mockResolvedValue(null);
   readStewardSessionTokenMock.mockReturnValue(null);
-  verifyStewardTokenMock.mockResolvedValue({
-    userId: "steward-1",
-    issuedAt: 100,
+  verifyStewardTokenWithResultMock.mockClear();
+  verifyStewardTokenWithResultMock.mockResolvedValue({
+    kind: "valid",
+    claims: {
+      userId: "steward-1",
+      issuedAt: 100,
+    },
   });
   revokeInferenceSessionsThroughMock.mockResolvedValue(undefined);
   markSsoBridgeLogoutMock.mockClear();
+  markSsoBridgeLogoutMock.mockResolvedValue(undefined);
 });
 
 describe("POST /api/auth/logout cookie clearing", () => {
@@ -102,9 +119,17 @@ describe("POST /api/auth/logout cookie clearing", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(verifyStewardTokenMock).toHaveBeenCalledWith(
+    expect((await res.json()) as unknown).toEqual({
+      success: true,
+      logoutProofVersion: 1,
+      barrierState: "confirmed",
+      barrierConfirmed: true,
+      message: "Logged out successfully",
+    });
+    expect(verifyStewardTokenWithResultMock).toHaveBeenCalledWith(
       expect.anything(),
       "header.payload.signature",
+      { skipDistributedCache: true },
     );
     expect(markSsoBridgeLogoutMock).toHaveBeenCalledWith("steward-1");
   });
@@ -143,7 +168,7 @@ describe("POST /api/auth/logout cookie clearing", () => {
     );
   });
 
-  test("strong rollout clears cookies but returns 503 when the cutoff is unconfirmed", async () => {
+  test("strong rollout preserves retry credentials when the cutoff is unconfirmed", async () => {
     readStewardSessionTokenMock.mockReturnValue("prod-token");
     getCurrentUserMock.mockResolvedValue({
       id: "user-1",
@@ -171,11 +196,91 @@ describe("POST /api/auth/logout cookie clearing", () => {
     );
 
     expect(res.status).toBe(503);
-    expect(deletedCookieNames(res)).toContain("steward-token");
+    expect(deletedCookieNames(res)).toEqual([]);
     expect((await res.json()) as unknown).toEqual({
       error: "Logout revocation is temporarily unavailable",
       code: "logout_revocation_unavailable",
     });
+  });
+
+  test("preserves retry credentials when the cross-host logout marker is unconfirmed", async () => {
+    readStewardSessionTokenMock.mockReturnValue("prod-token");
+    markSsoBridgeLogoutMock.mockRejectedValue(new Error("marker unavailable"));
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          cookie: "steward-token=prod-token",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).toHaveBeenCalledTimes(2);
+    expect(deletedCookieNames(res)).toEqual([]);
+    expect((await res.json()) as unknown).toEqual({
+      error: "Logout revocation is temporarily unavailable",
+      code: "logout_revocation_unavailable",
+    });
+  });
+
+  test("preserves retry authority when token verification is unavailable", async () => {
+    readStewardSessionTokenMock.mockReturnValue("prod-token");
+    verifyStewardTokenWithResultMock.mockResolvedValue({
+      kind: "unavailable",
+      error: new Error("verifier unavailable"),
+    });
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          cookie: "steward-token=prod-token",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("never claims a cross-host barrier for an invalid credential", async () => {
+    readStewardSessionTokenMock.mockReturnValue("invalid-token");
+    verifyStewardTokenWithResultMock.mockResolvedValue({ kind: "invalid" });
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          cookie: "steward-token=invalid-token",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(200);
+    expect((await res.json()) as unknown).toEqual({
+      success: true,
+      logoutProofVersion: 1,
+      barrierState: "already_absent",
+      barrierConfirmed: false,
+      message: "Logged out successfully",
+    });
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toContain("steward-token");
   });
 
   test("staging legacy-only logout does not end production user sessions", async () => {
@@ -197,6 +302,13 @@ describe("POST /api/auth/logout cookie clearing", () => {
     );
 
     expect(res.status).toBe(200);
+    expect((await res.json()) as unknown).toEqual({
+      success: true,
+      logoutProofVersion: 1,
+      barrierState: "already_absent",
+      barrierConfirmed: false,
+      message: "Logged out successfully",
+    });
     const cleared = deletedCookieNames(res);
     expect(cleared).toContain("steward-token-staging");
     expect(cleared).toContain("steward-refresh-token-staging");

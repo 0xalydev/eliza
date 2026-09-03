@@ -448,6 +448,42 @@ app.post("/", async (c) => {
       ? Math.max(0, claims.expiration - Math.floor(Date.now() / 1000))
       : null;
 
+    if (claims.bridged) {
+      // `syncUserFromSteward` can await durable provisioning/cache work while
+      // a concurrent logout stamps this lineage. Recheck at the cookie commit
+      // boundary so a request admitted before logout cannot plant authority
+      // after logout has completed. Client-side origin custody orders modern
+      // tabs; this server guard also protects in-flight older clients.
+      let blockedByLogoutAtCommit: boolean;
+      try {
+        blockedByLogoutAtCommit = await isBlockedBySsoBridgeLogout(
+          claims.userId,
+          claims.issuedAt,
+        );
+      } catch (error) {
+        // error-policy:J1 an unreadable logout barrier cannot authorize a
+        // bridge-issued cookie commit.
+        logStewardAuth("sso-marker-unavailable-at-commit", null);
+        logger.error(
+          "[steward-auth] SSO logout-marker store unavailable at cookie commit",
+          {
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        return c.json(
+          errorBody("SSO bridge unavailable", "sso_unavailable"),
+          503,
+        );
+      }
+      if (blockedByLogoutAtCommit) {
+        logStewardAuth("session-ended-at-commit", null);
+        return c.json(
+          errorBody("Session was signed out", "session_ended"),
+          401,
+        );
+      }
+    }
+
     const secure = c.env.NODE_ENV === "production";
     const domain = cookieDomainForHost(c.req.header("host"));
 
@@ -462,10 +498,11 @@ app.post("/", async (c) => {
       ...(typeof ttl === "number" ? { maxAge: ttl } : {}),
     });
 
-    if (claims.stagingSessionBinding) {
-      // QA sessions have a signed absolute expiry and are deliberately not
-      // renewable. Remove any older refresh cookie so it cannot silently
-      // replace the QA session with an ordinary long-lived Steward session.
+    if (claims.bridged || claims.stagingSessionBinding) {
+      // Bridge-issued and QA sessions carry access authority only: neither
+      // transfers the source origin's refresh credential. Remove any older
+      // host refresh cookie and ignore a supplied one so a previous account
+      // cannot silently replace the newly bridged identity after expiry.
       deleteCookie(c, cookieNames.refreshToken, {
         path: "/",
         ...(domain ? { domain } : {}),
@@ -488,7 +525,8 @@ app.post("/", async (c) => {
       path: "/",
       ...(domain ? { domain } : {}),
       maxAge:
-        claims.stagingSessionBinding && typeof ttl === "number"
+        (claims.bridged || claims.stagingSessionBinding) &&
+        typeof ttl === "number"
           ? ttl
           : STEWARD_REFRESH_COOKIE_MAX_AGE,
     });

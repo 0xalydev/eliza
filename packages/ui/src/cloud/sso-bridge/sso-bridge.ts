@@ -38,16 +38,23 @@
  * (`signOutFromSsoBridgedHost` — the unified app's account action uses it)
  * records a persistent local marker that suppresses auto-bridging until the
  * next real sign-in, and calls the server logout route, which stamps a
- * server-side Postgres logout marker. The mint/exchange endpoints refuse to
- * bridge across that marker, the cookie-planting session-sync endpoint
- * refuses pre-logout tokens with `session_ended` (so the paired origin's
- * surviving session cannot re-plant the host cookies and clears itself on its
- * next sync), and the explicit app-origin logout marker prevents a bounce.
+ * server-side Postgres logout marker for the access-token authority presented
+ * by this flow. The mint/exchange endpoints refuse to bridge authority covered
+ * by that marker, the cookie-planting session-sync endpoint reports
+ * `session_ended` for covered pre-logout access tokens, and the explicit
+ * app-origin marker prevents an automatic bounce. Revocation of a Steward
+ * refresh family remains a Steward server contract rather than a guarantee of
+ * this bridge client.
  */
 
 import { ELIZA_DOMAIN_CONTRACTS } from "@elizaos/shared/elizacloud";
 import {
+  clearStoredStewardTokenIfCurrent,
   readStoredStewardToken,
+  STEWARD_LOGOUT_PROOF_VERSION,
+  type StewardLogoutBarrierState,
+  type StewardLogoutResponse,
+  type StewardSessionResponse,
   writeStoredStewardTokenIfCurrent,
 } from "@elizaos/shared/steward-session-client";
 import { shellLocalStorage } from "../../surface-realm-channel";
@@ -59,6 +66,7 @@ import {
   markStewardServerCookieSynced,
 } from "../lib/steward-session-cookie-sync-marker";
 import {
+  clearServerStewardSessionCookies,
   clearStaleStewardSession,
   configuredSessionEndpoint,
 } from "../shell/StewardProviderShared";
@@ -277,6 +285,17 @@ export function consumeSsoBridgeVerifier(): string | null {
   }
 }
 
+function discardSsoBridgeHandshakeIfCurrent(state: string): void {
+  try {
+    if (sessionStorage.getItem(SSO_STATE_KEY) !== state) return;
+    sessionStorage.removeItem(SSO_STATE_KEY);
+    sessionStorage.removeItem(SSO_VERIFIER_KEY);
+  } catch {
+    // error-policy:J6 abandoned secrets are tab-scoped and overwritten by the
+    // next handshake; failure to clean them cannot authorize an exchange.
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Redirect-loop guard
 // ---------------------------------------------------------------------------
@@ -324,12 +343,103 @@ export function clearSsoBridgeAttempt(): void {
 }
 
 // ---------------------------------------------------------------------------
-// Logged-out marker (defect fix: logout stays logged out)
+// Logged-out marker
 // ---------------------------------------------------------------------------
 
 const SSO_LOGGED_OUT_KEY = "eliza_sso_logged_out";
+const SSO_LOGOUT_GENERATION_KEY = "eliza_sso_logout_generation";
+const SSO_FINALIZATION_INTENT_KEY = "eliza_sso_finalization_intent";
 let ssoLogoutEpoch = 0;
 let activeSsoCookieSyncAbortController: AbortController | null = null;
+
+type StoredGenerationSnapshot =
+  | { readable: true; value: string | null }
+  | { readable: false };
+
+function readStoredGeneration(key: string): StoredGenerationSnapshot {
+  try {
+    return { readable: true, value: localStorage.getItem(key) };
+  } catch {
+    // error-policy:J4 persistent coordination storage is an authority input;
+    // an unreadable value must never compare equal and authorize a commit.
+    return { readable: false };
+  }
+}
+
+function storedGenerationMatches(
+  key: string,
+  snapshot: StoredGenerationSnapshot,
+): boolean {
+  if (!snapshot.readable) return false;
+  try {
+    return localStorage.getItem(key) === snapshot.value;
+  } catch {
+    // error-policy:J4 a finalization that cannot re-read its cross-tab epoch
+    // loses authority instead of publishing over a possible logout/login.
+    return false;
+  }
+}
+
+function publishFinalizationIntent(nonce: string): boolean {
+  try {
+    shellLocalStorage.setItem(SSO_FINALIZATION_INTENT_KEY, nonce);
+    return localStorage.getItem(SSO_FINALIZATION_INTENT_KEY) === nonce;
+  } catch {
+    // error-policy:J4 latest-intent coordination must round-trip through the
+    // shared origin store; otherwise this operation cannot safely finalize.
+    return false;
+  }
+}
+
+function createFinalizationIntent(): string | null {
+  try {
+    const nonce = randomHex32();
+    return publishFinalizationIntent(nonce) ? nonce : null;
+  } catch {
+    // error-policy:J4 a non-unique intent cannot participate safely in the
+    // cross-tab last-started-wins protocol.
+    return null;
+  }
+}
+
+function finalizationIntentMatches(nonce: string | null): boolean {
+  if (!nonce) return false;
+  try {
+    return localStorage.getItem(SSO_FINALIZATION_INTENT_KEY) === nonce;
+  } catch {
+    // error-policy:J4 unreadable shared intent means authority is unknown.
+    return false;
+  }
+}
+
+function requireFinalizationIntent(
+  nonce: string,
+  operation: "account switch" | "sign-out",
+): void {
+  const current = readStoredGeneration(SSO_FINALIZATION_INTENT_KEY);
+  if (!current.readable) {
+    throw new Error(`SSO ${operation} coordination became unavailable.`);
+  }
+  if (current.value !== nonce) {
+    throw new Error(
+      `SSO ${operation} was superseded by a newer session intent.`,
+    );
+  }
+}
+
+function reassertSsoLoggedOutMarker(
+  nonce: string,
+  operation: "account switch" | "sign-out",
+): void {
+  requireFinalizationIntent(nonce, operation);
+  try {
+    shellLocalStorage.setItem(SSO_LOGGED_OUT_KEY, "1");
+  } catch (error) {
+    throw new Error(`SSO ${operation} could not persist its logout marker.`, {
+      cause: error,
+    });
+  }
+}
 
 /**
  * Persistent (localStorage) "the user explicitly signed out here" marker. It
@@ -347,9 +457,22 @@ export function isSsoLoggedOut(): boolean {
   }
 }
 
-export function markSsoLoggedOut(): void {
+export function markSsoLoggedOut(): string | null {
   ssoLogoutEpoch += 1;
   activeSsoCookieSyncAbortController?.abort();
+  let logoutIntent: string | null = null;
+  try {
+    const nonce = randomHex32();
+    // Generation lands before the legacy marker so an exchange in another
+    // realm observes revocation at its commit guard at the earliest possible
+    // point. The same nonce is also this logout's latest-wins intent.
+    shellLocalStorage.setItem(SSO_LOGOUT_GENERATION_KEY, nonce);
+    logoutIntent = publishFinalizationIntent(nonce) ? nonce : null;
+  } catch {
+    // error-policy:J6 the legacy marker and in-realm epoch still make this
+    // realm fail closed; cross-tab exchanges also require readable intent
+    // coordination before they may commit.
+  }
   try {
     // Reserved shell key: raw localStorage writes throw SurfaceRealmDeniedError
     // while a view scope is foreground (surface-realm-broker guard, #13452).
@@ -358,6 +481,7 @@ export function markSsoLoggedOut(): void {
     // error-policy:J6 best-effort marker; isSsoLoggedOut fails closed when
     // storage is unavailable.
   }
+  return logoutIntent;
 }
 
 export function clearSsoLoggedOut(): void {
@@ -441,8 +565,37 @@ export async function redirectToSsoBridge(
   returnTo: string,
   hostname: string = window.location.hostname,
 ): Promise<boolean> {
+  const logoutEpochAtStart = ssoLogoutEpoch;
+  const logoutGenerationAtStart = readStoredGeneration(
+    SSO_LOGOUT_GENERATION_KEY,
+  );
+  const finalizationIntentAtStart = readStoredGeneration(
+    SSO_FINALIZATION_INTENT_KEY,
+  );
+  if (
+    !logoutGenerationAtStart.readable ||
+    !finalizationIntentAtStart.readable ||
+    isSsoLoggedOut()
+  ) {
+    return false;
+  }
+  const initiationStillCurrent = (): boolean =>
+    logoutEpochAtStart === ssoLogoutEpoch &&
+    storedGenerationMatches(
+      SSO_LOGOUT_GENERATION_KEY,
+      logoutGenerationAtStart,
+    ) &&
+    storedGenerationMatches(
+      SSO_FINALIZATION_INTENT_KEY,
+      finalizationIntentAtStart,
+    ) &&
+    !isSsoLoggedOut();
   const handshake = await createSsoBridgeHandshake();
   if (!handshake) return false;
+  if (!initiationStillCurrent()) {
+    discardSsoBridgeHandshakeIfCurrent(handshake.state);
+    return false;
+  }
   const url = buildBridgeMintUrl(
     hostname,
     handshake.state,
@@ -450,7 +603,15 @@ export async function redirectToSsoBridge(
     returnTo,
   );
   if (!url) return false;
+  if (!initiationStillCurrent()) {
+    discardSsoBridgeHandshakeIfCurrent(handshake.state);
+    return false;
+  }
   markSsoBridgeAttempt();
+  if (!initiationStillCurrent()) {
+    discardSsoBridgeHandshakeIfCurrent(handshake.state);
+    return false;
+  }
   try {
     appModeNavigation.replace(url);
     return true;
@@ -491,13 +652,14 @@ export type SsoMintResult =
  * app origin's PKCE challenge. The Bearer token comes from THIS origin's
  * localStorage — deliberately never from the parent-domain cookie, which JS
  * on user-content subdomains can plant (the server enforces the same rule).
- * No refresh token travels: the app origin already shares the HttpOnly
- * domain refresh cookie.
+ * No refresh token travels: bridge-issued app-origin sessions are deliberately
+ * non-renewable, and cookie sync clears any stale refresh authority there.
  */
 export async function mintSsoCode(
   hostname: string,
   challenge: string,
   fetchFn: typeof fetch = fetch,
+  signal?: AbortSignal,
 ): Promise<SsoMintResult> {
   const base = apiBaseForHostname(hostname);
   if (!base) return { ok: false, error: "Host cannot mint SSO codes" };
@@ -506,33 +668,51 @@ export async function mintSsoCode(
   }
   const token = readStoredStewardToken();
   if (!token) return { ok: false, error: "No local session" };
+  const requestAbortController = new AbortController();
+  const stopForwardingAbort = forwardAbort(signal, requestAbortController);
   let res: Response;
   try {
-    res = await fetchFn(`${base}/api/auth/sso-bridge/mint`, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
+    res = await fetchWithDeadline(
+      fetchFn,
+      `${base}/api/auth/sso-bridge/mint`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ codeChallenge: challenge }),
       },
-      body: JSON.stringify({ codeChallenge: challenge }),
-    });
+      requestAbortController,
+      SSO_BRIDGE_REQUEST_TIMEOUT_MS,
+    );
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
     // bridge route turns into its fall-back-to-login redirect.
+    stopForwardingAbort();
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
   }
-  if (!res.ok) return { ok: false, error: `Mint failed (HTTP ${res.status})` };
+  if (!res.ok) {
+    stopForwardingAbort();
+    return { ok: false, error: `Mint failed (HTTP ${res.status})` };
+  }
   let body: unknown;
   try {
-    body = await res.json();
+    body = await readJsonWithDeadline(
+      res,
+      requestAbortController,
+      SSO_BRIDGE_REQUEST_TIMEOUT_MS,
+    );
   } catch {
     // error-policy:J3 a malformed upstream response is explicit invalid input,
     // never a fabricated empty success envelope.
     return { ok: false, error: "Mint returned no usable code" };
+  } finally {
+    stopForwardingAbort();
   }
   const code =
     body && typeof body === "object" && "code" in body
@@ -554,23 +734,180 @@ export type SsoBridgeFetch = (
   init?: RequestInit,
 ) => Promise<Response>;
 
-let ssoExchangeFinalizationTail: Promise<void> = Promise.resolve();
-const SSO_COOKIE_SYNC_TIMEOUT_MS = 10_000;
+export interface SsoBridgeLockManager {
+  request<T>(
+    name: string,
+    options: { mode: "exclusive"; signal: AbortSignal },
+    callback: () => T | PromiseLike<T>,
+  ): Promise<T>;
+}
 
-/** Keep token/cookie finalization ordered so the newest generation wins. */
-function serializeSsoExchangeFinalization<T>(
+export interface SsoBridgeCoordinationOptions {
+  /** Test/native seam; `null` explicitly models an unavailable Web Locks API. */
+  lockManager?: SsoBridgeLockManager | null;
+  lockTimeoutMs?: number;
+  /** Component lifetime cancellation for exchange, lock wait, and cookie sync. */
+  signal?: AbortSignal;
+}
+
+const SSO_FINALIZATION_LOCK_NAME = "eliza-sso-bridge-finalization";
+const SSO_FINALIZATION_LOCK_TIMEOUT_MS = 15_000;
+const SSO_BRIDGE_REQUEST_TIMEOUT_MS = 10_000;
+const SSO_COOKIE_SYNC_TIMEOUT_MS = 10_000;
+const SSO_LOGOUT_TIMEOUT_MS = 10_000;
+
+function resolveSsoBridgeLockManager(
+  configured: SsoBridgeLockManager | null | undefined,
+): SsoBridgeLockManager {
+  if (configured !== undefined) {
+    if (configured) return configured;
+    throw new Error("Web Locks are unavailable for SSO coordination");
+  }
+  try {
+    const browserLocks = navigator.locks;
+    if (!browserLocks) {
+      throw new Error("Web Locks are unavailable for SSO coordination");
+    }
+    return {
+      request: (name, options, callback) =>
+        browserLocks.request(name, options, callback),
+    };
+  } catch (error) {
+    if (error instanceof Error) throw error;
+    throw new Error("Web Locks are unavailable for SSO coordination", {
+      cause: error,
+    });
+  }
+}
+
+/**
+ * Serialize bearer + cookie authority across every tab on this origin. Lock
+ * acquisition is bounded; an operation that cannot establish exclusive
+ * custody fails before it can mutate either half of the session.
+ */
+async function withSsoFinalizationLock<T>(
+  lockManager: SsoBridgeLockManager,
   operation: () => Promise<T>,
+  timeoutMs: number = SSO_FINALIZATION_LOCK_TIMEOUT_MS,
+  signal?: AbortSignal,
 ): Promise<T> {
-  const result = ssoExchangeFinalizationTail.then(operation);
-  ssoExchangeFinalizationTail = result.then(
-    () => undefined,
-    () => {
-      // error-policy:J5 the originating caller observes `result`; this tail
-      // handler only releases the queue so one failed generation cannot strand
-      // every later login or logout operation.
-    },
+  const abortController = new AbortController();
+  const stopForwardingAbort = forwardAbort(signal, abortController);
+  let acquired = false;
+  const timeout = window.setTimeout(() => {
+    if (!acquired) abortController.abort();
+  }, timeoutMs);
+  try {
+    return await lockManager.request(
+      SSO_FINALIZATION_LOCK_NAME,
+      { mode: "exclusive", signal: abortController.signal },
+      async () => {
+        acquired = true;
+        window.clearTimeout(timeout);
+        return operation();
+      },
+    );
+  } catch (error) {
+    if (signal?.aborted && !acquired) {
+      throw new DOMException(
+        "The SSO session operation was aborted",
+        "AbortError",
+      );
+    }
+    if (abortController.signal.aborted && !acquired) {
+      throw new Error("Timed out waiting for SSO session coordination", {
+        cause: error,
+      });
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeout);
+    stopForwardingAbort();
+  }
+}
+
+function forwardAbort(
+  source: AbortSignal | undefined,
+  target: AbortController,
+): () => void {
+  if (!source) return () => {};
+  const abort = (): void => target.abort();
+  source.addEventListener("abort", abort, { once: true });
+  if (source.aborted) abort();
+  return () => source.removeEventListener("abort", abort);
+}
+
+function runWithAbortDeadline<T>(
+  operation: () => Promise<T>,
+  abortController: AbortController,
+  timeoutMs: number,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    let timeout = 0;
+    const resolveOnce = (value: T): void => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      abortController.signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const rejectOnce = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      abortController.signal.removeEventListener("abort", onAbort);
+      reject(error);
+    };
+    const onAbort = (): void => {
+      rejectOnce(
+        new DOMException("The SSO session request was aborted", "AbortError"),
+      );
+    };
+    timeout = window.setTimeout(() => abortController.abort(), timeoutMs);
+    abortController.signal.addEventListener("abort", onAbort, { once: true });
+    if (abortController.signal.aborted) {
+      onAbort();
+      return;
+    }
+    try {
+      void operation().then(resolveOnce, rejectOnce);
+    } catch (error) {
+      rejectOnce(error);
+    }
+  });
+}
+
+/**
+ * A fetch deadline that releases the Web Lock even when an injected adapter
+ * ignores AbortSignal. The late request remains observed by the attached
+ * handlers, while its result can no longer extend this operation's custody.
+ */
+function fetchWithDeadline(
+  fetchFn: SsoBridgeFetch,
+  input: RequestInfo | URL,
+  init: RequestInit,
+  abortController: AbortController,
+  timeoutMs: number,
+): Promise<Response> {
+  return runWithAbortDeadline(
+    () => fetchFn(input, { ...init, signal: abortController.signal }),
+    abortController,
+    timeoutMs,
   );
-  return result;
+}
+
+/** Response bodies are network work too and remain bounded while locked. */
+function readJsonWithDeadline(
+  response: Response,
+  abortController: AbortController,
+  timeoutMs: number,
+): Promise<unknown> {
+  return runWithAbortDeadline(
+    () => response.json() as Promise<unknown>,
+    abortController,
+    timeoutMs,
+  );
 }
 
 function tokenLooksHydratable(token: string): boolean {
@@ -579,6 +916,93 @@ function tokenLooksHydratable(token: string): boolean {
   if (typeof id !== "string" || id.trim().length === 0) return false;
   if (typeof claims?.exp !== "number") return false;
   return claims.exp * 1000 > Date.now();
+}
+
+type StewardSessionProof = Pick<
+  StewardSessionResponse,
+  "ok" | "stewardUserId" | "userId"
+>;
+
+function hasStewardSessionProof(value: unknown): value is StewardSessionProof {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    ok?: unknown;
+    stewardUserId?: unknown;
+    userId?: unknown;
+  };
+  return (
+    candidate.ok === true &&
+    typeof candidate.userId === "string" &&
+    candidate.userId.trim().length > 0 &&
+    typeof candidate.stewardUserId === "string" &&
+    candidate.stewardUserId.trim().length > 0
+  );
+}
+
+function hasSsoLogoutBarrierProof(
+  value: unknown,
+): value is StewardLogoutResponse {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as {
+    success?: unknown;
+    logoutProofVersion?: unknown;
+    barrierState?: unknown;
+    barrierConfirmed?: unknown;
+    message?: unknown;
+  };
+  return (
+    candidate.success === true &&
+    candidate.logoutProofVersion === STEWARD_LOGOUT_PROOF_VERSION &&
+    ((candidate.barrierState === "confirmed" &&
+      candidate.barrierConfirmed === true) ||
+      (candidate.barrierState === "already_absent" &&
+        candidate.barrierConfirmed === false)) &&
+    typeof candidate.message === "string" &&
+    candidate.message.trim().length > 0
+  );
+}
+
+async function readSsoLogoutBarrierProof(
+  response: Response,
+  abortController: AbortController,
+): Promise<StewardLogoutBarrierState | null> {
+  try {
+    const body = await readJsonWithDeadline(
+      response,
+      abortController,
+      SSO_LOGOUT_TIMEOUT_MS,
+    );
+    return hasSsoLogoutBarrierProof(body) ? body.barrierState : null;
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") throw error;
+    return null;
+  }
+}
+
+async function scrubPersistedExchangeTokenIfOwned(
+  token: string,
+): Promise<void> {
+  invalidateStewardServerCookieSyncMarker();
+  const cleared = await clearStoredStewardTokenIfCurrent(token);
+  if (!cleared) return;
+  // Do not forward the component-lifetime signal here: once this token was
+  // durably published, its cookie POST may already have landed. Rollback must
+  // survive route unmount; its own AbortController deadline still bounds lock
+  // custody when the network is unavailable.
+  await clearServerStewardSessionCookies({
+    timeoutMs: SSO_COOKIE_SYNC_TIMEOUT_MS,
+  });
+  try {
+    window.dispatchEvent(new CustomEvent("steward-token-sync"));
+  } catch (error) {
+    // error-policy:J7 canonical authority is already cleared; diagnostics are
+    // sufficient if an optional renderer notification cannot be delivered.
+    reportRendererDiagnostic({
+      scope: "steward.sso-bridge.session-notification",
+      error,
+      severity: "warning",
+    });
+  }
 }
 
 /**
@@ -602,39 +1026,75 @@ export async function performSsoExchange(
   hostname: string,
   fetchFn: SsoBridgeFetch = fetch,
   isCurrent: () => boolean = () => true,
+  coordination: SsoBridgeCoordinationOptions = {},
 ): Promise<SsoExchangeResult> {
   const base = apiBaseForHostname(hostname);
   if (!base) return { ok: false, error: "Host cannot exchange SSO codes" };
   if (!isWellFormedSsoChallenge(verifier)) {
     return { ok: false, error: "Malformed code verifier" };
   }
+  const lockManager = resolveSsoBridgeLockManager(coordination.lockManager);
   const logoutEpochAtStart = ssoLogoutEpoch;
+  const logoutGenerationAtStart = readStoredGeneration(
+    SSO_LOGOUT_GENERATION_KEY,
+  );
+  const finalizationIntent = createFinalizationIntent();
+  if (!logoutGenerationAtStart.readable || !finalizationIntent) {
+    return { ok: false, error: "SSO session coordination unavailable" };
+  }
+  const stillOwnsAuthority = (): boolean =>
+    logoutEpochAtStart === ssoLogoutEpoch &&
+    storedGenerationMatches(
+      SSO_LOGOUT_GENERATION_KEY,
+      logoutGenerationAtStart,
+    ) &&
+    finalizationIntentMatches(finalizationIntent) &&
+    isCurrent();
+  const exchangeAbortController = new AbortController();
+  const stopForwardingExchangeAbort = forwardAbort(
+    coordination.signal,
+    exchangeAbortController,
+  );
   let res: Response;
   try {
-    res = await fetchFn(`${base}/api/auth/sso-bridge/exchange`, {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code, codeVerifier: verifier }),
-    });
+    res = await fetchWithDeadline(
+      fetchFn,
+      `${base}/api/auth/sso-bridge/exchange`,
+      {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code, codeVerifier: verifier }),
+      },
+      exchangeAbortController,
+      SSO_BRIDGE_REQUEST_TIMEOUT_MS,
+    );
   } catch (err) {
     // error-policy:J1 transport failure becomes the typed failure result the
     // bridge route turns into its fall-back-to-login redirect.
+    stopForwardingExchangeAbort();
     return {
       ok: false,
       error: err instanceof Error ? err.message : String(err),
     };
   }
   if (!res.ok) {
+    stopForwardingExchangeAbort();
     return { ok: false, error: `Exchange failed (HTTP ${res.status})` };
   }
   let body: unknown;
   try {
-    body = await res.json();
+    body = await readJsonWithDeadline(
+      res,
+      exchangeAbortController,
+      SSO_BRIDGE_REQUEST_TIMEOUT_MS,
+    );
   } catch {
     // error-policy:J3 a malformed upstream response is explicit invalid input,
     // never a fabricated empty success envelope.
     return { ok: false, error: "Exchange returned no usable session" };
+  } finally {
+    stopForwardingExchangeAbort();
   }
   const token =
     body && typeof body === "object" && "token" in body
@@ -645,82 +1105,178 @@ export async function performSsoExchange(
   if (!token || !tokenLooksHydratable(token)) {
     return { ok: false, error: "Exchange returned no usable session" };
   }
-  if (!isCurrent()) {
+  if (!stillOwnsAuthority()) {
     return { ok: false, error: "SSO exchange superseded" };
   }
 
   // Persistence/finalization errors are deliberately outside the transport
   // catch above. They reach the route boundary as unexpected failures instead
   // of being disguised as an ordinary expired/replayed-code login recovery.
-  return await serializeSsoExchangeFinalization(async () => {
-    const persisted = await writeStoredStewardTokenIfCurrent(
-      token,
-      () => logoutEpochAtStart === ssoLogoutEpoch && isCurrent(),
-    );
-    if (
-      !persisted ||
-      logoutEpochAtStart !== ssoLogoutEpoch ||
-      readStoredStewardToken() !== token
-    ) {
-      return { ok: false, error: "SSO exchange superseded" };
-    }
-
-    const sessionEndpoint = configuredSessionEndpoint();
-    const cookieSyncAbortController = new AbortController();
-    activeSsoCookieSyncAbortController = cookieSyncAbortController;
-    const cookieSyncTimeout = window.setTimeout(
-      () => cookieSyncAbortController.abort(),
-      SSO_COOKIE_SYNC_TIMEOUT_MS,
-    );
-    let cookieSyncResponse: Response | null = null;
-    try {
-      cookieSyncResponse = await fetchFn(sessionEndpoint, {
-        method: "POST",
-        credentials: "include",
-        signal: cookieSyncAbortController.signal,
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token }),
-      });
-    } catch (error) {
-      // error-policy:J6 best-effort cookie sync; the committed local session
-      // remains authoritative and AuthTokenSync retries on its own cadence.
-      // Report the failed teardown/sync attempt instead of swallowing it.
-      reportRendererDiagnostic({
-        scope: "steward.sso-bridge.cookie-sync",
-        error,
-        severity: "warning",
-      });
-    } finally {
-      window.clearTimeout(cookieSyncTimeout);
-      if (activeSsoCookieSyncAbortController === cookieSyncAbortController) {
-        activeSsoCookieSyncAbortController = null;
+  return await withSsoFinalizationLock(
+    lockManager,
+    async () => {
+      const persisted = await writeStoredStewardTokenIfCurrent(
+        token,
+        // This callback is evaluated inside the canonical token mutation
+        // queue, immediately before the durable write: both authority and JWT
+        // lifetime are therefore revalidated at the actual commit point.
+        () => stillOwnsAuthority() && tokenLooksHydratable(token),
+      );
+      if (!persisted) {
+        return tokenLooksHydratable(token)
+          ? { ok: false, error: "SSO exchange superseded" }
+          : { ok: false, error: "SSO exchange session expired" };
       }
-    }
+      if (!stillOwnsAuthority() || readStoredStewardToken() !== token) {
+        await scrubPersistedExchangeTokenIfOwned(token);
+        return { ok: false, error: "SSO exchange superseded" };
+      }
+      if (!tokenLooksHydratable(token)) {
+        await scrubPersistedExchangeTokenIfOwned(token);
+        return { ok: false, error: "SSO exchange session expired" };
+      }
 
-    const stillOwnsFinalization =
-      logoutEpochAtStart === ssoLogoutEpoch &&
-      readStoredStewardToken() === token;
-    if (!stillOwnsFinalization) {
-      return { ok: false, error: "SSO exchange superseded" };
-    }
-    if (cookieSyncResponse?.ok) {
+      const sessionEndpoint = configuredSessionEndpoint();
+      const cookieSyncAbortController = new AbortController();
+      const stopForwardingCookieSyncAbort = forwardAbort(
+        coordination.signal,
+        cookieSyncAbortController,
+      );
+      activeSsoCookieSyncAbortController = cookieSyncAbortController;
+      let cookieSyncProven = false;
+      let cookieSyncSessionEnded = false;
+      try {
+        const cookieSyncResponse = await fetchWithDeadline(
+          fetchFn,
+          sessionEndpoint,
+          {
+            method: "POST",
+            credentials: "include",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ token }),
+          },
+          cookieSyncAbortController,
+          SSO_COOKIE_SYNC_TIMEOUT_MS,
+        );
+        if (cookieSyncResponse.status === 401) {
+          const errorBody = (await readJsonWithDeadline(
+            cookieSyncResponse,
+            cookieSyncAbortController,
+            SSO_COOKIE_SYNC_TIMEOUT_MS,
+          ).catch(() => {
+            // error-policy:J3 a malformed error body cannot prove the typed
+            // server revocation signal.
+            return null;
+          })) as { code?: unknown } | null;
+          cookieSyncSessionEnded = errorBody?.code === "session_ended";
+        } else if (cookieSyncResponse.ok) {
+          const responseBody = await readJsonWithDeadline(
+            cookieSyncResponse,
+            cookieSyncAbortController,
+            SSO_COOKIE_SYNC_TIMEOUT_MS,
+          ).catch(() => {
+            // error-policy:J3 a malformed success body cannot prove that the
+            // server accepted cookie authority for this exact bearer.
+            return null;
+          });
+          cookieSyncProven = hasStewardSessionProof(responseBody);
+          if (!cookieSyncProven) {
+            reportRendererDiagnostic({
+              scope: "steward.sso-bridge.cookie-sync-response",
+              error: new Error(
+                "Cookie sync returned a malformed successful response",
+              ),
+              severity: "warning",
+              context: { status: cookieSyncResponse.status },
+            });
+          }
+        } else {
+          reportRendererDiagnostic({
+            scope: "steward.sso-bridge.cookie-sync-response",
+            error: new Error("Cookie sync rejected the bridged session"),
+            severity: "warning",
+            context: { status: cookieSyncResponse.status },
+          });
+        }
+      } catch (error) {
+        // error-policy:J6 best-effort cookie sync; the committed local session
+        // remains authoritative and AuthTokenSync retries on its own cadence.
+        // Report the failed teardown/sync attempt instead of swallowing it.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.cookie-sync",
+          error,
+          severity: "warning",
+        });
+      } finally {
+        stopForwardingCookieSyncAbort();
+        if (activeSsoCookieSyncAbortController === cookieSyncAbortController) {
+          activeSsoCookieSyncAbortController = null;
+        }
+      }
+
+      const stillOwnsFinalization =
+        stillOwnsAuthority() && readStoredStewardToken() === token;
+      if (!stillOwnsFinalization) {
+        await scrubPersistedExchangeTokenIfOwned(token);
+        return { ok: false, error: "SSO exchange superseded" };
+      }
+      if (cookieSyncSessionEnded) {
+        // The paired origin logged this account out after the bridge token was
+        // issued. This distinct server code is a real revocation, not a generic
+        // cookie-sync outage: keep auto-bridging suppressed and scrub every
+        // local bearer before the exchange route can publish success.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.session-ended",
+          error: new Error("Session was ended by an explicit logout"),
+          severity: "warning",
+        });
+        markSsoLoggedOut();
+        await clearStaleStewardSession({
+          awaitCookieClear: true,
+          signal: coordination.signal,
+          timeoutMs: SSO_LOGOUT_TIMEOUT_MS,
+        });
+        return { ok: false, error: "Session was signed out" };
+      }
+      if (!cookieSyncProven) {
+        // The server-side cookie boundary is part of the login commit, not an
+        // optional mirror. In particular it is the post-exchange recheck that
+        // can observe a paired-origin logout landing after the code exchange.
+        // Never publish a local bearer over an unavailable, rejected, or
+        // malformed proof; compensate any Set-Cookie that may already have
+        // landed before the response/body failed validation.
+        await scrubPersistedExchangeTokenIfOwned(token);
+        return {
+          ok: false,
+          error: "Could not establish the Eliza Cloud browser session",
+        };
+      }
+      // No awaited work follows this lifetime check. A token that expired
+      // after durable persistence is removed before the route can publish
+      // success or a cookie-sync proof.
+      if (!tokenLooksHydratable(token)) {
+        await scrubPersistedExchangeTokenIfOwned(token);
+        return { ok: false, error: "SSO exchange session expired" };
+      }
       markStewardServerCookieSynced(token, sessionEndpoint);
-    }
-    clearSsoBridgeAttempt();
-    clearSsoLoggedOut();
-    try {
-      window.dispatchEvent(new CustomEvent("steward-token-sync"));
-    } catch (error) {
-      // error-policy:J7 the durable token is already authoritative; report a
-      // failed optional renderer notification without changing the result.
-      reportRendererDiagnostic({
-        scope: "steward.sso-bridge.session-notification",
-        error,
-        severity: "warning",
-      });
-    }
-    return { ok: true };
-  });
+      clearSsoBridgeAttempt();
+      clearSsoLoggedOut();
+      try {
+        window.dispatchEvent(new CustomEvent("steward-token-sync"));
+      } catch (error) {
+        // error-policy:J7 the durable token is already authoritative; report a
+        // failed optional renderer notification without changing the result.
+        reportRendererDiagnostic({
+          scope: "steward.sso-bridge.session-notification",
+          error,
+          severity: "warning",
+        });
+      }
+      return { ok: true };
+    },
+    coordination.lockTimeoutMs,
+    coordination.signal,
+  );
 }
 
 /**
@@ -764,7 +1320,7 @@ export function burnSsoBridgeCode(
 }
 
 // ---------------------------------------------------------------------------
-// Sign-out (defect fix: logout stays logged out)
+// Sign-out
 // ---------------------------------------------------------------------------
 
 /**
@@ -777,47 +1333,103 @@ export function burnSsoBridgeCode(
  * is suppressed even if the network never answers) and aborts an active
  * bridge cookie sync. The queued server logout then runs after that earlier
  * cookie mutation has settled, while the session cookies are still in the jar;
- * it ends the server-side sessions and stamps the marker that blocks minting,
- * exchanging, and cookie re-planting for pre-logout tokens. The local scrub
- * shares that ordered teardown. On hostnames outside the deployed map (local
- * dev) the server call is skipped and this degrades to the local scrub. A
- * hosted non-success response or transport failure rejects so explicit
- * sign-out cannot claim success over a server session that may still be live.
+ * it ends the server-side sessions and stamps the marker for the presented
+ * access-token authority. The local scrub shares that ordered teardown. On
+ * hostnames outside the deployed map (local dev) the server call is skipped and
+ * this degrades to the local scrub. A hosted non-success response or transport
+ * failure rejects so explicit sign-out cannot claim success over a server
+ * session that may still be live; refresh-family revocation remains owned by
+ * Steward's server-side session contract.
  */
 export async function signOutFromSsoBridgedHost(
   hostname: string = window.location.hostname,
   fetchFn: typeof fetch = fetch,
+  coordination: SsoBridgeCoordinationOptions = {},
 ): Promise<void> {
   const stewardToken = readStoredStewardToken();
+  const activeStewardToken =
+    stewardToken && tokenLooksHydratable(stewardToken) ? stewardToken : null;
   // Invalidate before even issuing the server logout request: fetch adapters
   // may have synchronous hooks, and no re-entrant token publication may reuse
   // proof from the authority epoch being ended.
   invalidateStewardServerCookieSyncMarker();
-  markSsoLoggedOut();
+  const logoutIntent = markSsoLoggedOut();
+  if (!logoutIntent) {
+    throw new Error("SSO session coordination is unavailable for sign-out.");
+  }
   const base = apiBaseForHostname(hostname);
-  await serializeSsoExchangeFinalization(async () => {
-    const serverLogout = base
-      ? fetchFn(`${base}/api/auth/logout`, {
-          method: "POST",
-          credentials: "include",
-          headers: {
-            "Content-Type": "application/json",
-            ...(stewardToken
-              ? { Authorization: `Bearer ${stewardToken}` }
-              : {}),
-          },
-        })
-      : // error-policy:J6 best-effort server teardown — the local marker is
-        // already set and the local scrub below always runs.
-        Promise.resolve(undefined);
-    await clearStaleStewardSession();
-    const response = await serverLogout;
-    if (response && !response.ok) {
-      throw new Error(
-        `Eliza Cloud could not end the browser session (${response.status}).`,
+  const lockManager = resolveSsoBridgeLockManager(coordination.lockManager);
+  await withSsoFinalizationLock(
+    lockManager,
+    async () => {
+      // A newer login/logout intent owns the lock when it arrives; this older
+      // logout must not tear down the session that intent is about to publish.
+      // Reassert immediately: a stale exchange that passed its last authority
+      // check just before this logout started may have removed the first marker
+      // while we waited for custody. Network/storage failure below must still
+      // leave auto-bridging suppressed for a safe retry.
+      reassertSsoLoggedOutMarker(logoutIntent, "sign-out");
+      const logoutAbortController = new AbortController();
+      const stopForwardingLogoutAbort = forwardAbort(
+        coordination.signal,
+        logoutAbortController,
       );
-    }
-  });
+      const serverLogout = base
+        ? fetchWithDeadline(
+            fetchFn,
+            `${base}/api/auth/logout`,
+            {
+              method: "POST",
+              credentials: "include",
+              headers: {
+                "Content-Type": "application/json",
+                ...(activeStewardToken
+                  ? { Authorization: `Bearer ${activeStewardToken}` }
+                  : {}),
+              },
+            },
+            logoutAbortController,
+            SSO_LOGOUT_TIMEOUT_MS,
+          )
+        : // error-policy:J6 best-effort server teardown — the local marker is
+          // already set and the local scrub below always runs.
+          Promise.resolve(undefined);
+      let response: Response | undefined;
+      let barrierState: StewardLogoutBarrierState | null = null;
+      try {
+        response = await serverLogout;
+        if (response?.ok) {
+          barrierState = await readSsoLogoutBarrierProof(
+            response,
+            logoutAbortController,
+          );
+        }
+      } finally {
+        stopForwardingLogoutAbort();
+      }
+      if (response && !response.ok) {
+        throw new Error(
+          `Eliza Cloud could not end the browser session (${response.status}).`,
+        );
+      }
+      if (response && !barrierState) {
+        throw new Error(
+          "Eliza Cloud did not return a valid browser-session logout proof.",
+        );
+      }
+      // Retain the bearer needed to retry a failed hosted logout until the
+      // server barrier has definitely accepted it. The synchronous marker
+      // still suppresses auto-login throughout the attempt.
+      await clearStaleStewardSession({
+        awaitCookieClear: true,
+        signal: coordination.signal,
+        timeoutMs: SSO_LOGOUT_TIMEOUT_MS,
+      });
+      reassertSsoLoggedOutMarker(logoutIntent, "sign-out");
+    },
+    coordination.lockTimeoutMs,
+    coordination.signal,
+  );
 }
 
 /**
@@ -829,31 +1441,81 @@ export async function signOutFromSsoBridgedHost(
 export async function prepareSsoAccountSwitch(
   hostname: string = window.location.hostname,
   fetchFn: typeof fetch = fetch,
+  coordination: SsoBridgeCoordinationOptions = {},
 ): Promise<void> {
   const stewardToken = readStoredStewardToken();
+  const activeStewardToken =
+    stewardToken && tokenLooksHydratable(stewardToken) ? stewardToken : null;
   invalidateStewardServerCookieSyncMarker();
-  markSsoLoggedOut();
+  const logoutIntent = markSsoLoggedOut();
+  if (!logoutIntent) {
+    throw new Error(
+      "SSO session coordination is unavailable for account switching.",
+    );
+  }
   const base = apiBaseForHostname(hostname);
   if (!base) {
     throw new Error(
       "Eliza Cloud account switching is unavailable on this host.",
     );
   }
-  await serializeSsoExchangeFinalization(async () => {
-    const serverLogout = fetchFn(`${base}/api/auth/logout`, {
-      method: "POST",
-      credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        ...(stewardToken ? { Authorization: `Bearer ${stewardToken}` } : {}),
-      },
-    });
-    await clearStaleStewardSession();
-    const response = await serverLogout;
-    if (!response.ok) {
-      throw new Error(
-        `Eliza Cloud could not end the previous browser session (${response.status}).`,
+  const lockManager = resolveSsoBridgeLockManager(coordination.lockManager);
+  await withSsoFinalizationLock(
+    lockManager,
+    async () => {
+      reassertSsoLoggedOutMarker(logoutIntent, "account switch");
+      const logoutAbortController = new AbortController();
+      const stopForwardingLogoutAbort = forwardAbort(
+        coordination.signal,
+        logoutAbortController,
       );
-    }
-  });
+      const serverLogout = fetchWithDeadline(
+        fetchFn,
+        `${base}/api/auth/logout`,
+        {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            ...(activeStewardToken
+              ? { Authorization: `Bearer ${activeStewardToken}` }
+              : {}),
+          },
+        },
+        logoutAbortController,
+        SSO_LOGOUT_TIMEOUT_MS,
+      );
+      let response: Response;
+      let barrierState: StewardLogoutBarrierState | null = null;
+      try {
+        response = await serverLogout;
+        if (response.ok) {
+          barrierState = await readSsoLogoutBarrierProof(
+            response,
+            logoutAbortController,
+          );
+        }
+      } finally {
+        stopForwardingLogoutAbort();
+      }
+      if (!response.ok) {
+        throw new Error(
+          `Eliza Cloud could not end the previous browser session (${response.status}).`,
+        );
+      }
+      if (!barrierState) {
+        throw new Error(
+          "Eliza Cloud did not return a valid previous-session logout proof.",
+        );
+      }
+      await clearStaleStewardSession({
+        awaitCookieClear: true,
+        signal: coordination.signal,
+        timeoutMs: SSO_LOGOUT_TIMEOUT_MS,
+      });
+      reassertSsoLoggedOutMarker(logoutIntent, "account switch");
+    },
+    coordination.lockTimeoutMs,
+    coordination.signal,
+  );
 }

@@ -4,6 +4,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   clearStoredStewardToken,
+  clearStoredStewardTokenIfCurrent,
   configureStoredStewardTokenScope,
   exchangeStewardCode,
   hasStewardAuthedCookie,
@@ -365,6 +366,40 @@ describe("Steward session storage transitions", () => {
       ),
     ).resolves.toBe(false);
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+  });
+
+  it("does not let a queued stale compare-clear erase a newer token", async () => {
+    await writeStoredStewardToken("expired-exchange-token");
+    let releaseNewerPersistence: () => void = () => {};
+    const newerPersistence = new Promise<void>((resolve) => {
+      releaseNewerPersistence = resolve;
+    });
+    let markNewerPersistenceStarted: () => void = () => {};
+    const newerPersistenceStarted = new Promise<void>((resolve) => {
+      markNewerPersistenceStarted = resolve;
+    });
+    const unregister = registerStewardTokenPersistence(async (token) => {
+      markNewerPersistenceStarted();
+      await newerPersistence;
+      localStorage.setItem(STEWARD_TOKEN_KEY, token);
+    });
+
+    try {
+      const newerWrite = writeStoredStewardToken("newer-login-token");
+      await newerPersistenceStarted;
+      const staleClear = clearStoredStewardTokenIfCurrent(
+        "expired-exchange-token",
+      );
+      releaseNewerPersistence();
+
+      await newerWrite;
+      await expect(staleClear).resolves.toBe(false);
+    } finally {
+      releaseNewerPersistence();
+      unregister();
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("newer-login-token");
   });
 
   it("revalidates a cached token through the registered durable host", async () => {

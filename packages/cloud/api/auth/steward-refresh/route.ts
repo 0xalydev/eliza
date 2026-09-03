@@ -299,6 +299,17 @@ app.post("/", async (c) => {
       logRefresh("bearer-invalid-token");
       return c.json(errorBody("Invalid token", "invalid_token"), 401);
     }
+    // A bridge-issued access token has no transferred refresh-cookie authority.
+    // Re-minting it from bearer claims would let an origin extend the token
+    // beyond a cross-host logout by assigning a fresh iat. Require a new SSO
+    // exchange instead of manufacturing an unbounded bearer-only session.
+    if (claims.bridged) {
+      logRefresh("bearer-bridged-session-nonrenewable");
+      return c.json(
+        errorBody("Session ended; sign in again", "session_ended"),
+        401,
+      );
+    }
     // Staging QA sessions are deliberately non-renewable. Their absolute
     // one-hour maximum is signed into the source binding, and the bearer
     // convenience refresh must never move that window forward.

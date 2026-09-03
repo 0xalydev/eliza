@@ -275,12 +275,12 @@ describe("clearStaleStewardSession", () => {
 });
 
 describe("clearServerStewardSessionCookies", () => {
-  it("marks every cookie-clearing DELETE as a non-simple request", () => {
+  it("marks every cookie-clearing DELETE as a non-simple request", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(null, { status: 204 }));
 
-    clearServerStewardSessionCookies();
+    await clearServerStewardSessionCookies();
 
     expect(fetchSpy).toHaveBeenCalled();
     for (const [url, init] of fetchSpy.mock.calls) {
@@ -291,6 +291,48 @@ describe("clearServerStewardSessionCookies", () => {
         headers: { "Content-Type": "application/json" },
       });
     }
+  });
+
+  it("bounds and aborts every cookie DELETE even when fetch never settles", async () => {
+    const signals: AbortSignal[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      if (init?.signal instanceof AbortSignal) signals.push(init.signal);
+      return new Promise<Response>(() => {});
+    });
+    vi.useFakeTimers();
+
+    try {
+      const cleanup = clearServerStewardSessionCookies({ timeoutMs: 25 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(signals.length).toBeGreaterThan(0);
+      expect(signals.every((signal) => !signal.aborted)).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(cleanup).resolves.toBeUndefined();
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("forwards caller cancellation to every in-flight cookie DELETE", async () => {
+    const requestSignals: AbortSignal[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
+      if (init?.signal instanceof AbortSignal) {
+        requestSignals.push(init.signal);
+      }
+      return new Promise<Response>(() => {});
+    });
+    const callerAbort = new AbortController();
+
+    const cleanup = clearServerStewardSessionCookies({
+      signal: callerAbort.signal,
+    });
+    expect(requestSignals.length).toBeGreaterThan(0);
+    callerAbort.abort();
+
+    await expect(cleanup).resolves.toBeUndefined();
+    expect(requestSignals.every((signal) => signal.aborted)).toBe(true);
   });
 });
 

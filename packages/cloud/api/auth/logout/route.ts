@@ -1,16 +1,24 @@
 /**
  * POST /api/auth/logout
- * Logs out the current user by ending all sessions and clearing auth cookies.
- * Also invalidates Redis caches to ensure immediate token invalidation.
+ * Establishes the available browser-session logout barriers, then clears the
+ * host cookies and drains session/cache state. Steward refresh-family
+ * revocation remains an upstream session-lineage contract.
  */
 
+import {
+  STEWARD_LOGOUT_PROOF_VERSION,
+  type StewardLogoutResponse,
+} from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
 import { deleteCookie } from "hono/cookie";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import { invalidateSessionCaches } from "@/lib/auth";
 import { checkElizaMutatingRequestOrigin } from "@/lib/auth/browser-origin-policy";
 import { cookieDomainForHost } from "@/lib/auth/cookie-domain";
-import { verifyStewardTokenCached } from "@/lib/auth/steward-client";
+import {
+  type StewardTokenClaims,
+  verifyStewardTokenWithResult,
+} from "@/lib/auth/steward-client";
 import { stewardCookieNames } from "@/lib/auth/steward-cookies";
 import {
   getCurrentUser,
@@ -56,44 +64,52 @@ app.post("/", async (c) => {
   // bearers are deliberately excluded from browser-session teardown.
   const stewardToken = readStewardSessionToken(c);
 
-  // Clear cookies FIRST. Clearing them is what actually logs the user out, and
-  // it must happen even if the server-side teardown below fails (a transient DB
-  // error during logout must not leave the session cookies in place — that was
-  // the prior behavior, which left users "still logged in" after a failed
-  // logout). The session-record teardown + cache invalidation are best-effort
-  // hygiene (caches expire on their own TTL).
-  const domain = cookieDomainForHost(c.req.header("host"));
-  const stewardOpts = domain ? { path: "/", domain } : { path: "/" };
-  // Non-production clears only its suffixed pair. The unsuffixed legacy names
-  // are production's live cookies on the shared parent domain; deleting them
-  // from staging/dev signs the user out of production.
-  // In production the scoped names already ARE the historical unsuffixed names,
-  // so a single set of deleteCookie calls covers both eras. The separate legacy
-  // clear block was redundant (#14130).
-  deleteCookie(c, cookieNames.token, stewardOpts);
-  deleteCookie(c, cookieNames.refreshToken, stewardOpts);
-  deleteCookie(c, cookieNames.authed, stewardOpts);
-  deleteCookie(c, "eliza-anon-session", { path: "/" });
+  let verifiedClaims: StewardTokenClaims | null = null;
+  if (stewardToken) {
+    const verification = await verifyStewardTokenWithResult(
+      c.env,
+      stewardToken,
+      { skipDistributedCache: true },
+    );
+    if (verification.kind === "unavailable") {
+      // error-policy:J1 do not destroy the credential needed to retry a
+      // security boundary whose verifier could not establish token authority.
+      logger.error("[Logout] Steward token verification unavailable", {
+        error:
+          verification.error instanceof Error
+            ? verification.error.message
+            : String(verification.error),
+      });
+      return c.json(
+        {
+          error: "Logout revocation is temporarily unavailable",
+          code: "logout_revocation_unavailable" as const,
+        },
+        503,
+      );
+    }
+    if (verification.kind === "valid") {
+      verifiedClaims = verification.claims;
+    }
+  }
 
   let strongRevocationFailed = false;
-  if (stewardToken && isInferenceStrongRevocationEnabled(c.env)) {
+  let ssoLogoutBarrierFailed = false;
+  if (verifiedClaims && isInferenceStrongRevocationEnabled(c.env)) {
     try {
-      const [claims, user] = await Promise.all([
-        verifyStewardTokenCached(c.env, stewardToken),
-        getCurrentUser(c),
-      ]);
-      if (!claims || !user?.organization_id) {
+      const user = await getCurrentUser(c);
+      if (!user?.organization_id) {
         throw new Error("logout credential identity could not be resolved");
       }
       await revokeInferenceSessionsThrough(
         user.organization_id,
         user.id,
-        claims.issuedAt,
+        verifiedClaims.issuedAt,
       );
     } catch (error) {
-      // error-policy:J1 cookies are already cleared, but the server must not
-      // claim a globally complete logout until the strong inference boundary
-      // confirms that the presented session generation is denied.
+      // error-policy:J1 preserve retry credentials and never claim a globally
+      // complete logout until the strong inference boundary confirms that the
+      // presented session generation is denied.
       logger.error("[Logout] Strong inference-session revocation failed", {
         error: error instanceof Error ? error.message : String(error),
       });
@@ -109,35 +125,60 @@ app.post("/", async (c) => {
   // the bridge reads), so a store outage that loses this stamp also disables
   // the bridge itself — but a TRANSIENT stamp failure would leave a bridgeable
   // window once the store recovers, hence one retry and an error-level log
-  // (never a silent downgrade to debug) when the stamp is unconfirmed.
-  if (stewardToken) {
+  // (never a silent downgrade to debug) when the stamp is unconfirmed. The
+  // response then fails closed before credentials are destroyed.
+  if (verifiedClaims) {
     try {
-      const claims = await verifyStewardTokenCached(c.env, stewardToken);
-      if (claims) {
-        try {
-          await markSsoBridgeLogout(claims.userId);
-        } catch {
-          // error-policy:J6 single bounded retry of best-effort teardown; the
-          // definitive failure is handled (loudly) by the outer catch.
-          await markSsoBridgeLogout(claims.userId);
-        }
-        logger.debug("[Logout] Stamped SSO bridge logout marker");
+      try {
+        await markSsoBridgeLogout(verifiedClaims.userId);
+      } catch {
+        // error-policy:J6 single bounded retry; the definitive failure is
+        // handled (loudly) by the outer fail-closed boundary.
+        await markSsoBridgeLogout(verifiedClaims.userId);
       }
+      logger.debug("[Logout] Stamped SSO bridge logout marker");
     } catch (error) {
-      // error-policy:J6 best-effort teardown — cookies are already cleared, so
-      // THIS origin is logged out; but the cross-host logout barrier did not
-      // land, which is a security-relevant condition worth an alert, not a
-      // debug line. The bridge's own store reads fail closed while the store
-      // is down, narrowing the exposure to a post-recovery window bounded by
-      // the access-token TTL.
+      // error-policy:J1 the server must not report a globally complete logout
+      // when its cross-host barrier did not land. The 503 below tells account-
+      // switch callers not to bridge a new identity across an unconfirmed
+      // old-session boundary and leaves the original credential retryable.
       logger.error(
         "[Logout] FAILED to stamp SSO bridge logout marker — cross-host logout barrier not persisted",
         {
           error: error instanceof Error ? error.message : String(error),
         },
       );
+      ssoLogoutBarrierFailed = true;
     }
   }
+
+  if (strongRevocationFailed || ssoLogoutBarrierFailed) {
+    // The browser keeps both cookie and Bearer authority so the exact same
+    // validated session can retry after the transient barrier outage.
+    return c.json(
+      {
+        error: "Logout revocation is temporarily unavailable",
+        code: "logout_revocation_unavailable" as const,
+      },
+      503,
+    );
+  }
+
+  // Critical revocation boundaries are now confirmed. Clear browser cookies
+  // before best-effort session-record/cache teardown, which must never restore
+  // authority or turn a completed logout into a false failure.
+  const domain = cookieDomainForHost(c.req.header("host"));
+  const stewardOpts = domain ? { path: "/", domain } : { path: "/" };
+  // Non-production clears only its suffixed pair. The unsuffixed legacy names
+  // are production's live cookies on the shared parent domain; deleting them
+  // from staging/dev signs the user out of production.
+  // In production the scoped names already ARE the historical unsuffixed names,
+  // so a single set of deleteCookie calls covers both eras. The separate legacy
+  // clear block was redundant (#14130).
+  deleteCookie(c, cookieNames.token, stewardOpts);
+  deleteCookie(c, cookieNames.refreshToken, stewardOpts);
+  deleteCookie(c, cookieNames.authed, stewardOpts);
+  deleteCookie(c, "eliza-anon-session", { path: "/" });
 
   try {
     // Only tear down caches/sessions when the request presented a Steward JWT
@@ -184,17 +225,22 @@ app.post("/", async (c) => {
     );
   }
 
-  if (strongRevocationFailed) {
-    return c.json(
-      {
-        error: "Logout revocation is temporarily unavailable",
-        code: "logout_revocation_unavailable" as const,
-      },
-      503,
-    );
-  }
-
-  return c.json({ success: true, message: "Logged out successfully" });
+  const proof: StewardLogoutResponse = verifiedClaims
+    ? {
+        success: true,
+        logoutProofVersion: STEWARD_LOGOUT_PROOF_VERSION,
+        barrierState: "confirmed",
+        barrierConfirmed: true,
+        message: "Logged out successfully",
+      }
+    : {
+        success: true,
+        logoutProofVersion: STEWARD_LOGOUT_PROOF_VERSION,
+        barrierState: "already_absent",
+        barrierConfirmed: false,
+        message: "Logged out successfully",
+      };
+  return c.json(proof);
 });
 
 export default app;

@@ -5,6 +5,7 @@ type VerifiedStewardClaims = {
   userId: string;
   email: string;
   tenantId: string;
+  bridged?: boolean;
   expiration: number;
   issuedAt: number;
 };
@@ -126,6 +127,28 @@ describe("steward-refresh bearer rotation", () => {
     await expect(response.json()).resolves.toEqual({
       error: "Invalid token",
       code: "invalid_token",
+    });
+    expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
+  });
+
+  test("refuses to extend a bridge-issued bearer without its original session authority", async () => {
+    verifyStewardTokenCached.mockResolvedValue({
+      userId: "steward-user-1",
+      email: "user@example.com",
+      tenantId: "elizacloud",
+      bridged: true,
+      expiration: Math.floor(Date.now() / 1000) + 60,
+      issuedAt: Math.floor(Date.now() / 1000) - 60,
+    });
+
+    const response = await post({
+      Authorization: "Bearer bridge-issued-steward-jwt",
+    });
+
+    expect(response.status).toBe(401);
+    await expect(response.json()).resolves.toEqual({
+      error: "Session ended; sign in again",
+      code: "session_ended",
     });
     expect(mintStewardTokenFromClaims).not.toHaveBeenCalled();
   });

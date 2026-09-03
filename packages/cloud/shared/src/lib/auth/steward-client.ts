@@ -142,6 +142,16 @@ export interface StewardVerifyOptions {
   skipDistributedCache?: boolean;
 }
 
+/**
+ * Security-boundary verification distinguishes attacker-controlled invalid
+ * input from an unavailable verifier so callers never turn an outage into an
+ * authorization success.
+ */
+export type StewardTokenVerificationResult =
+  | { kind: "valid"; claims: StewardTokenClaims }
+  | { kind: "invalid" }
+  | { kind: "unavailable"; error: unknown };
+
 export const STEWARD_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 
 /**
@@ -159,6 +169,27 @@ const STEWARD_VERIFY_CLOCK_SKEW_SECONDS = 5 * 60;
  */
 const MAX_STEWARD_TOKEN_TTL_SECONDS = STEWARD_ACCESS_TOKEN_TTL_SECONDS;
 const STEWARD_TELEGRAM_ID_PATTERN = /^[1-9]\d{0,19}$/;
+const EXPECTED_STEWARD_VERIFICATION_ERROR_CODES = new Set([
+  "ERR_JOSE_ALG_NOT_ALLOWED",
+  "ERR_JWS_INVALID",
+  "ERR_JWS_SIGNATURE_VERIFICATION_FAILED",
+  "ERR_JWT_CLAIM_VALIDATION_FAILED",
+  "ERR_JWT_EXPIRED",
+  "ERR_JWT_INVALID",
+]);
+
+function isExpectedStewardVerificationFailure(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = "code" in error && typeof error.code === "string" ? error.code : null;
+  return (
+    (code !== null && EXPECTED_STEWARD_VERIFICATION_ERROR_CODES.has(code)) ||
+    error.message.includes("JWSInvalid") ||
+    error.message.includes("JWTExpired") ||
+    error.message.includes("JWTClaimValidationFailed") ||
+    error.message.includes("Invalid Compact JWS") ||
+    error.message.includes("signature verification failed")
+  );
+}
 
 /** Telegram Login identifies users with a positive canonical decimal sender id. */
 export function isValidStewardTelegramId(value: unknown): value is string {
@@ -505,7 +536,15 @@ async function verifyStewardTokenWithoutCaches(input: {
     return null;
   }
 
-  const claims = extractClaims(payload);
+  let claims: StewardTokenClaims;
+  try {
+    claims = extractClaims(payload);
+  } catch {
+    // error-policy:J3 claim extraction is pure parsing of untrusted JWT input;
+    // every exception here is an invalid credential, not verifier downtime.
+    logger.warn("[StewardClient] Rejected malformed token claims");
+    return null;
+  }
 
   if (!claims.userId) {
     logger.warn("[StewardClient] JWT valid but missing sub/userId identity claim");
@@ -533,16 +572,22 @@ async function verifyStewardTokenWithoutCaches(input: {
  *   Pass Hono `c.env` on Workers, or `process.env` on Node. Callers
  *   that still rely on the legacy global may pass `process.env` explicitly.
  */
-export async function verifyStewardTokenCached(
+async function verifyStewardTokenCachedInternal(
   env: StewardVerifyEnv,
   token: string,
-  options: StewardVerifyOptions = {},
+  options: StewardVerifyOptions,
+  failOnUnavailable: boolean,
 ): Promise<StewardTokenClaims | null> {
   const stagingHeader = readStagingTokenHeader(token);
   const secret = stagingHeader.isCandidate
     ? resolveStagingTokenSecret(env, stagingHeader.keyId)
     : resolveJwtSecret(env);
-  if (!secret) return null;
+  if (!secret) {
+    if (failOnUnavailable) {
+      throw new Error("Steward token verification secret is unavailable");
+    }
+    return null;
+  }
 
   const tokenHash = hashToken(token);
   const signingKeyFingerprint = fingerprintSigningKey(secret);
@@ -701,18 +746,7 @@ export async function verifyStewardTokenCached(
 
     return claims;
   } catch (error) {
-    const isExpectedFailure =
-      error instanceof Error &&
-      (error.message.includes("JWSInvalid") ||
-        error.message.includes("JWTExpired") ||
-        error.message.includes("JWTClaimValidationFailed") ||
-        error.message.includes("Invalid Compact JWS") ||
-        error.message.includes("signature verification failed") ||
-        ("code" in error &&
-          (error.code === "ERR_JWS_INVALID" ||
-            error.code === "ERR_JWT_EXPIRED" ||
-            error.code === "ERR_JWT_CLAIM_VALIDATION_FAILED" ||
-            error.code === "ERR_JWS_SIGNATURE_VERIFICATION_FAILED")));
+    const isExpectedFailure = isExpectedStewardVerificationFailure(error);
 
     if (isExpectedFailure) {
       logger.debug(
@@ -726,7 +760,34 @@ export async function verifyStewardTokenCached(
       "[StewardClient] ✗ Unexpected verification error:",
       error instanceof Error ? error.message : "Unknown error",
     );
+    if (failOnUnavailable) throw error;
     return null;
+  }
+}
+
+export async function verifyStewardTokenCached(
+  env: StewardVerifyEnv,
+  token: string,
+  options: StewardVerifyOptions = {},
+): Promise<StewardTokenClaims | null> {
+  return await verifyStewardTokenCachedInternal(env, token, options, false);
+}
+
+/**
+ * Verification contract for fail-closed mutation boundaries such as logout.
+ * Existing authentication callers keep the nullable cached API above, while
+ * this result preserves the difference between bad input and an outage.
+ */
+export async function verifyStewardTokenWithResult(
+  env: StewardVerifyEnv,
+  token: string,
+  options: StewardVerifyOptions = {},
+): Promise<StewardTokenVerificationResult> {
+  try {
+    const claims = await verifyStewardTokenCachedInternal(env, token, options, true);
+    return claims ? { kind: "valid", claims } : { kind: "invalid" };
+  } catch (error) {
+    return { kind: "unavailable", error };
   }
 }
 

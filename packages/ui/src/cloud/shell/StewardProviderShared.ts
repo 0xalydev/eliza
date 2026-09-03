@@ -123,19 +123,78 @@ function stewardSessionClearUrls(): string[] {
   return [...urls];
 }
 
-export function clearServerStewardSessionCookies(): void {
+const STEWARD_SESSION_COOKIE_CLEAR_TIMEOUT_MS = 10_000;
+
+export interface StewardSessionCookieClearOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface StaleStewardSessionClearOptions
+  extends StewardSessionCookieClearOptions {
+  /** Preserve legacy fire-and-forget cleanup unless a custody lock owns it. */
+  awaitCookieClear?: boolean;
+}
+
+function clearServerStewardSessionCookie(
+  url: string,
+  {
+    signal,
+    timeoutMs = STEWARD_SESSION_COOKIE_CLEAR_TIMEOUT_MS,
+  }: StewardSessionCookieClearOptions,
+): Promise<void> {
+  const abortController = new AbortController();
+  const forwardAbort = (): void => abortController.abort();
+  signal?.addEventListener("abort", forwardAbort, { once: true });
+
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) globalThis.clearTimeout(timeout);
+      abortController.signal.removeEventListener("abort", finish);
+      signal?.removeEventListener("abort", forwardAbort);
+      resolve();
+    };
+    abortController.signal.addEventListener("abort", finish, { once: true });
+    timeout = globalThis.setTimeout(() => abortController.abort(), timeoutMs);
+    if (signal?.aborted) {
+      abortController.abort();
+      return;
+    }
+
+    try {
+      void fetch(url, {
+        method: "DELETE",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
+      }).then(finish, finish);
+    } catch {
+      // error-policy:J6 an injected fetch may throw synchronously during
+      // best-effort teardown; settle this bounded cookie-clear attempt.
+      finish();
+    }
+  });
+}
+
+export async function clearServerStewardSessionCookies(
+  options: StewardSessionCookieClearOptions = {},
+): Promise<void> {
   // Invalidate before issuing any best-effort DELETE: a rejected request must
   // never leave a proof that can suppress a later session-establishing POST.
   invalidateStewardServerCookieSyncMarker();
-  for (const url of stewardSessionClearUrls()) {
-    // error-policy:J6 best-effort sign-out cookie clear across session hosts;
-    // the local token is already cleared and an expired cookie self-heals.
-    fetch(url, {
-      method: "DELETE",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-    }).catch(() => undefined);
-  }
+  // error-policy:J6 best-effort sign-out cookie clear across session hosts;
+  // every attempt settles on success, rejection, cancellation, or its bounded
+  // deadline. Awaiting this promise under the cross-tab custody lock prevents
+  // a late DELETE response from racing a newer session-establishing POST.
+  await Promise.all(
+    stewardSessionClearUrls().map((url) =>
+      clearServerStewardSessionCookie(url, options),
+    ),
+  );
 }
 
 export function readStoredToken(): string | null {
@@ -167,7 +226,9 @@ export function tokenSecsRemaining(token: string): number | null {
   return payload.exp - Date.now() / 1000;
 }
 
-export async function clearStaleStewardSession(): Promise<void> {
+export async function clearStaleStewardSession(
+  options: StaleStewardSessionClearOptions = {},
+): Promise<void> {
   if (typeof window === "undefined") return;
   // This is deliberately before protected-storage removal. That operation can
   // reject and abort the rest of teardown, but an attempted session clear must
@@ -210,7 +271,8 @@ export async function clearStaleStewardSession(): Promise<void> {
     scrubPersistedActiveServerToken();
   }
   scrubPersistedAgentProfileTokens();
-  clearServerStewardSessionCookies();
+  const cookieClear = clearServerStewardSessionCookies(options);
+  if (options.awaitCookieClear) await cookieClear;
   try {
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
   } catch {

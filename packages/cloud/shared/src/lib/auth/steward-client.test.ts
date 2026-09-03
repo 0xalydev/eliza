@@ -15,6 +15,7 @@ const SECRET = "steward-client-test-secret-0123456789abcdef";
 const ENV = { STEWARD_JWT_SECRET: SECRET };
 const memoryCache = new Map<string, unknown>();
 let distributedCacheValue: unknown = null;
+let distributedCacheError: Error | null = null;
 let tokenSequence = 0;
 
 mock.module("../../db/helpers", () => ({
@@ -27,7 +28,10 @@ mock.module("../../db/helpers", () => ({
 
 mock.module("../cache/client", () => ({
   cache: {
-    get: async () => distributedCacheValue,
+    get: async () => {
+      if (distributedCacheError) throw distributedCacheError;
+      return distributedCacheValue;
+    },
     set: async () => undefined,
     del: async () => undefined,
   },
@@ -55,8 +59,12 @@ mock.module("../utils/logger", () => ({
   redact: { id: (v: string) => v, orgId: (v: string) => v, userId: (v: string) => v },
 }));
 
-const { mintStewardTokenFromClaims, STEWARD_ACCESS_TOKEN_TTL_SECONDS, verifyStewardTokenCached } =
-  await import("./steward-client");
+const {
+  mintStewardTokenFromClaims,
+  STEWARD_ACCESS_TOKEN_TTL_SECONDS,
+  verifyStewardTokenCached,
+  verifyStewardTokenWithResult,
+} = await import("./steward-client");
 
 function secretKey(): Uint8Array {
   return new TextEncoder().encode(SECRET);
@@ -82,11 +90,13 @@ describe("verifyStewardTokenCached — token lifecycle claims", () => {
   beforeEach(() => {
     memoryCache.clear();
     distributedCacheValue = null;
+    distributedCacheError = null;
   });
 
   afterEach(() => {
     memoryCache.clear();
     distributedCacheValue = null;
+    distributedCacheError = null;
   });
 
   test("accepts a token minted at the standard Steward access-token TTL", async () => {
@@ -387,5 +397,51 @@ describe("verifyStewardTokenCached — token lifecycle claims", () => {
       .setExpirationTime("1h")
       .sign(new TextEncoder().encode("attacker-controlled-secret"));
     expect(await verify(token)).toBeNull();
+  });
+
+  test("distinguishes valid, invalid, and unavailable verification outcomes", async () => {
+    const validToken = await mint({ exp: Math.floor(Date.now() / 1000) + 300 });
+    await expect(verifyStewardTokenWithResult(ENV, validToken)).resolves.toMatchObject({
+      kind: "valid",
+      claims: { userId: "steward-user-1" },
+    });
+
+    const malformedClaims = await new SignJWT({
+      sub: "steward-telegram-invalid",
+      authMethod: "telegram",
+      telegramId: "not-a-sender-id",
+    })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(secretKey());
+    await expect(verifyStewardTokenWithResult(ENV, malformedClaims)).resolves.toEqual({
+      kind: "invalid",
+    });
+    await expect(verifyStewardTokenWithResult(ENV, "not-a-jwt")).resolves.toEqual({
+      kind: "invalid",
+    });
+    const wrongAlgorithm = await new SignJWT({ sub: "wrong-algorithm" })
+      .setProtectedHeader({ alg: "HS384", typ: "JWT" })
+      .setIssuedAt()
+      .setExpirationTime("5m")
+      .sign(secretKey());
+    await expect(verifyStewardTokenWithResult(ENV, wrongAlgorithm)).resolves.toEqual({
+      kind: "invalid",
+    });
+
+    await expect(verifyStewardTokenWithResult({}, validToken)).resolves.toMatchObject({
+      kind: "unavailable",
+    });
+  });
+
+  test("reports an unexpected distributed-cache failure while preserving the legacy null API", async () => {
+    const token = await mint({ exp: Math.floor(Date.now() / 1000) + 300 });
+    distributedCacheError = new Error("verification cache unavailable");
+
+    await expect(verifyStewardTokenWithResult(ENV, token)).resolves.toMatchObject({
+      kind: "unavailable",
+    });
+    await expect(verifyStewardTokenCached(ENV, token)).resolves.toBeNull();
   });
 });

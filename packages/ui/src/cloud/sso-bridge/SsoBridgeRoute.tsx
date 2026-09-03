@@ -141,6 +141,7 @@ async function runMintLegOperation(
   state: string,
   challenge: string,
   returnTo: string,
+  signal: AbortSignal,
 ): Promise<MintLegOutcome> {
   const appOrigin = pairedAppOrigin(hostname);
   if (!appOrigin) return { kind: "not-initiated" };
@@ -187,7 +188,7 @@ async function runMintLegOperation(
   };
 
   try {
-    const result = await mintSsoCode(hostname, challenge);
+    const result = await mintSsoCode(hostname, challenge, fetch, signal);
     if (!result.ok) {
       return { kind: "redirect", url: appLoginUrl(appOrigin, returnTo) };
     }
@@ -235,6 +236,7 @@ function MintLeg({
 }): React.JSX.Element {
   const operationRef = useRef<{
     activeEffects: Set<number>;
+    abortController: AbortController;
     key: string;
     promise: Promise<MintLegOutcome>;
   } | null>(null);
@@ -252,11 +254,21 @@ function MintLeg({
     const operation =
       previousOperation?.key === operationKey
         ? previousOperation
-        : {
-            activeEffects: new Set<number>(),
-            key: operationKey,
-            promise: runMintLegOperation(hostname, state, challenge, returnTo),
-          };
+        : (() => {
+            const abortController = new AbortController();
+            return {
+              activeEffects: new Set<number>(),
+              abortController,
+              key: operationKey,
+              promise: runMintLegOperation(
+                hostname,
+                state,
+                challenge,
+                returnTo,
+                abortController.signal,
+              ),
+            };
+          })();
     operationRef.current = operation;
     operation.activeEffects.add(effectGeneration);
 
@@ -331,6 +343,11 @@ function MintLeg({
 
     return () => {
       operation.activeEffects.delete(effectGeneration);
+      queueMicrotask(() => {
+        if (operation.activeEffects.size === 0) {
+          operation.abortController.abort();
+        }
+      });
       if (effectIsCurrent()) {
         effectGenerationRef.current = effectGeneration + 1;
       }
@@ -354,6 +371,7 @@ async function runExchangeLegOperation(
   code: string | null,
   state: string | null,
   operationIsCurrent: () => boolean,
+  signal: AbortSignal,
 ): Promise<boolean> {
   // State nonce first, before ANY network call: the stored value is consumed
   // single-shot, and only an exact echo of what THIS origin created may
@@ -364,7 +382,11 @@ async function runExchangeLegOperation(
   const verifier = consumeSsoBridgeVerifier();
   const stateOk =
     stored !== null && isWellFormedSsoState(state) && stored === state;
-  if (!stateOk || !isWellFormedSsoCode(code) || verifier === null) {
+  if (
+    !stateOk ||
+    !isWellFormedSsoCode(code) ||
+    !isWellFormedSsoChallenge(verifier)
+  ) {
     if (isWellFormedSsoCode(code)) burnSsoBridgeCode(code, hostname);
     return false;
   }
@@ -384,6 +406,7 @@ async function runExchangeLegOperation(
     hostname,
     generationBoundFetch,
     operationIsCurrent,
+    { signal },
   );
   return result.ok;
 }
@@ -402,6 +425,7 @@ function ExchangeLeg({
   const operationKey = JSON.stringify([hostname, code, state]);
   const operationRef = useRef<{
     activeEffects: Set<number>;
+    abortController: AbortController;
     key: string;
     promise: Promise<boolean>;
   } | null>(null);
@@ -424,9 +448,12 @@ function ExchangeLeg({
       previousOperation?.key === operationKey
         ? previousOperation
         : (() => {
+            previousOperation?.abortController.abort();
             const activeEffects = new Set<number>();
+            const abortController = new AbortController();
             return {
               activeEffects,
+              abortController,
               key: operationKey,
               promise: runExchangeLegOperation(
                 hostname,
@@ -435,6 +462,7 @@ function ExchangeLeg({
                 () =>
                   operationRef.current?.activeEffects === activeEffects &&
                   activeEffects.size > 0,
+                abortController.signal,
               ),
             };
           })();
@@ -463,6 +491,11 @@ function ExchangeLeg({
 
     return () => {
       operation.activeEffects.delete(effectGeneration);
+      queueMicrotask(() => {
+        if (operation.activeEffects.size === 0) {
+          operation.abortController.abort();
+        }
+      });
       if (effectIsCurrent()) {
         effectGenerationRef.current = effectGeneration + 1;
       }
