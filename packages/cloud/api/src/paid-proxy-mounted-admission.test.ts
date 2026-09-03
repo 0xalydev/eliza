@@ -6,6 +6,7 @@
 
 import { beforeEach, expect, mock, test } from "bun:test";
 import { Hono } from "hono";
+import * as organizationInferenceAdmissionActual from "@/lib/services/organization-inference-admission";
 import type { AppEnv } from "@/types/cloud-worker-env";
 
 const globalSessionReads = mock();
@@ -113,6 +114,7 @@ mock.module("@/lib/services/inference-admission-snapshot", () => ({
   inferenceRateLimitConfig: () => ({ windowMs: 60_000, maxRequests: 100 }),
 }));
 mock.module("@/lib/services/organization-inference-admission", () => ({
+  ...organizationInferenceAdmissionActual,
   admitOrganizationInference: mock(async (params: Record<string, unknown>) => {
     admissionCalls.push(params);
     return {

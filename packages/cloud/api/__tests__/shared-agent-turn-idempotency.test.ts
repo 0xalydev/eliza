@@ -13,6 +13,7 @@
  */
 
 import { beforeEach, expect, mock, test } from "bun:test";
+import * as organizationInferenceAdmissionActual from "@/lib/services/organization-inference-admission";
 import * as realResolveSharedAgent from "@/lib/services/shared-runtime/resolve-shared-agent";
 
 // ---------------------------------------------------------------------------
@@ -89,6 +90,7 @@ mock.module("@/lib/services/inference-admission-snapshot", () => ({
   inferenceRateLimitConfig: () => ({ windowMs: 60_000, maxRequests: 120 }),
 }));
 mock.module("@/lib/services/organization-inference-admission", () => ({
+  ...organizationInferenceAdmissionActual,
   admitOrganizationInference: async (params: {
     context: { requestId: string; metadata?: Record<string, unknown> };
   }) => {

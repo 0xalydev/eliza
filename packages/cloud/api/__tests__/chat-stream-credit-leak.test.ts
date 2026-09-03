@@ -10,6 +10,7 @@
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { APICallError } from "ai";
+import * as organizationInferenceAdmissionActual from "@/lib/services/organization-inference-admission";
 
 const aiActual = require("ai") as Record<string, unknown>;
 const creditsActual = await import("@/lib/services/credits");
@@ -138,6 +139,7 @@ mock.module("@/lib/services/credits", () => ({
 }));
 
 mock.module("@/lib/services/organization-inference-admission", () => ({
+  ...organizationInferenceAdmissionActual,
   admitOrganizationInference: mock(async (params: Record<string, unknown>) => {
     admissionCalls.push(params);
     let settlement: Promise<unknown> | undefined;
