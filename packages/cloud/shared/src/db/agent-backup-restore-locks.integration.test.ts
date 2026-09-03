@@ -102,8 +102,8 @@ if (EXACT_FINAL_REPLACEMENT_GUARD_SQL.length !== 2) {
   throw new Error("0371 exact final replacement guard fixture is incomplete");
 }
 const RESTORE_V3_CANDIDATE_MIGRATIONS = [
-  "0373_agent_backup_restore_v3_candidates",
-  "0374_agent_backup_restore_v3_candidate_guards",
+  "0375_agent_backup_restore_v3_candidates",
+  "0376_agent_backup_restore_v3_candidate_guards",
 ].map((name) => readFileSync(join(MIGRATIONS_DIR, `${name}.sql`), "utf8"));
 
 const ORG_ID = "00000000-0000-4000-8000-00000000b101";

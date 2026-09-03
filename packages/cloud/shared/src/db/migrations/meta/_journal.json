@@ -2497,15 +2497,29 @@
     {
       "idx": 356,
       "version": "7",
-      "when": 1794254400064,
-      "tag": "0373_agent_backup_restore_v3_candidates",
+      "when": 1796083200000,
+      "tag": "0373_subscription_authority",
       "breakpoints": true
     },
     {
       "idx": 357,
       "version": "7",
-      "when": 1794254400065,
-      "tag": "0374_agent_backup_restore_v3_candidate_guards",
+      "when": 1796083200001,
+      "tag": "0374_subscription_funding_transaction_uniqueness",
+      "breakpoints": true
+    },
+    {
+      "idx": 358,
+      "version": "7",
+      "when": 1796083200002,
+      "tag": "0375_agent_backup_restore_v3_candidates",
+      "breakpoints": true
+    },
+    {
+      "idx": 359,
+      "version": "7",
+      "when": 1796083200003,
+      "tag": "0376_agent_backup_restore_v3_candidate_guards",
       "breakpoints": true
     }
   ]
