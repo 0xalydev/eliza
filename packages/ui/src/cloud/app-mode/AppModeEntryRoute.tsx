@@ -28,6 +28,7 @@ import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
 import { useAgents } from "../instances/lib/data/eliza-agents";
 import { useSessionAuth } from "../lib/use-session-auth";
 import {
+  buildSsoBridgeErrorUrl,
   redirectToSsoBridge,
   shouldAutoBridgeToSso,
 } from "../sso-bridge/sso-bridge";
@@ -113,7 +114,15 @@ export function AppModeEntryRoute({
 
   if (!authenticated) {
     if (ssoBridgeFailed) {
-      return <Navigate to="/auth/error?reason=auth_failed" replace />;
+      return (
+        <Navigate
+          to={buildSsoBridgeErrorUrl(
+            "auth_failed",
+            `${location.pathname}${location.search}`,
+          )}
+          replace
+        />
+      );
     }
     if (ssoBridging !== false) {
       // Decision pending (first paint before the effect) or the full-page

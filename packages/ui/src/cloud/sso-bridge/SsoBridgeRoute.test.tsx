@@ -439,7 +439,7 @@ describe("SsoBridgeRoute — mint leg (eliza.app auth host)", () => {
     renderBridge("eliza.app", MINT_QS);
 
     expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
-      "/auth/error?reason=auth_failed",
+      "/auth/error?reason=auth_failed&returnTo=%2Fchat",
     );
     expect(
       fetchLog.filter(({ url }) => url.endsWith("/sso-bridge/burn")),
@@ -801,7 +801,7 @@ describe("SsoBridgeRoute — exchange leg (app host)", () => {
         `?code=${CODE}&state=${STATE}&returnTo=%2Fchat`,
       );
       expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
-        "/auth/error?reason=sync_failed",
+        "/auth/error?reason=sync_failed&returnTo=%2Fchat",
       );
     } finally {
       unregister();

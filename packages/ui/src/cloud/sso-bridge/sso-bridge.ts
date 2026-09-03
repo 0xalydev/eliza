@@ -152,6 +152,23 @@ export function sanitizeBridgeReturnTo(
   return value;
 }
 
+/**
+ * Local recovery URL for an unexpected bridge failure. Keep the original
+ * same-origin destination so retrying authentication does not discard a deep
+ * link such as `/chat`, while applying the same open-redirect and loop guards
+ * as the cross-origin handshake itself.
+ */
+export function buildSsoBridgeErrorUrl(
+  reason: "auth_failed" | "sync_failed",
+  returnTo: string,
+): string {
+  const params = new URLSearchParams({
+    reason,
+    returnTo: sanitizeBridgeReturnTo(returnTo),
+  });
+  return `/auth/error?${params.toString()}`;
+}
+
 // ---------------------------------------------------------------------------
 // State nonce + PKCE verifier (defect fix: handshake binding + code theft)
 // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import { appModeNavigation } from "../app-mode/app-mode";
 import { publishPersonalEntryHandoff } from "../app-mode/use-personal-entry";
 import { useCloudT } from "../shell/CloudI18nProvider";
 import {
+  buildSsoBridgeErrorUrl,
   redirectToSsoBridge,
   shouldAutoBridgeToSso,
 } from "../sso-bridge/sso-bridge";
@@ -211,7 +212,9 @@ export default function JoinPage(): React.JSX.Element {
 
   // Signed out → send to login, returning here once authenticated.
   if (session.ready && !session.authenticated && ssoBridgeFailed) {
-    return <Navigate to="/auth/error?reason=auth_failed" replace />;
+    return (
+      <Navigate to={buildSsoBridgeErrorUrl("auth_failed", "/join")} replace />
+    );
   }
   if (session.ready && !session.authenticated && ssoBridging === false) {
     return <Navigate to="/login?returnTo=/join" replace />;

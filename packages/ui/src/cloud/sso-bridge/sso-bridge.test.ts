@@ -20,6 +20,7 @@ import {
 import {
   buildBridgeExchangeUrl,
   buildBridgeMintUrl,
+  buildSsoBridgeErrorUrl,
   burnSsoBridgeCode,
   clearSsoBridgeAttempt,
   clearSsoLoggedOut,
@@ -160,6 +161,22 @@ describe("sanitizeBridgeReturnTo", () => {
   it("rejects the bridge path itself (self-loop)", () => {
     expect(sanitizeBridgeReturnTo("/auth/bridge")).toBe("/");
     expect(sanitizeBridgeReturnTo("/auth/bridge?code=x")).toBe("/");
+  });
+});
+
+describe("buildSsoBridgeErrorUrl", () => {
+  it("preserves a safe deep-link for local recovery", () => {
+    expect(
+      buildSsoBridgeErrorUrl("sync_failed", "/chat?thread=one#latest"),
+    ).toBe(
+      "/auth/error?reason=sync_failed&returnTo=%2Fchat%3Fthread%3Done%23latest",
+    );
+  });
+
+  it("fails a cross-origin recovery target closed to the local root", () => {
+    expect(
+      buildSsoBridgeErrorUrl("auth_failed", "https://evil.example/chat"),
+    ).toBe("/auth/error?reason=auth_failed&returnTo=%2F");
   });
 });
 

@@ -121,7 +121,7 @@ describe("JoinPage managed-app SSO handoff", () => {
     render(<JoinPage />);
 
     expect((await screen.findByTestId("navigate")).textContent).toBe(
-      "/auth/error?reason=auth_failed",
+      "/auth/error?reason=auth_failed&returnTo=%2Fjoin",
     );
     expect(replacedUrls).toHaveLength(1);
     expect(runJoinFlowMock).not.toHaveBeenCalled();

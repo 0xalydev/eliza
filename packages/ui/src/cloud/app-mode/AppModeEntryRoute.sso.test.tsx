@@ -205,7 +205,7 @@ describe("AppModeEntryRoute — SSO auto-bridge (managed app origin)", () => {
     renderEntry("/chat?x=1");
 
     expect((await screen.findByTestId("auth-error-page")).textContent).toBe(
-      "?reason=auth_failed",
+      "?reason=auth_failed&returnTo=%2Fchat%3Fx%3D1",
     );
     expect(screen.queryByTestId("login-page")).toBeNull();
     expect(replacedUrls).toHaveLength(1);

@@ -34,6 +34,7 @@ import { appModeNavigation } from "../app-mode/app-mode";
 import { hasHydratableStewardToken } from "../lib/steward-session";
 import {
   buildBridgeExchangeUrl,
+  buildSsoBridgeErrorUrl,
   burnSsoBridgeCode,
   consumeSsoBridgeState,
   consumeSsoBridgeVerifier,
@@ -337,7 +338,9 @@ function MintLeg({
   }, [hostname, state, challenge, returnTo]);
 
   if (unexpectedFailure) {
-    return <Navigate to="/auth/error?reason=auth_failed" replace />;
+    return (
+      <Navigate to={buildSsoBridgeErrorUrl("auth_failed", returnTo)} replace />
+    );
   }
   if (notInitiated) {
     return <Navigate to="/" replace />;
@@ -467,7 +470,9 @@ function ExchangeLeg({
   }, [hostname, code, state, returnTo, navigate, operationKey]);
 
   if (unexpectedFailureKey === operationKey) {
-    return <Navigate to="/auth/error?reason=sync_failed" replace />;
+    return (
+      <Navigate to={buildSsoBridgeErrorUrl("sync_failed", returnTo)} replace />
+    );
   }
   if (failedOperationKey === operationKey) {
     return (
