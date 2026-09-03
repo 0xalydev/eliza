@@ -269,7 +269,7 @@ describe("generate-music provider health gate", () => {
     expect(stillOpen.status).toBe(200);
   });
 
-  test("failed requests that trip the breaker still refund their hold", async () => {
+  test("failed requests that trip the breaker conservatively retain their hold", async () => {
     const { state, reservation } = makeReservation();
     reserve.mockResolvedValueOnce(reservation);
     generateAudio.mockRejectedValueOnce(
@@ -278,6 +278,6 @@ describe("generate-music provider health gate", () => {
     const res = await post({ model: MINIMAX, prompt: "storm ambience" });
     expect(res.status).toBeGreaterThanOrEqual(500);
     expect(state.reconcileCalls).toBe(1);
-    expect(state.lastActual).toBe(0);
+    expect(state.lastActual).toBe(COST.totalCost);
   });
 });

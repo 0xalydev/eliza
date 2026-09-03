@@ -9,8 +9,8 @@
  *  - per-model duration cap → 400,
  *  - provider not configured → 503, no reserve,
  *  - insufficient credits → 402,
- *  - pre-settle provider failure → full refund,
- *  - post-settle DB failure → charge NOT refunded (money-leak guard).
+ *  - post-dispatch provider failure → conservative settlement,
+ *  - post-generation DB failure → error response without refund.
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -281,7 +281,7 @@ describe("generate-sfx — validation gates (no money moves)", () => {
 });
 
 describe("generate-sfx — settlement", () => {
-  test("pre-settle provider failure refunds in full", async () => {
+  test("post-dispatch provider failure conservatively retains the hold", async () => {
     const ledger = makeLedgerReservation(10, COST);
     reserve.mockResolvedValue(ledger.reservation);
     generate.mockRejectedValue(new Error("upstream 503"));
@@ -291,11 +291,11 @@ describe("generate-sfx — settlement", () => {
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(generationsCreate).not.toHaveBeenCalled();
     expect(ledger.reconcileCalls).toBe(1);
-    expect(ledger.lastActual).toBe(0);
-    expect(ledger.balance).toBeCloseTo(ledger.startBalance, 10);
+    expect(ledger.lastActual).toBeCloseTo(COST, 10);
+    expect(ledger.balance).toBeCloseTo(ledger.startBalance - COST, 10);
   });
 
-  test("post-settle DB failure does NOT refund the settled charge", async () => {
+  test("post-generation DB failure returns an error without refunding", async () => {
     const ledger = makeLedgerReservation(10, COST);
     const blob = makeFakeBlob();
     reserve.mockResolvedValue(ledger.reservation);
@@ -311,7 +311,7 @@ describe("generate-sfx — settlement", () => {
       { BLOB: blob.binding },
     );
 
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(500);
     expect(ledger.reconcileCalls).toBe(1);
     expect(ledger.lastActual).toBeCloseTo(COST, 10);
     expect(ledger.balance).toBeCloseTo(ledger.startBalance - COST, 10);

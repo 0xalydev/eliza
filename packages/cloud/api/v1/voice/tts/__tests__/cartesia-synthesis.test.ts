@@ -14,8 +14,10 @@ import {
   synthesizeCartesiaWav,
 } from "../cartesia-synthesis";
 
+const originalFetch = globalThis.fetch;
+
 afterEach(() => {
-  vi.unstubAllGlobals();
+  globalThis.fetch = originalFetch;
 });
 
 /** In-memory Cartesia socket: on the generation request, replay frames+done. */
@@ -266,7 +268,7 @@ describe("makeWorkersCartesiaWebSocketFactory", () => {
         webSocket: upstreamSocket,
       });
     });
-    vi.stubGlobal("fetch", fetchImpl);
+    globalThis.fetch = fetchImpl as unknown as typeof fetch;
     const beforeProviderDispatch = vi.fn(async () => {
       events.push("callback:start");
       await Promise.resolve();
@@ -292,7 +294,7 @@ describe("makeWorkersCartesiaWebSocketFactory", () => {
 
   it("does not attempt the upgrade when the dispatch callback rejects", async () => {
     const fetchImpl = vi.fn(async () => new Response(null));
-    vi.stubGlobal("fetch", fetchImpl);
+    globalThis.fetch = fetchImpl as unknown as typeof fetch;
     const beforeProviderDispatch = vi.fn(async () => {
       throw new Error("dispatch marker unavailable");
     });
