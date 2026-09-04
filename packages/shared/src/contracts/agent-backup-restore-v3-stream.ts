@@ -1066,6 +1066,14 @@ export function canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationReques
   );
 }
 
+export async function computeAgentBackupRestoreV3CandidateSealAuthorizationRequestSha256(
+  request: Readonly<AgentBackupRestoreV3CandidateSealAuthorizationRequest>,
+): Promise<string> {
+  return sha256Hex(
+    canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationRequest(request),
+  );
+}
+
 export function parseAgentBackupRestoreV3CandidateSealAuthorization(
   value: unknown,
 ): Readonly<AgentBackupRestoreV3CandidateSealAuthorization> {

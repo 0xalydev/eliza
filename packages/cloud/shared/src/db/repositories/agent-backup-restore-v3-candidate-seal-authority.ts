@@ -32,12 +32,17 @@ import {
   applyAgentBackupRestoreV3TransactionDeadline,
   assertAgentBackupRestoreV3OperationControl,
   isAgentBackupRestoreV3AmbiguousCommitResponse,
+  snapshotAgentBackupRestoreV3OperationControl,
   throwIfAgentBackupRestoreV3DatabaseDeadline,
 } from "./agent-backup-restore-v3-candidate-database-control";
 import { readPostLockDatabaseNow } from "./primary-database-clock";
 
 const AUTHORIZATION_TTL_MS = 60_000;
-const AMBIGUOUS_COMMIT_RECOVERY_MS = 5_000;
+// Leave headroom inside the caller's 5s cleanup fence so the repository can
+// settle and return before the outer timer detaches this read-only recovery.
+const AMBIGUOUS_COMMIT_RECOVERY_MS = 4_000;
+const AMBIGUOUS_COMMIT_RECOVERY_POLL_MS = 25;
+const ADDITIONAL_AMBIGUOUS_COMMIT_SQL_STATES = new Set(["40003", "57P02"]);
 const SEAL_COMMAND_CONTEXT = "elizaos.agent-backup.restore-v3-candidate-seal-command.v1";
 
 export class AgentBackupRestoreV3CandidateSealConflictError extends Error {
@@ -133,14 +138,33 @@ function asDate(value: Date | string, field: string): Date {
 function recoveryControl(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   cause: unknown,
+  forceFresh = false,
 ): Readonly<AgentBackupRestoreV3OperationControl> {
-  if (!isAgentBackupRestoreV3AmbiguousCommitResponse(cause)) return control;
+  if (!forceFresh && !isCandidateSealCommitAmbiguous(cause)) {
+    return snapshotAgentBackupRestoreV3OperationControl(control);
+  }
   // A lost COMMIT acknowledgement must get one bounded, read-only PRIMARY
   // lookup even if the caller's signal was tripped while the driver failed.
   return Object.freeze({
     signal: new AbortController().signal,
     deadlineEpochMs: Date.now() + AMBIGUOUS_COMMIT_RECOVERY_MS,
   });
+}
+
+function isCandidateSealCommitAmbiguous(cause: unknown): boolean {
+  const sqlState = agentBackupRestoreV3DatabaseSqlState(cause);
+  return (
+    (sqlState !== undefined && ADDITIONAL_AMBIGUOUS_COMMIT_SQL_STATES.has(sqlState)) ||
+    isAgentBackupRestoreV3AmbiguousCommitResponse(cause)
+  );
+}
+
+function isValidInactiveControl(control: Readonly<AgentBackupRestoreV3OperationControl>): boolean {
+  return (
+    Number.isSafeInteger(control.deadlineEpochMs) &&
+    control.deadlineEpochMs > 0 &&
+    (control.signal.aborted || Date.now() >= control.deadlineEpochMs)
+  );
 }
 
 function exactCandidateAuthorityMatches(
@@ -258,20 +282,28 @@ function authorizationFromBound(
   });
 }
 
-async function readExactAuthorization(
+async function readExactAuthorizationSnapshot(
   bound: BoundSealAuthorization,
   request: Readonly<AgentBackupRestoreV3CandidateSealAuthorizationRequest>,
   proofToken: string,
-  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  boundedControl: Readonly<AgentBackupRestoreV3OperationControl>,
   cause: unknown,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateSealAuthorization> | null> {
   if (bound.expiresAtEpochMs === undefined) return null;
+  if (bound.proofZeroized || Date.now() >= bound.proofDestroyAtEpochMs) {
+    zeroizeBoundProof(bound);
+    throw conflict("Restore-v3 seal proof material expired before replay", cause);
+  }
   const expiresAtEpochMs = bound.expiresAtEpochMs;
-  return dbWrite.transaction(async (tx) => {
+  const authorization = await dbWrite.transaction(async (tx) => {
+    assertAgentBackupRestoreV3OperationControl(
+      boundedControl,
+      "Restore-v3 seal authorization recovery",
+    );
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`);
     await applyAgentBackupRestoreV3TransactionDeadline(
       tx,
-      recoveryControl(control, cause),
+      boundedControl,
       "Restore-v3 seal authorization recovery",
     );
     const [row] = await tx
@@ -279,6 +311,11 @@ async function readExactAuthorization(
       .from(agentBackupRestoreV3CandidateSealAuthorizations)
       .where(eq(agentBackupRestoreV3CandidateSealAuthorizations.id, bound.authorizationId))
       .limit(1);
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 seal authorization recovery",
+    );
     if (!row) return null;
     if (
       !exactAuthorizationRowMatches(row, {
@@ -294,12 +331,103 @@ async function readExactAuthorization(
     ) {
       throw conflict("Restore-v3 seal authorization replay is divergent", cause);
     }
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 seal authorization recovery",
+    );
     const databaseNow = await readPostLockDatabaseNow(tx);
     if (asDate(row.expires_at, "seal authorization expiry").getTime() <= databaseNow.getTime()) {
       throw conflict("Restore-v3 seal authorization replay is expired", cause);
     }
+    if (bound.proofZeroized || Date.now() >= bound.proofDestroyAtEpochMs) {
+      zeroizeBoundProof(bound);
+      throw conflict("Restore-v3 seal proof material expired during replay", cause);
+    }
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 seal authorization recovery",
+    );
     return authorizationFromBound(bound, request, proofToken);
   });
+  if (
+    authorization &&
+    (bound.proofZeroized ||
+      Date.now() >= expiresAtEpochMs ||
+      Date.now() >= bound.proofDestroyAtEpochMs)
+  ) {
+    zeroizeBoundProof(bound);
+    throw conflict("Restore-v3 seal proof material expired before replay response", cause);
+  }
+  return authorization;
+}
+
+async function readExactAuthorization(
+  bound: BoundSealAuthorization,
+  request: Readonly<AgentBackupRestoreV3CandidateSealAuthorizationRequest>,
+  proofToken: string,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  cause: unknown,
+): Promise<Readonly<AgentBackupRestoreV3CandidateSealAuthorization> | null> {
+  return readExactAuthorizationSnapshot(
+    bound,
+    request,
+    proofToken,
+    recoveryControl(control, cause),
+    cause,
+  );
+}
+
+async function waitForExactAuthorization(
+  bound: BoundSealAuthorization,
+  request: Readonly<AgentBackupRestoreV3CandidateSealAuthorizationRequest>,
+  proofToken: string,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  cause: unknown,
+): Promise<Readonly<AgentBackupRestoreV3CandidateSealAuthorization> | null> {
+  if (bound.expiresAtEpochMs === undefined) return null;
+  const freshControl = recoveryControl(control, cause, true);
+  const boundedControl = Object.freeze({
+    signal: freshControl.signal,
+    deadlineEpochMs: Math.min(
+      freshControl.deadlineEpochMs,
+      bound.expiresAtEpochMs,
+      bound.proofDestroyAtEpochMs,
+    ),
+  });
+  while (Date.now() < boundedControl.deadlineEpochMs) {
+    try {
+      const exact = await readExactAuthorizationSnapshot(
+        bound,
+        request,
+        proofToken,
+        boundedControl,
+        cause,
+      );
+      if (exact) return exact;
+    } catch (replayCause) {
+      if (replayCause instanceof AgentBackupRestoreV3CandidateSealConflictError) {
+        throw replayCause;
+      }
+      const sqlState = agentBackupRestoreV3DatabaseSqlState(replayCause);
+      if (
+        Date.now() >= boundedControl.deadlineEpochMs ||
+        (replayCause instanceof DOMException && replayCause.name === "AbortError") ||
+        sqlState === "55P03" ||
+        sqlState === "57014"
+      ) {
+        return null;
+      }
+      if (!isCandidateSealCommitAmbiguous(replayCause)) throw replayCause;
+    }
+    const remainingMs = boundedControl.deadlineEpochMs - Date.now();
+    if (remainingMs <= 0) return null;
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(AMBIGUOUS_COMMIT_RECOVERY_POLL_MS, remainingMs));
+    });
+  }
+  return null;
 }
 
 class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateSealAuthority {
@@ -309,7 +437,8 @@ class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateS
     requestInput: AgentBackupRestoreV3CandidateSealAuthorizationRequest,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<Readonly<AgentBackupRestoreV3CandidateSealAuthorization>> {
-    assertAgentBackupRestoreV3OperationControl(control, "Restore-v3 seal authorization");
+    const operationControl = snapshotAgentBackupRestoreV3OperationControl(control);
+    assertAgentBackupRestoreV3OperationControl(operationControl, "Restore-v3 seal authorization");
     const request = parseAgentBackupRestoreV3CandidateSealAuthorizationRequest(requestInput);
     const requestCanonical =
       canonicalizeAgentBackupRestoreV3CandidateSealAuthorizationRequest(request);
@@ -346,7 +475,7 @@ class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateS
     // random bytes (never a bearer string) until the bounded expiry.
     const proofBytes = Buffer.from(bound.proofBytes);
     const proofToken = proofBytes.toString("base64url");
-    return this.#authorize(bound, request, proofToken, control).finally(() => {
+    return this.#authorize(bound, request, proofToken, operationControl).finally(() => {
       proofBytes.fill(0);
     });
   }
@@ -357,11 +486,15 @@ class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateS
     proofToken: string,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<Readonly<AgentBackupRestoreV3CandidateSealAuthorization>> {
+    const authorizationControl = Object.freeze({
+      signal: control.signal,
+      deadlineEpochMs: Math.min(control.deadlineEpochMs, bound.proofDestroyAtEpochMs),
+    });
     try {
-      return await dbWrite.transaction(async (tx) => {
+      const authorization = await dbWrite.transaction(async (tx) => {
         await applyAgentBackupRestoreV3TransactionDeadline(
           tx,
-          control,
+          authorizationControl,
           "Restore-v3 seal authorization",
         );
         // Non-locking discovery only. The INSERT trigger is the sole owner of
@@ -386,19 +519,30 @@ class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateS
         ) {
           throw conflict("Restore-v3 seal authorization lacks its exact active candidate");
         }
+        await applyAgentBackupRestoreV3TransactionDeadline(
+          tx,
+          authorizationControl,
+          "Restore-v3 seal authorization",
+        );
         const databaseNow = await readPostLockDatabaseNow(tx);
         bound.expiresAtEpochMs ??= Math.min(
           request.authority.leaseExpiresAtEpochMs,
-          control.deadlineEpochMs,
+          authorizationControl.deadlineEpochMs,
           databaseNow.getTime() + AUTHORIZATION_TTL_MS,
+          bound.proofDestroyAtEpochMs,
         );
         scheduleBoundProofZeroization(bound, bound.expiresAtEpochMs);
         if (
           bound.expiresAtEpochMs <= databaseNow.getTime() ||
-          bound.expiresAtEpochMs > control.deadlineEpochMs
+          bound.expiresAtEpochMs > authorizationControl.deadlineEpochMs
         ) {
           throw conflict("Restore-v3 seal authorization has no live bounded interval");
         }
+        await applyAgentBackupRestoreV3TransactionDeadline(
+          tx,
+          authorizationControl,
+          "Restore-v3 seal authorization",
+        );
         await tx.insert(agentBackupRestoreV3CandidateSealAuthorizations).values({
           id: bound.authorizationId,
           candidate_id: candidate.id,
@@ -418,16 +562,35 @@ class CandidateSealAuthorityRepository implements AgentBackupRestoreV3CandidateS
           proof_token_sha256: bound.proofTokenSha256,
           expires_at: new Date(bound.expiresAtEpochMs),
         });
-        assertAgentBackupRestoreV3OperationControl(control, "Restore-v3 seal authorization");
+        await applyAgentBackupRestoreV3TransactionDeadline(
+          tx,
+          authorizationControl,
+          "Restore-v3 seal authorization",
+        );
+        if (bound.proofZeroized) {
+          throw conflict("Restore-v3 seal proof material expired during authorization");
+        }
         return authorizationFromBound(bound, request, proofToken);
       });
+      if (
+        bound.proofZeroized ||
+        bound.expiresAtEpochMs === undefined ||
+        Date.now() >= bound.expiresAtEpochMs ||
+        Date.now() >= bound.proofDestroyAtEpochMs
+      ) {
+        zeroizeBoundProof(bound);
+        throw conflict("Restore-v3 seal proof material expired before authorization response");
+      }
+      return authorization;
     } catch (cause) {
       throwIfAgentBackupRestoreV3DatabaseDeadline(cause, "Restore-v3 seal authorization");
       const sqlState = agentBackupRestoreV3DatabaseSqlState(cause);
-      if (sqlState !== "23505" && !isAgentBackupRestoreV3AmbiguousCommitResponse(cause)) {
+      if (sqlState !== "23505" && !isCandidateSealCommitAmbiguous(cause)) {
         throw cause;
       }
-      const exact = await readExactAuthorization(bound, request, proofToken, control, cause);
+      const exact = isCandidateSealCommitAmbiguous(cause)
+        ? await waitForExactAuthorization(bound, request, proofToken, control, cause)
+        : await readExactAuthorization(bound, request, proofToken, control, cause);
       if (exact) return exact;
       throw cause;
     }
@@ -543,15 +706,15 @@ function exactTerminalMatches(
   );
 }
 
-async function readExactSealedReceipt(
+async function readExactSealedReceiptSnapshot(
   prepared: PreparedSeal,
-  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  boundedControl: Readonly<AgentBackupRestoreV3OperationControl>,
   cause: unknown,
 ): Promise<AgentBackupRestoreV3CandidateReceipt | null> {
-  const boundedControl = recoveryControl(control, cause);
   return dbWrite.transaction(async (tx) => {
     // One immutable snapshot prevents a concurrent terminal transition from
     // being observed as a mixture. Every statement below is read-only PRIMARY.
+    assertAgentBackupRestoreV3OperationControl(boundedControl, "Restore-v3 candidate seal replay");
     await tx.execute(sql`SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY`);
     await applyAgentBackupRestoreV3TransactionDeadline(
       tx,
@@ -563,6 +726,11 @@ async function readExactSealedReceipt(
       .from(agentBackupRestoreV3Candidates)
       .where(eq(agentBackupRestoreV3Candidates.id, prepared.session.stagingHandle))
       .limit(1);
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 candidate seal replay",
+    );
     const [authorization] = await tx
       .select()
       .from(agentBackupRestoreV3CandidateSealAuthorizations)
@@ -573,6 +741,11 @@ async function readExactSealedReceipt(
         ),
       )
       .limit(1);
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 candidate seal replay",
+    );
     const [terminal] = await tx
       .select()
       .from(agentBackupRestoreV3CandidateTerminalCommands)
@@ -583,6 +756,11 @@ async function readExactSealedReceipt(
         ),
       )
       .limit(1);
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 candidate seal replay",
+    );
     if (!terminal) return null;
     if (
       !candidate ||
@@ -623,8 +801,70 @@ async function readExactSealedReceipt(
     ) {
       throw conflict("Restore-v3 sealed response replay changed canonical bytes", cause);
     }
+    await applyAgentBackupRestoreV3TransactionDeadline(
+      tx,
+      boundedControl,
+      "Restore-v3 candidate seal replay",
+    );
     return durableReceipt;
   });
+}
+
+async function readExactSealedReceipt(
+  prepared: PreparedSeal,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  cause: unknown,
+  forceFreshControl = false,
+): Promise<AgentBackupRestoreV3CandidateReceipt | null> {
+  return readExactSealedReceiptSnapshot(
+    prepared,
+    recoveryControl(control, cause, forceFreshControl),
+    cause,
+  );
+}
+
+async function waitForExactSealedReceipt(
+  prepared: PreparedSeal,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  cause: unknown,
+): Promise<AgentBackupRestoreV3CandidateReceipt | null> {
+  const boundedControl = recoveryControl(control, cause, true);
+  while (Date.now() < boundedControl.deadlineEpochMs) {
+    try {
+      const exact = await readExactSealedReceiptSnapshot(prepared, boundedControl, cause);
+      if (exact) return exact;
+    } catch (replayCause) {
+      if (replayCause instanceof AgentBackupRestoreV3CandidateSealConflictError) {
+        throw replayCause;
+      }
+      const sqlState = agentBackupRestoreV3DatabaseSqlState(replayCause);
+      if (
+        Date.now() >= boundedControl.deadlineEpochMs ||
+        (replayCause instanceof DOMException && replayCause.name === "AbortError") ||
+        sqlState === "55P03" ||
+        sqlState === "57014"
+      ) {
+        return null;
+      }
+      if (!isCandidateSealCommitAmbiguous(replayCause)) throw replayCause;
+    }
+    const remainingMs = boundedControl.deadlineEpochMs - Date.now();
+    if (remainingMs <= 0) return null;
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, Math.min(AMBIGUOUS_COMMIT_RECOVERY_POLL_MS, remainingMs));
+    });
+  }
+  return null;
+}
+
+async function replayExactSealedReceiptOrThrow(
+  prepared: PreparedSeal,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  cause: unknown,
+): Promise<AgentBackupRestoreV3CandidateReceipt> {
+  const exact = await waitForExactSealedReceipt(prepared, control, cause);
+  if (exact) return exact;
+  throw cause;
 }
 
 /**
@@ -637,9 +877,17 @@ export function sealAgentBackupRestoreV3Candidate(
   authorizationInput: Readonly<AgentBackupRestoreV3CandidateSealAuthorization>,
   control: Readonly<AgentBackupRestoreV3OperationControl>,
 ): Promise<AgentBackupRestoreV3CandidateReceipt> {
-  assertAgentBackupRestoreV3OperationControl(control, "Restore-v3 candidate seal");
+  const operationControl = snapshotAgentBackupRestoreV3OperationControl(control);
   const prepared = prepareSeal(sessionInput, receiptInput, authorizationInput);
-  return sealPreparedCandidate(prepared, control);
+  try {
+    assertAgentBackupRestoreV3OperationControl(operationControl, "Restore-v3 candidate seal");
+  } catch (cause) {
+    // An inactive but otherwise valid control may only reconcile an already-
+    // committed exact seal. It never enters the mutating transaction below.
+    if (!isValidInactiveControl(operationControl)) throw cause;
+    return replayExactSealedReceiptOrThrow(prepared, operationControl, cause);
+  }
+  return sealPreparedCandidate(prepared, operationControl);
 }
 
 async function sealPreparedCandidate(
@@ -656,6 +904,7 @@ async function sealPreparedCandidate(
         .from(agentBackupRestoreV3Candidates)
         .where(eq(agentBackupRestoreV3Candidates.id, prepared.session.stagingHandle))
         .limit(1);
+      await applyAgentBackupRestoreV3TransactionDeadline(tx, control, "Restore-v3 candidate seal");
       const [authorization] = await tx
         .select()
         .from(agentBackupRestoreV3CandidateSealAuthorizations)
@@ -686,10 +935,12 @@ async function sealPreparedCandidate(
       ) {
         throw conflict("Restore-v3 seal lacks its exact active candidate authorization");
       }
+      await applyAgentBackupRestoreV3TransactionDeadline(tx, control, "Restore-v3 candidate seal");
       const databaseNow = await readPostLockDatabaseNow(tx);
       if (databaseNow.getTime() >= prepared.authorization.expiresAtEpochMs) {
         throw conflict("Restore-v3 seal authorization is expired");
       }
+      await applyAgentBackupRestoreV3TransactionDeadline(tx, control, "Restore-v3 candidate seal");
       await tx.insert(agentBackupRestoreV3CandidateTerminalCommands).values({
         id: prepared.terminalCommandId,
         candidate_id: prepared.session.stagingHandle,
@@ -706,13 +957,18 @@ async function sealPreparedCandidate(
         sealed_receipt_sha256: prepared.receiptSha256,
         command_sha256: prepared.terminalCommandSha256,
       });
-      assertAgentBackupRestoreV3OperationControl(control, "Restore-v3 candidate seal");
+      await applyAgentBackupRestoreV3TransactionDeadline(tx, control, "Restore-v3 candidate seal");
     });
     return prepared.receipt;
   } catch (cause) {
-    throwIfAgentBackupRestoreV3DatabaseDeadline(cause, "Restore-v3 candidate seal");
-    const exact = await readExactSealedReceipt(prepared, control, cause);
+    // A timeout/cancellation can race the COMMIT acknowledgement. Reconcile
+    // once from PRIMARY under a fresh read-only budget before classifying the
+    // original failure; absence still preserves the original fail-closed error.
+    const exact = isCandidateSealCommitAmbiguous(cause)
+      ? await waitForExactSealedReceipt(prepared, control, cause)
+      : await readExactSealedReceipt(prepared, control, cause, true);
     if (exact) return exact;
+    throwIfAgentBackupRestoreV3DatabaseDeadline(cause, "Restore-v3 candidate seal");
     throw cause;
   }
 }
