@@ -1,6 +1,6 @@
 /** Immutable payload ownership journals, replay, and streaming writer. */
 
-import { createHash, type Hash } from "node:crypto";
+import { type BinaryLike, createHash, Hash } from "node:crypto";
 import { constants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import { types as utilTypes } from "node:util";
@@ -45,7 +45,6 @@ const MAX_UINT64 = 18_446_744_073_709_551_615n;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UINT64_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 const PAYLOAD_OWNER_TOKEN_MINIMUM_BYTES = 32;
-const EMPTY_PAYLOAD_SHA256 = createHash("sha256").digest("hex");
 const OBJECT_FREEZE = Object.freeze;
 const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
 const OBJECT_IS = Object.is;
@@ -68,12 +67,47 @@ const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
   "byteLength",
 )?.get;
 const REFLECT_APPLY = Reflect.apply;
+const CREATE_HASH = createHash;
+const HASH_UPDATE = Hash.prototype.update as (
+  data: BinaryLike,
+  inputEncoding?: BufferEncoding,
+) => Hash;
+const HASH_DIGEST_HEX = Hash.prototype.digest as (encoding: "hex") => string;
+const HASH_COPY = Hash.prototype.copy as () => Hash;
 const INTRINSIC_UINT8_ARRAY = Uint8Array;
 const UINT8_ARRAY_SET = Uint8Array.prototype.set;
 const UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
 const IS_PROXY = utilTypes.isProxy;
 const IS_UINT8_ARRAY = utilTypes.isUint8Array;
 const STRING_SLICE = String.prototype.slice;
+const EMPTY_PAYLOAD_SHA256 = hashDigestHex(createSha256Hash());
+
+function createSha256Hash(): Hash {
+  return CREATE_HASH("sha256");
+}
+
+function updateHash(
+  hash: Hash,
+  data: BinaryLike,
+  inputEncoding?: BufferEncoding,
+): Hash {
+  if (inputEncoding === undefined) {
+    return REFLECT_APPLY(HASH_UPDATE, hash, [data]);
+  }
+  return REFLECT_APPLY(HASH_UPDATE, hash, [data, inputEncoding]);
+}
+
+function hashDigestHex(hash: Hash): string {
+  return REFLECT_APPLY(HASH_DIGEST_HEX, hash, ["hex"]);
+}
+
+function copyHash(hash: Hash): Hash {
+  return REFLECT_APPLY(HASH_COPY, hash, []);
+}
+
+function sha256Hex(data: BinaryLike, inputEncoding?: BufferEncoding): string {
+  return hashDigestHex(updateHash(createSha256Hash(), data, inputEncoding));
+}
 
 function sortedObjectKeys(value: object): string[] {
   return REFLECT_APPLY(ARRAY_SORT, OBJECT_KEYS(value), []);
@@ -297,9 +331,7 @@ function ownerTokenSha256(value: Uint8Array): string {
     );
   }
   try {
-    return createHash("sha256")
-      .update(candidateFsNativeIoView(owned))
-      .digest("hex");
+    return sha256Hex(candidateFsNativeIoView(owned));
   } finally {
     zeroBytes(owned);
   }
@@ -311,7 +343,7 @@ function payloadJournalNames(name: string): {
   readonly receipt: string;
   readonly checkpoints: readonly [string, string];
 } {
-  const derivation = createHash("sha256").update(name, "utf8").digest("hex");
+  const derivation = sha256Hex(name, "utf8");
   const prefix = `.payload-${stringSlice(derivation, 0, 32)}`;
   return OBJECT_FREEZE({
     owner: `${prefix}.owner.json`,
@@ -649,7 +681,7 @@ async function hashAndValidatePayloadPrefix(
       "Candidate payload is shorter than its durable checkpoint",
     );
   }
-  const hash = createHash("sha256");
+  const hash = createSha256Hash();
   const chunk = new INTRINSIC_UINT8_ARRAY(
     Math.min(
       CANDIDATE_FS_IO_CHUNK_BYTES,
@@ -668,7 +700,7 @@ async function hashAndValidatePayloadPrefix(
       const checkpoint = checkpoints[
         checkpointIndex
       ] as PayloadCheckpointJournal;
-      if (hash.copy().digest("hex") !== checkpoint.prefixSha256) {
+      if (hashDigestHex(copyHash(hash)) !== checkpoint.prefixSha256) {
         candidateFsError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
           "Candidate payload prefix differs from its durable checkpoint",
@@ -698,7 +730,7 @@ async function hashAndValidatePayloadPrefix(
           "Candidate payload ended before its durable checkpoint",
         );
       }
-      hash.update(candidateFsByteView(chunk, 0, read.bytesRead));
+      updateHash(hash, candidateFsByteView(chunk, 0, read.bytesRead));
       zeroBytes(chunk, 0, read.bytesRead);
       position += read.bytesRead;
       validateReachedCheckpoints();
@@ -841,7 +873,7 @@ async function proveOpenedPayload(
       "Candidate payload exceeds its explicit byte bound",
     );
   }
-  const hash = createHash("sha256");
+  const hash = createSha256Hash();
   const chunk = new INTRINSIC_UINT8_ARRAY(
     Math.min(CANDIDATE_FS_IO_CHUNK_BYTES, Math.max(1, before.size)),
   );
@@ -863,7 +895,7 @@ async function proveOpenedPayload(
           "Candidate payload ended before its bound descriptor size",
         );
       }
-      hash.update(candidateFsByteView(chunk, 0, read.bytesRead));
+      updateHash(hash, candidateFsByteView(chunk, 0, read.bytesRead));
       zeroBytes(chunk, 0, read.bytesRead);
       position += read.bytesRead;
     }
@@ -885,7 +917,7 @@ async function proveOpenedPayload(
   return OBJECT_FREEZE({
     ...candidateFsIdentity(after),
     sizeBytes: after.size,
-    sha256: hash.digest("hex"),
+    sha256: hashDigestHex(hash),
   });
 }
 
@@ -1125,14 +1157,14 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
         // overwritten value with uncertain provenance.
         await this.#owner.syncAttemptRoot(exactControl);
 
-        nextHash = (this.#prefixHash as Hash).copy();
-        nextHash.update(owned);
+        nextHash = copyHash(this.#prefixHash as Hash);
+        updateHash(nextHash, owned);
         const nextAcknowledgedBytes = durablePosition + byteLength;
         const nextCheckpoint = payloadCheckpoint(
           this.#identityJournal as PayloadIdentityJournal,
           nextGeneration,
           nextAcknowledgedBytes,
-          nextHash.copy().digest("hex"),
+          hashDigestHex(copyHash(nextHash)),
         );
         writeStarted = true;
         await writeAll(
@@ -1310,6 +1342,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
     releaseLockUse: () => void,
   ): Promise<Readonly<AgentBackupRestoreV3CandidatePayloadReceipt>> {
     let primaryFailure: unknown;
+    let primaryFailed = false;
     let result: Readonly<AgentBackupRestoreV3CandidatePayloadReceipt> | null =
       null;
     try {
@@ -1349,7 +1382,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
         const receipt = OBJECT_FREEZE({
           ...candidateFsIdentity(before),
           sizeBytes: before.size,
-          sha256: this.#prefixHash.copy().digest("hex"),
+          sha256: hashDigestHex(copyHash(this.#prefixHash)),
         });
         if (receipt.sha256 !== this.#currentCheckpoint.prefixSha256) {
           candidateFsError(
@@ -1381,13 +1414,14 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
         result = receipt;
       }
     } catch (cause) {
+      primaryFailed = true;
       primaryFailure = cause;
     }
     releaseLockUse();
     try {
       await this.#disposeResources();
     } catch (cleanupCause) {
-      if (primaryFailure !== undefined) {
+      if (primaryFailed) {
         throw new AgentBackupRestoreV3CandidateFsError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_WRITER_CLEANUP_FAILED",
           "Candidate payload finalization and resource cleanup both failed",
@@ -1396,7 +1430,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
       }
       throw cleanupCause;
     }
-    if (primaryFailure !== undefined) throw primaryFailure;
+    if (primaryFailed) throw primaryFailure;
     if (!result) {
       candidateFsError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_WRITER_STATE_INVALID",
@@ -1433,12 +1467,14 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
 
   async #disposeResources(): Promise<void> {
     let firstFailure: unknown;
+    let firstFailed = false;
     const handle = this.#handle;
     this.#handle = null;
     if (handle) {
       try {
         await boundedInternalCleanup(() => handle.close());
       } catch (cause) {
+        firstFailed = true;
         firstFailure = cause;
       }
     }
@@ -1448,13 +1484,13 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
       try {
         await lock.release(internalCleanupControl());
       } catch (cause) {
-        if (firstFailure !== undefined) {
+        if (firstFailed) {
           throw new AggregateError([firstFailure, cause]);
         }
         throw cause;
       }
     }
-    if (firstFailure !== undefined) throw firstFailure;
+    if (firstFailed) throw firstFailure;
   }
 }
 
@@ -1858,11 +1894,7 @@ export async function proveCandidateFsPayload(
   }
   await authority.assertAuthority(control);
   const operationLock = await authority.operationLock(
-    `.prove-${stringSlice(
-      createHash("sha256").update(name).digest("hex"),
-      0,
-      16,
-    )}`,
+    `.prove-${stringSlice(sha256Hex(name), 0, 16)}`,
     control,
     heldLock,
   );
@@ -1935,7 +1967,7 @@ export async function readCandidateFsPayload(
   }
   const expected = parsePayloadReceipt(expectedValue, maximumBytes);
   const exactName = requireControlName(name, "payload name");
-  const ownerJournal: PayloadOwnerJournal = Object.freeze({
+  const ownerJournal: PayloadOwnerJournal = OBJECT_FREEZE({
     version: 1,
     name: exactName,
     ownerTokenSha256: ownerTokenSha256(readOptions.ownerToken as Uint8Array),
@@ -1945,10 +1977,7 @@ export async function readCandidateFsPayload(
   const payloadPath = authority.directPath(exactName, "payload name");
   await authority.assertAuthority(control);
   const operationLock = await authority.operationLock(
-    `.read-payload-${createHash("sha256")
-      .update(exactName)
-      .digest("hex")
-      .slice(0, 16)}`,
+    `.read-payload-${stringSlice(sha256Hex(exactName), 0, 16)}`,
     control,
     heldLock,
   );
@@ -1964,6 +1993,7 @@ export async function readCandidateFsPayload(
   let payload: Uint8Array | null = null;
   let result: Readonly<AgentBackupRestoreV3CandidatePayloadRead> | null = null;
   let primaryFailure: unknown;
+  let primaryFailed = false;
   try {
     releaseLockUse = authority.beginLockUse(activeLock);
     await authority.assertLockHeld(activeLock, control);
@@ -2059,7 +2089,7 @@ export async function readCandidateFsPayload(
     const exactPayloadByteLength = typedArrayByteLength(exactPayload);
     payload = exactPayload;
     let offset = 0;
-    const hash = createHash("sha256");
+    const hash = createSha256Hash();
     while (offset < exactPayloadByteLength) {
       const read = await controlled(
         () =>
@@ -2077,7 +2107,8 @@ export async function readCandidateFsPayload(
           "Candidate payload ended before its exact receipt size",
         );
       }
-      hash.update(
+      updateHash(
+        hash,
         candidateFsByteView(exactPayload, offset, offset + read.bytesRead),
       );
       offset += read.bytesRead;
@@ -2090,7 +2121,7 @@ export async function readCandidateFsPayload(
     );
     if (
       !sameStableFile(before, after) ||
-      hash.digest("hex") !== expected.sha256
+      hashDigestHex(hash) !== expected.sha256
     ) {
       candidateFsError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
@@ -2100,6 +2131,7 @@ export async function readCandidateFsPayload(
     await authority.assertLockHeld(activeLock, control);
     result = OBJECT_FREEZE({ receipt: expected, payload: exactPayload });
   } catch (cause) {
+    primaryFailed = true;
     primaryFailure = cause;
   }
 
@@ -2127,9 +2159,9 @@ export async function readCandidateFsPayload(
       cleanupFailures.push(cause);
     }
   }
-  if (primaryFailure !== undefined || cleanupFailures.length > 0 || !result) {
+  if (primaryFailed || cleanupFailures.length > 0 || !result) {
     if (payload) zeroBytes(payload);
-    if (primaryFailure !== undefined && cleanupFailures.length > 0) {
+    if (primaryFailed && cleanupFailures.length > 0) {
       throw new AgentBackupRestoreV3CandidateFsError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_READ_FAILED",
         "Candidate payload read and bounded cleanup both failed",
@@ -2139,7 +2171,7 @@ export async function readCandidateFsPayload(
         },
       );
     }
-    if (primaryFailure !== undefined) throw primaryFailure;
+    if (primaryFailed) throw primaryFailure;
     if (cleanupFailures.length === 1) throw cleanupFailures[0];
     if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures);
     candidateFsError(
