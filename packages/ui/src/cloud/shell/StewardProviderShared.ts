@@ -4,6 +4,7 @@
  */
 import {
   clearStoredStewardToken,
+  clearStoredStewardTokenIfCurrent,
   readStoredStewardToken,
   STEWARD_REFRESH_ENDPOINT,
   STEWARD_SESSION_ENDPOINT,
@@ -19,7 +20,10 @@ import { scrubPersistedActiveServerToken } from "../../state/persistence";
 import { clearSharedCloudAccountBinding } from "../../state/shared-cloud-account-binding";
 import { clearElizaApiToken } from "../../utils/eliza-globals";
 import { decodeJwtPayload } from "../lib/jwt";
-import { invalidateStewardServerCookieSyncMarker } from "../lib/steward-session-cookie-sync-marker";
+import {
+  invalidateStewardServerCookieSyncMarker,
+  invalidateStewardServerCookieSyncMarkerIfOwned,
+} from "../lib/steward-session-cookie-sync-marker";
 import { ELIZA_CLOUD_DIRECT_API_BY_HOST } from "./steward-url";
 
 export function isPlaceholderValue(value: string | undefined): boolean {
@@ -115,12 +119,27 @@ export function configuredRefreshEndpoint(): string {
 
 function stewardSessionClearUrls(): string[] {
   if (typeof window === "undefined") return [configuredSessionEndpoint()];
-  const urls = new Set([STEWARD_SESSION_ENDPOINT, configuredSessionEndpoint()]);
+  const candidates = [STEWARD_SESSION_ENDPOINT, configuredSessionEndpoint()];
   const direct = directStewardSessionEndpoint();
   if (direct) {
-    urls.add(direct);
+    candidates.push(direct);
   }
-  return [...urls];
+  const seen = new Set<string>();
+  return candidates.filter((url) => {
+    // Relative and absolute forms can name the exact same same-origin route
+    // (for example `/api/...` and `https://eliza.app/api/...`). One transient
+    // duplicate failure must not negate an already-acknowledged deletion.
+    let identity = url;
+    try {
+      identity = new URL(url, window.location.origin).href;
+    } catch {
+      // error-policy:J4 retain an unparseable configured target as its own
+      // request; the DELETE will fail closed through the normal fetch result.
+    }
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 const STEWARD_SESSION_COOKIE_CLEAR_TIMEOUT_MS = 10_000;
@@ -130,10 +149,14 @@ export interface StewardSessionCookieClearOptions {
   timeoutMs?: number;
 }
 
+export type StewardSessionCookieClearResult = { ok: true } | { ok: false };
+
 export interface StaleStewardSessionClearOptions
   extends StewardSessionCookieClearOptions {
   /** Preserve legacy fire-and-forget cleanup unless a custody lock owns it. */
   awaitCookieClear?: boolean;
+  /** Ignore a delayed response once a newer canonical bearer owns the app. */
+  expectedToken?: string;
 }
 
 function clearServerStewardSessionCookie(
@@ -142,23 +165,24 @@ function clearServerStewardSessionCookie(
     signal,
     timeoutMs = STEWARD_SESSION_COOKIE_CLEAR_TIMEOUT_MS,
   }: StewardSessionCookieClearOptions,
-): Promise<void> {
+): Promise<boolean> {
   const abortController = new AbortController();
   const forwardAbort = (): void => abortController.abort();
   signal?.addEventListener("abort", forwardAbort, { once: true });
 
-  return new Promise<void>((resolve) => {
+  return new Promise<boolean>((resolve) => {
     let settled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-    const finish = (): void => {
+    const finish = (acknowledged: boolean): void => {
       if (settled) return;
       settled = true;
       if (timeout !== undefined) globalThis.clearTimeout(timeout);
-      abortController.signal.removeEventListener("abort", finish);
+      abortController.signal.removeEventListener("abort", fail);
       signal?.removeEventListener("abort", forwardAbort);
-      resolve();
+      resolve(acknowledged);
     };
-    abortController.signal.addEventListener("abort", finish, { once: true });
+    const fail = (): void => finish(false);
+    abortController.signal.addEventListener("abort", fail, { once: true });
     timeout = globalThis.setTimeout(() => abortController.abort(), timeoutMs);
     if (signal?.aborted) {
       abortController.abort();
@@ -171,30 +195,56 @@ function clearServerStewardSessionCookie(
         credentials: "include",
         headers: { "Content-Type": "application/json" },
         signal: abortController.signal,
-      }).then(finish, finish);
+      }).then((response) => {
+        if (!response.ok) {
+          finish(false);
+          return;
+        }
+        try {
+          void response.json().then((body: unknown) => {
+            if (!body || typeof body !== "object" || Array.isArray(body)) {
+              finish(false);
+              return;
+            }
+            const keys = Object.keys(body);
+            finish(
+              keys.length === 1 &&
+                keys[0] === "ok" &&
+                (body as { ok?: unknown }).ok === true,
+            );
+          }, fail);
+        } catch {
+          // error-policy:J3 a synchronously throwing/injected body parser
+          // cannot prove that the cookie deletion completed.
+          fail();
+        }
+      }, fail);
     } catch {
-      // error-policy:J6 an injected fetch may throw synchronously during
-      // best-effort teardown; settle this bounded cookie-clear attempt.
-      finish();
+      // error-policy:J3 an injected fetch may throw synchronously. This is an
+      // explicit unconfirmed teardown result, never fabricated success.
+      fail();
     }
   });
 }
 
 export async function clearServerStewardSessionCookies(
   options: StewardSessionCookieClearOptions = {},
-): Promise<void> {
+): Promise<StewardSessionCookieClearResult> {
   // Invalidate before issuing any best-effort DELETE: a rejected request must
   // never leave a proof that can suppress a later session-establishing POST.
   invalidateStewardServerCookieSyncMarker();
-  // error-policy:J6 best-effort sign-out cookie clear across session hosts;
-  // every attempt settles on success, rejection, cancellation, or its bounded
-  // deadline. Awaiting this promise under the cross-tab custody lock prevents
-  // a late DELETE response from racing a newer session-establishing POST.
-  await Promise.all(
+  // Every attempt settles on an acknowledged exact `{ ok: true }` response or
+  // an explicit unconfirmed result (non-2xx, malformed body, transport error,
+  // cancellation, or deadline). Awaiting this promise under the cross-tab
+  // custody lock prevents a late DELETE response from racing a newer
+  // session-establishing POST while still letting legacy fire-and-forget
+  // callers ignore a resolved result without creating unhandled rejections.
+  const acknowledgements = await Promise.all(
     stewardSessionClearUrls().map((url) =>
       clearServerStewardSessionCookie(url, options),
     ),
   );
+  return acknowledgements.every(Boolean) ? { ok: true } : { ok: false };
 }
 
 export function readStoredToken(): string | null {
@@ -228,15 +278,30 @@ export function tokenSecsRemaining(token: string): number | null {
 
 export async function clearStaleStewardSession(
   options: StaleStewardSessionClearOptions = {},
-): Promise<void> {
-  if (typeof window === "undefined") return;
+): Promise<boolean> {
+  if (typeof window === "undefined") return false;
   // This is deliberately before protected-storage removal. That operation can
   // reject and abort the rest of teardown, but an attempted session clear must
   // still retire any unconsumed proof from the previous authority epoch.
-  invalidateStewardServerCookieSyncMarker();
+  if (options.expectedToken === undefined) {
+    invalidateStewardServerCookieSyncMarker();
+  } else {
+    invalidateStewardServerCookieSyncMarkerIfOwned(options.expectedToken);
+  }
   let storedTokenClearError: unknown;
   try {
-    await clearStoredStewardToken();
+    if (options.expectedToken !== undefined) {
+      const cleared = await clearStoredStewardTokenIfCurrent(
+        options.expectedToken,
+      );
+      if (!cleared) return false;
+      // The guarded removal and a newer login are serialized. If that newer
+      // login already published before this continuation runs, preserve all of
+      // its mirrors instead of applying A's delayed destructive cleanup to B.
+      if (readStoredStewardToken() !== null) return false;
+    } else {
+      await clearStoredStewardToken();
+    }
   } catch (error) {
     if (error instanceof StewardTokenRemovalError) throw error;
     // error-policy:J2 canonical invalidation may already have succeeded before
@@ -272,11 +337,18 @@ export async function clearStaleStewardSession(
   }
   scrubPersistedAgentProfileTokens();
   const cookieClear = clearServerStewardSessionCookies(options);
-  if (options.awaitCookieClear) await cookieClear;
+  let cookieClearError: Error | undefined;
+  if (options.awaitCookieClear && !(await cookieClear).ok) {
+    cookieClearError = new Error(
+      "Eliza Cloud session-cookie cleanup was not acknowledged.",
+    );
+  }
   try {
     window.dispatchEvent(new CustomEvent("steward-token-sync"));
   } catch {
     // error-policy:J6 best-effort sync notification after credentials are scrubbed.
   }
   if (storedTokenClearError !== undefined) throw storedTokenClearError;
+  if (cookieClearError) throw cookieClearError;
+  return true;
 }

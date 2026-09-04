@@ -464,6 +464,25 @@ describe("Workers API-key auth", () => {
     expect(verifyStewardTokenCached).toHaveBeenCalledTimes(1);
   });
 
+  test("an explicit Steward token bypasses a stale bearer and cached user", async () => {
+    stewardTokenBehavior = async () => ({
+      userId: "steward-1",
+      email: "user@example.test",
+      walletAddress: null,
+      walletChain: null,
+    });
+    stewardUserBehavior = async () => activeUser();
+    const c = contextWithHeaders({ authorization: "Bearer stale.bearer.jwt" });
+    c.set("user", activeUser({ id: "stale-user" }));
+
+    await expect(getCurrentUser(c as never, "valid-cookie-token")).resolves.toMatchObject({
+      id: "user-1",
+      steward_id: "steward-1",
+    });
+    expect(verifyStewardTokenCached).toHaveBeenCalledWith(expect.anything(), "valid-cookie-token");
+    expect(c.get("user")).toMatchObject({ id: "user-1" });
+  });
+
   test("accepts a Playwright test session only when the cookie claims match the hydrated org", async () => {
     cookieBehavior = () => "test-session-token";
     playwrightTokenBehavior = () => ({ userId: "user-1", organizationId: "org-1" });

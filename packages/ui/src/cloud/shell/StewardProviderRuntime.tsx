@@ -10,7 +10,10 @@
  * (honoring `exp`) running while a cloud surface is mounted.
  */
 
-import { writeStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  clearStoredStewardTokenIfCurrent,
+  writeStoredStewardTokenIfCurrent,
+} from "@elizaos/shared/steward-session-client";
 import { StewardProvider, useAuth as useStewardAuth } from "@stwd/react";
 import { StewardClient } from "@stwd/sdk";
 import {
@@ -19,15 +22,26 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
-import { dispatchStewardSessionChange } from "../../events/steward-session-event";
+import {
+  dispatchStewardSessionChange,
+  STEWARD_SESSION_CHANGE_EVENT,
+} from "../../events/steward-session-event";
 import { scrubPersistedAgentProfileTokens } from "../../state/agent-profiles";
 import { scrubPersistedActiveServerToken } from "../../state/persistence";
 import { reportRendererDiagnostic } from "../../utils/renderer-diagnostics";
+import { decodeJwtPayload } from "../lib/jwt";
 import {
   consumeStewardServerCookieSynced,
   invalidateStewardServerCookieSyncMarker,
 } from "../lib/steward-session-cookie-sync-marker";
+import {
+  isSsoLoggedOut,
+  markSsoLoggedOut,
+  SSO_LOGOUT_STATE_EVENT,
+  type SsoLogoutStateChangeDetail,
+} from "../sso-bridge/sso-bridge";
 import {
   clearServerStewardSessionCookies,
   clearStaleStewardSession,
@@ -43,7 +57,39 @@ import {
 
 const REFRESH_CHECK_INTERVAL_MS = 60_000;
 const REFRESH_AHEAD_SECS = 120;
+const SDK_CANONICAL_TOKEN_GRACE_MS = 10_000;
+const SSO_LOGGED_OUT_STORAGE_KEY = "eliza_sso_logged_out";
+const SSO_LOGOUT_GENERATION_STORAGE_KEY = "eliza_sso_logout_generation";
 type StewardProviderClient = ComponentProps<typeof StewardProvider>["client"];
+
+type LogoutGenerationSnapshot =
+  | { readable: true; value: string | null }
+  | { readable: false };
+
+function readLogoutGenerationSnapshot(): LogoutGenerationSnapshot {
+  try {
+    return {
+      readable: true,
+      value: window.localStorage.getItem(SSO_LOGOUT_GENERATION_STORAGE_KEY),
+    };
+  } catch {
+    // Persistent logout coordination is an authority input. If it cannot be
+    // read, no passive writer may establish or refresh a browser session.
+    return { readable: false };
+  }
+}
+
+function logoutGenerationMatches(snapshot: LogoutGenerationSnapshot): boolean {
+  if (!snapshot.readable) return false;
+  try {
+    return (
+      window.localStorage.getItem(SSO_LOGOUT_GENERATION_STORAGE_KEY) ===
+      snapshot.value
+    );
+  } catch {
+    return false;
+  }
+}
 
 type StewardResponseBody = { code?: string; token?: string };
 
@@ -91,18 +137,108 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
   const { isAuthenticated, user } = auth;
   const lastSyncedToken = useRef<string | null>(null);
   const wasAuthenticated = useRef(false);
+  const [ssoSessionSuppressed, setSsoSessionSuppressed] =
+    useState(isSsoLoggedOut);
+  const ssoSessionSuppressedRef = useRef(ssoSessionSuppressed);
+
+  const updateSsoSessionSuppressed = (suppressed: boolean): void => {
+    ssoSessionSuppressedRef.current = suppressed;
+    setSsoSessionSuppressed(suppressed);
+  };
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentional re-run trigger
   useEffect(() => {
+    let missingCanonicalTokenTimer: ReturnType<typeof setTimeout> | undefined;
+    let sdkSessionRetired = false;
+    const retireSdkSession = () => {
+      if (isAuthenticated && !sdkSessionRetired) {
+        sdkSessionRetired = true;
+        auth.signOut();
+      }
+    };
+    const suppressSdkSession = (): void => {
+      updateSsoSessionSuppressed(true);
+      retireSdkSession();
+    };
+    const authorityWindowIsCurrent = (
+      generation: LogoutGenerationSnapshot,
+    ): boolean =>
+      !ssoSessionSuppressedRef.current &&
+      !isSsoLoggedOut() &&
+      logoutGenerationMatches(generation);
     const syncToken = () => {
+      if (ssoSessionSuppressedRef.current || isSsoLoggedOut()) {
+        suppressSdkSession();
+        return;
+      }
+      const logoutGenerationAtStart = readLogoutGenerationSnapshot();
+      if (!logoutGenerationAtStart.readable) {
+        suppressSdkSession();
+        return;
+      }
       const token = readStoredToken();
       if (!token) {
-        if (wasAuthenticated.current && lastSyncedToken.current) {
+        const sdkSessionOutlivedCanonicalToken =
+          isAuthenticated &&
+          (wasAuthenticated.current || lastSyncedToken.current !== null);
+        if (wasAuthenticated.current || lastSyncedToken.current) {
           lastSyncedToken.current = null;
           wasAuthenticated.current = false;
           clearServerStewardSessionCookies();
         }
+        if (sdkSessionOutlivedCanonicalToken) {
+          // A storage event is how another tab's canonical removal reaches
+          // this runtime. Retire the SDK's in-memory snapshot too; otherwise
+          // provider consumers can remain authenticated with no bearer.
+          retireSdkSession();
+        } else if (
+          isAuthenticated &&
+          missingCanonicalTokenTimer === undefined
+        ) {
+          // A legitimate SDK callback can become authenticated just before the
+          // login flow publishes canonical storage. Bound that window; if no
+          // token appears, retire an orphaned MemoryStorage session instead of
+          // leaving raw SDK consumers authenticated indefinitely.
+          missingCanonicalTokenTimer = globalThis.setTimeout(() => {
+            missingCanonicalTokenTimer = undefined;
+            if (!readStoredToken()) retireSdkSession();
+          }, SDK_CANONICAL_TOKEN_GRACE_MS);
+        }
         return;
+      }
+      if (missingCanonicalTokenTimer !== undefined) {
+        globalThis.clearTimeout(missingCanonicalTokenTimer);
+        missingCanonicalTokenTimer = undefined;
+      }
+      const tokenClaims = decodeJwtPayload(token);
+      const tokenUserId = tokenClaims?.userId ?? tokenClaims?.sub ?? null;
+      // Read the provider snapshot directly. `getToken()` has the surprising
+      // side effect of launching the SDK's own background refresh, which would
+      // create another writer outside this component's CAS/generation fence.
+      const sdkToken = isAuthenticated ? (auth.session?.token ?? null) : null;
+      const sdkTokenClaims = sdkToken ? decodeJwtPayload(sdkToken) : null;
+      const sdkUserId =
+        sdkTokenClaims?.userId ?? sdkTokenClaims?.sub ?? user?.id ?? null;
+      const sdkTenantId =
+        sdkTokenClaims?.tenantId ??
+        sdkTokenClaims?.tenant_id ??
+        user?.tenantId ??
+        null;
+      const canonicalTenantId =
+        tokenClaims?.tenantId ?? tokenClaims?.tenant_id ?? null;
+      const sdkAuthorityMismatch =
+        isAuthenticated &&
+        (!tokenUserId ||
+          !sdkUserId ||
+          sdkUserId !== tokenUserId ||
+          sdkTenantId !== canonicalTenantId);
+      if (sdkAuthorityMismatch) {
+        // Canonical storage has switched accounts but the SDK uses isolated
+        // MemoryStorage. Prefer the SDK token's own claims because its session
+        // can be authenticated while `user` is temporarily absent. Retire A
+        // before syncing B so raw SDK consumers cannot authorize under a
+        // different user/tenant than the cookie/request layer.
+        retireSdkSession();
       }
 
       if (tokenIsExpired(token)) return;
@@ -134,6 +270,15 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
         body: JSON.stringify({ token }),
       })
         .then(async (res) => {
+          // A delayed response belongs only to the exact bearer + logout
+          // generation that issued it. Never let A's response publish state or
+          // destructively clear a newer login B.
+          if (
+            !authorityWindowIsCurrent(logoutGenerationAtStart) ||
+            readStoredToken() !== token
+          ) {
+            return;
+          }
           if (res.ok) {
             dispatchStewardSessionChange("present");
             window.dispatchEvent(
@@ -145,6 +290,12 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
           }
 
           const body = await parseStewardResponseBody(res);
+          if (
+            !authorityWindowIsCurrent(logoutGenerationAtStart) ||
+            readStoredToken() !== token
+          ) {
+            return;
+          }
           if (body?.code === "server_secret_missing") {
             reportRendererDiagnostic({
               scope: "steward.server-secret-missing",
@@ -177,7 +328,9 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
             });
             lastSyncedToken.current = null;
             wasAuthenticated.current = false;
-            await clearStaleStewardSession();
+            markSsoLoggedOut();
+            suppressSdkSession();
+            await clearStaleStewardSession({ expectedToken: token });
             return;
           }
           // Same stale-proxy guard as the refresh path: a still-valid token that
@@ -207,7 +360,7 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
           });
           lastSyncedToken.current = null;
           wasAuthenticated.current = false;
-          await clearStaleStewardSession();
+          await clearStaleStewardSession({ expectedToken: token });
         })
         .catch((error) => {
           reportRendererDiagnostic({
@@ -224,6 +377,12 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
     let refreshInFlight: Promise<void> | null = null;
 
     const checkAndRefresh = async (force = false): Promise<void> => {
+      if (ssoSessionSuppressedRef.current || isSsoLoggedOut()) return;
+      const logoutGenerationAtStart = readLogoutGenerationSnapshot();
+      if (!logoutGenerationAtStart.readable) {
+        suppressSdkSession();
+        return;
+      }
       const token = readStoredToken();
       if (!token) return;
       if (!force) {
@@ -241,7 +400,22 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
           if (res.ok) {
             const body = await parseStewardResponseBody(res);
             if (body?.token) {
-              await writeStoredStewardToken(body.token);
+              const committed = await writeStoredStewardTokenIfCurrent(
+                body.token,
+                () =>
+                  authorityWindowIsCurrent(logoutGenerationAtStart) &&
+                  readStoredToken() === token,
+              );
+              if (
+                !committed ||
+                !authorityWindowIsCurrent(logoutGenerationAtStart) ||
+                readStoredToken() !== body.token
+              ) {
+                if (committed) {
+                  await clearStoredStewardTokenIfCurrent(body.token);
+                }
+                return;
+              }
               lastSyncedToken.current = body.token;
               wasAuthenticated.current = true;
             }
@@ -259,6 +433,12 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
             return;
           }
           if (res.status === 401) {
+            if (
+              !authorityWindowIsCurrent(logoutGenerationAtStart) ||
+              readStoredToken() !== token
+            ) {
+              return;
+            }
             // A refresh 401 normally means the session was revoked → clear so it
             // self-heals. But a STALE co-hosted proxy (staging's FRONTEND_ALIAS
             // pointing at the wrong control plane) 401s a still-VALID session,
@@ -272,7 +452,7 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
                 lastSyncedToken.current = null;
                 wasAuthenticated.current = false;
               }
-              await clearStaleStewardSession();
+              await clearStaleStewardSession({ expectedToken: token });
             } else {
               reportRendererDiagnostic({
                 scope: "steward.refresh-stale-proxy",
@@ -306,8 +486,35 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
       void checkAndRefresh();
     }, REFRESH_CHECK_INTERVAL_MS);
 
-    const handler = () => syncToken();
-    window.addEventListener("storage", handler);
+    const storageHandler = (event: StorageEvent) => {
+      if (event.key === SSO_LOGOUT_GENERATION_STORAGE_KEY) {
+        updateSsoSessionSuppressed(true);
+        retireSdkSession();
+        return;
+      }
+      if (event.key === SSO_LOGGED_OUT_STORAGE_KEY) {
+        const suppressed = event.newValue === "1" || isSsoLoggedOut();
+        updateSsoSessionSuppressed(suppressed);
+        if (suppressed) {
+          retireSdkSession();
+          return;
+        }
+      }
+      syncToken();
+    };
+    const sessionHandler = () => syncToken();
+    const ssoLogoutStateHandler = (event: Event) => {
+      const detail = (event as CustomEvent<SsoLogoutStateChangeDetail>).detail;
+      const suppressed =
+        detail?.state === "logged_out" ||
+        (detail?.state !== "cleared" && isSsoLoggedOut());
+      updateSsoSessionSuppressed(suppressed);
+      if (suppressed) retireSdkSession();
+      else syncToken();
+    };
+    window.addEventListener("storage", storageHandler);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, sessionHandler);
+    window.addEventListener(SSO_LOGOUT_STATE_EVENT, ssoLogoutStateHandler);
 
     const visibilityHandler = () => {
       if (document.visibilityState === "visible") {
@@ -332,7 +539,12 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
 
     return () => {
       clearInterval(refreshInterval);
-      window.removeEventListener("storage", handler);
+      if (missingCanonicalTokenTimer !== undefined) {
+        globalThis.clearTimeout(missingCanonicalTokenTimer);
+      }
+      window.removeEventListener("storage", storageHandler);
+      window.removeEventListener(STEWARD_SESSION_CHANGE_EVENT, sessionHandler);
+      window.removeEventListener(SSO_LOGOUT_STATE_EVENT, ssoLogoutStateHandler);
       document.removeEventListener("visibilitychange", visibilityHandler);
       window.removeEventListener("online", onlineHandler);
       window.removeEventListener("steward-unauthorized", unauthorizedHandler);
@@ -344,16 +556,17 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
   // must narrow the MFA-required union before exposing tokens.
   const localAuth = useMemo<LocalStewardAuthValue>(
     () => ({
-      isAuthenticated: auth.isAuthenticated,
+      isAuthenticated: !ssoSessionSuppressed && auth.isAuthenticated,
       isLoading: auth.isLoading,
-      user: auth.user
-        ? {
-            id: auth.user.id,
-            email: auth.user.email ?? undefined,
-            walletAddress: auth.user.walletAddress,
-          }
-        : null,
-      session: auth.session,
+      user:
+        !ssoSessionSuppressed && auth.user
+          ? {
+              id: auth.user.id,
+              email: auth.user.email ?? undefined,
+              walletAddress: auth.user.walletAddress,
+            }
+          : null,
+      session: ssoSessionSuppressed ? null : auth.session,
       signOut: () => {
         // Retire explicit-sync proof before the SDK begins its own fallible
         // sign-out work. A same-token login after any partial teardown must
@@ -368,7 +581,7 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
         scrubPersistedAgentProfileTokens();
         auth.signOut();
       },
-      getToken: () => auth.getToken(),
+      getToken: () => (ssoSessionSuppressed ? null : auth.getToken()),
       verifyEmailCallback: async (token: string, email: string) => {
         const result = await auth.verifyEmailCallback(token, email);
         if ("mfaRequired" in result) {
@@ -377,7 +590,7 @@ function AuthTokenSync({ children }: { children: ReactNode }) {
         return { token: result.token, refreshToken: result.refreshToken };
       },
     }),
-    [auth],
+    [auth, ssoSessionSuppressed],
   );
 
   return (

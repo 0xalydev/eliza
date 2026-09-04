@@ -668,6 +668,55 @@ describe("ensurePersonalDedicatedEliza", () => {
     expect(adoptionPosts).toBe(0);
   });
 
+  it("does not start Dedicated activation after the signed-in authority changes", async () => {
+    const personalElizaId = "personal:3b9e517b-5c33-5c5f-a6f9-f78c764dc41b";
+    let authCurrent = true;
+    const calls: Array<{ url: string; method: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        const method = init?.method ?? "GET";
+        calls.push({ url, method });
+        if (url.endsWith("/api/v1/eliza/personal")) {
+          return jsonResponse(200, {
+            success: true,
+            data: {
+              identity: {
+                id: personalElizaId,
+                displayName: "Eliza",
+                runtime: "shared",
+              },
+            },
+          });
+        }
+        if (url.endsWith("/upgrade-tier") && method === "GET") {
+          authCurrent = false;
+          return jsonResponse(200, {
+            success: true,
+            data: {
+              quoteId: "a".repeat(64),
+              canActivate: true,
+              activation: { state: "available" },
+            },
+          });
+        }
+        return jsonResponse(500, { error: `Unexpected URL ${url}` });
+      }),
+    );
+
+    await expect(
+      new ElizaClient().ensurePersonalDedicatedEliza({
+        cloudApiBase: "https://api.eliza.app",
+        authToken: "account-a-token",
+        isAuthCurrent: () => authCurrent,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(calls).toHaveLength(2);
+    expect(calls.every(({ method }) => method === "GET")).toBe(true);
+  });
+
   it.each([
     {
       requiresCatalogRestore: false,

@@ -701,6 +701,9 @@ describe("performSsoExchange", () => {
       diagnostics.push((event as CustomEvent<{ scope?: unknown }>).detail);
     };
     window.addEventListener("eliza:renderer-diagnostic", listener);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
 
     try {
       await expect(
@@ -711,15 +714,175 @@ describe("performSsoExchange", () => {
       });
     } finally {
       window.removeEventListener("eliza:renderer-diagnostic", listener);
+      globalThis.fetch = realFetch;
     }
 
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(isSsoLoggedOut()).toBe(true);
     expect(consumeStewardServerCookieSynced(token, calls[1].url)).toBe(false);
     expect(diagnostics).toContainEqual(
       expect.objectContaining({
         scope: "steward.sso-bridge.cookie-sync-response",
       }),
     );
+  });
+
+  it("reports an unconfirmed rollback when every cookie DELETE fails", async () => {
+    const token = liveToken("unconfirmed-cookie-cleanup-user");
+    const { fn, calls } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(200, {
+            ok: true,
+            userId: "cloud-user",
+            stewardUserId: "",
+          }),
+    );
+    const cookieDeleteCalls: FetchCall[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      cookieDeleteCalls.push({ url: String(input), init });
+      return Promise.resolve(json(503, { ok: false }));
+    }) as typeof fetch;
+    const diagnostics: Array<{
+      scope?: unknown;
+      severity?: unknown;
+    }> = [];
+    const listener = (event: Event) => {
+      diagnostics.push(
+        (event as CustomEvent<{ scope?: unknown; severity?: unknown }>).detail,
+      );
+    };
+    window.addEventListener("eliza:renderer-diagnostic", listener);
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      window.removeEventListener("eliza:renderer-diagnostic", listener);
+      globalThis.fetch = realFetch;
+    }
+
+    expect(calls).toHaveLength(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(isSsoLoggedOut()).toBe(true);
+    expect(shouldAutoBridgeToSso("cloud.eliza.app")).toBe(false);
+    expect(localStorage.getItem(SSO_LOGOUT_GENERATION_KEY)).not.toBeNull();
+    expect(localStorage.getItem(SSO_FINALIZATION_INTENT_KEY)).toBe(
+      localStorage.getItem(SSO_LOGOUT_GENERATION_KEY),
+    );
+    expect(cookieDeleteCalls.length).toBeGreaterThan(0);
+    expect(
+      cookieDeleteCalls.every(({ init }) => init?.method === "DELETE"),
+    ).toBe(true);
+    expect(diagnostics).toContainEqual(
+      expect.objectContaining({
+        scope: "steward.sso-bridge.cookie-cleanup",
+        severity: "error",
+      }),
+    );
+  });
+
+  it("reports an unconfirmed rollback when its durable logout intent cannot be published", async () => {
+    const token = liveToken("uncoordinated-cookie-rollback-user");
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(200, {
+            ok: true,
+            userId: "cloud-user",
+            stewardUserId: "",
+          }),
+    );
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+    let entropyCalls = 0;
+    const entropy = vi
+      .spyOn(globalThis.crypto, "getRandomValues")
+      .mockImplementation((array) => {
+        entropyCalls += 1;
+        if (entropyCalls === 2) {
+          throw new Error("secure entropy unavailable during rollback");
+        }
+        return array;
+      });
+    const diagnostics: Array<{ scope?: unknown; severity?: unknown }> = [];
+    const listener = (event: Event) => {
+      diagnostics.push(
+        (event as CustomEvent<{ scope?: unknown; severity?: unknown }>).detail,
+      );
+    };
+    window.addEventListener("eliza:renderer-diagnostic", listener);
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      window.removeEventListener("eliza:renderer-diagnostic", listener);
+      entropy.mockRestore();
+      globalThis.fetch = realFetch;
+    }
+
+    expect(entropyCalls).toBe(2);
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGOUT_GENERATION_KEY)).toBeNull();
+    expect(isSsoLoggedOut()).toBe(true);
+    expect(diagnostics).toContainEqual(
+      expect.objectContaining({
+        scope: "steward.sso-bridge.cookie-cleanup",
+        severity: "error",
+      }),
+    );
+  });
+
+  it("does not claim rollback when the durable logout marker fails to round-trip", async () => {
+    const token = liveToken("marker-roundtrip-user");
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(200, {
+            ok: true,
+            userId: "cloud-user",
+            stewardUserId: "",
+          }),
+    );
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+    const realSetItem = Storage.prototype.setItem;
+    const markerWrite = vi
+      .spyOn(Storage.prototype, "setItem")
+      .mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key === SSO_LOGGED_OUT_KEY) return;
+        realSetItem.call(this, key, value);
+      });
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      markerWrite.mockRestore();
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBeNull();
   });
 
   it("bounds an unresolved exchange and permits the next attempt", async () => {
@@ -939,7 +1102,7 @@ describe("performSsoExchange", () => {
     const cookieClearCalls: FetchCall[] = [];
     globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       cookieClearCalls.push({ url: String(input), init });
-      return Promise.resolve(new Response(null, { status: 204 }));
+      return Promise.resolve(json(200, { ok: true }));
     }) as typeof fetch;
 
     try {
@@ -967,6 +1130,8 @@ describe("performSsoExchange", () => {
     }
 
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
+    expect(shouldAutoBridgeToSso("cloud.eliza.app")).toBe(false);
     expect(cookieClearCalls.length).toBeGreaterThan(0);
     expect(
       cookieClearCalls.every(({ init }) => init?.method === "DELETE"),
@@ -974,6 +1139,54 @@ describe("performSsoExchange", () => {
     expect(consumeStewardServerCookieSynced(expiringToken, calls[1].url)).toBe(
       false,
     );
+  });
+
+  it("keeps a logout barrier when expired exchange cookie cleanup is unconfirmed", async () => {
+    let now = 2_000_000_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+    const expiringToken = jwt({
+      userId: "expiring-unconfirmed-user",
+      exp: Math.floor(now / 1000) + 1,
+    });
+    let resolveCookieSync: (response: Response) => void = () => {};
+    const cookieSync = new Promise<Response>((resolve) => {
+      resolveCookieSync = resolve;
+    });
+    const fn = ((input: RequestInfo | URL) =>
+      String(input).includes("/sso-bridge/exchange")
+        ? Promise.resolve(json(200, { ok: true, token: expiringToken }))
+        : cookieSync) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(503, { ok: false }))) as typeof fetch;
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+      );
+      await vi.waitFor(() =>
+        expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expiringToken),
+      );
+      now += 2_000;
+      resolveCookieSync(stewardSessionResponse("expiring-unconfirmed-user"));
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      resolveCookieSync(stewardSessionResponse("expiring-unconfirmed-user"));
+      nowSpy.mockRestore();
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
+    expect(shouldAutoBridgeToSso("cloud.eliza.app")).toBe(false);
   });
 
   it("rejects another realm's logout generation at the queued write guard", async () => {
@@ -1058,11 +1271,95 @@ describe("performSsoExchange", () => {
 
     await expect(exchange).resolves.toEqual({
       ok: false,
-      error: "SSO exchange superseded",
+      error:
+        "Could not establish or fully clean up the Eliza Cloud browser session",
     });
     expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
     expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
     expect(consumeStewardServerCookieSynced(token, calls[1].url)).toBe(false);
+  });
+
+  it("does not consume B's cookie proof when a late rollback still belongs to A", async () => {
+    const tokenA = liveToken("account-a");
+    const tokenB = liveToken("account-b");
+    let resolveCookieSync: (response: Response) => void = () => {};
+    const cookieSync = new Promise<Response>((resolve) => {
+      resolveCookieSync = resolve;
+    });
+    const calls: FetchCall[] = [];
+    const fn: SsoBridgeFetch = (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      return url.includes("/sso-bridge/exchange")
+        ? Promise.resolve(json(200, { ok: true, token: tokenA }))
+        : cookieSync;
+    };
+
+    const exchange = performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    await vi.waitFor(() => {
+      expect(calls).toHaveLength(2);
+      expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenA);
+    });
+    await writeStoredStewardToken(tokenB);
+    markStewardServerCookieSynced(tokenB, calls[1].url);
+    resolveCookieSync(stewardSessionResponse("account-a"));
+
+    await expect(exchange).resolves.toEqual({
+      ok: false,
+      error:
+        "Could not establish or fully clean up the Eliza Cloud browser session",
+    });
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(consumeStewardServerCookieSynced(tokenB, calls[1].url)).toBe(true);
+  });
+
+  it("publishes a rollback barrier when component lifetime ends after cookie POST", async () => {
+    const token = liveToken("abandoned-cookie-post-user");
+    let current = true;
+    let resolveCookieSync: (response: Response) => void = () => {};
+    const cookieSync = new Promise<Response>((resolve) => {
+      resolveCookieSync = resolve;
+    });
+    const calls: FetchCall[] = [];
+    const fn = ((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, init });
+      return url.includes("/sso-bridge/exchange")
+        ? Promise.resolve(json(200, { ok: true, token }))
+        : cookieSync;
+    }) as typeof fetch;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(503, { ok: false }))) as typeof fetch;
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+        () => current,
+      );
+      await vi.waitFor(() => {
+        expect(calls).toHaveLength(2);
+        expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+      });
+      current = false;
+      resolveCookieSync(stewardSessionResponse("abandoned-cookie-post-user"));
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      resolveCookieSync(stewardSessionResponse("abandoned-cookie-post-user"));
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
+    expect(shouldAutoBridgeToSso("cloud.eliza.app")).toBe(false);
   });
 
   it("establishes bridged auth without sending or consuming a Telegram claim", async () => {
@@ -1099,13 +1396,16 @@ describe("performSsoExchange", () => {
         ? json(200, { ok: true, token: liveToken() })
         : json(500, { error: "unexpected session mutation" }),
     );
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
 
-    const result = await performSsoExchange(
-      CODE,
-      VERIFIER,
-      "cloud.eliza.app",
-      fn,
-    );
+    let result: Awaited<ReturnType<typeof performSsoExchange>>;
+    try {
+      result = await performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
 
     expect(result).toEqual({
       ok: false,
@@ -1126,7 +1426,7 @@ describe("performSsoExchange", () => {
         : Promise.reject(new TypeError("network unavailable"));
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
 
     try {
       await expect(
@@ -1157,7 +1457,7 @@ describe("performSsoExchange", () => {
     const cookieClearCalls: FetchCall[] = [];
     globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       cookieClearCalls.push({ url: String(input), init });
-      return Promise.resolve(new Response(null, { status: 204 }));
+      return Promise.resolve(json(200, { ok: true }));
     }) as typeof fetch;
     const eventTokens: Array<string | null> = [];
     const listener = () =>
@@ -1183,6 +1483,180 @@ describe("performSsoExchange", () => {
     expect(
       cookieClearCalls.every(({ init }) => init?.method === "DELETE"),
     ).toBe(true);
+  });
+
+  it("does not let session_ended cleanup for A erase a queued login B", async () => {
+    const tokenA = liveToken("account-a");
+    const tokenB = liveToken("account-b");
+    let releaseLoginB: () => void = () => {};
+    const loginBGate = new Promise<void>((resolve) => {
+      releaseLoginB = resolve;
+    });
+    let markLoginBStarted: () => void = () => {};
+    const loginBStarted = new Promise<void>((resolve) => {
+      markLoginBStarted = resolve;
+    });
+    const unregister = registerStewardTokenPersistence(async (nextToken) => {
+      if (nextToken === tokenB) {
+        markLoginBStarted();
+        await loginBGate;
+      }
+      localStorage.setItem(STEWARD_TOKEN_KEY, nextToken);
+    });
+    let markLogoutObserved: () => void = () => {};
+    const logoutObserved = new Promise<void>((resolve) => {
+      markLogoutObserved = resolve;
+    });
+    const logoutStateListener = () => markLogoutObserved();
+    window.addEventListener("eliza:sso-logout-state", logoutStateListener, {
+      once: true,
+    });
+    let loginB: Promise<void> | null = null;
+    const { fn } = fetchStub((url) => {
+      if (url.includes("/sso-bridge/exchange")) {
+        return json(200, { ok: true, token: tokenA });
+      }
+      loginB = writeStoredStewardToken(tokenB).then(() => {
+        clearSsoLoggedOut();
+      });
+      return json(401, {
+        error: "Session was signed out",
+        code: "session_ended",
+      });
+    });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+      );
+      await Promise.all([loginBStarted, logoutObserved]);
+      releaseLoginB();
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+      await loginB;
+    } finally {
+      releaseLoginB();
+      unregister();
+      window.removeEventListener("eliza:sso-logout-state", logoutStateListener);
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(isSsoLoggedOut()).toBe(false);
+  });
+
+  it("preserves a newer partial logout marker when rollback A yields to B", async () => {
+    const tokenA = liveToken("partial-logout-account-a");
+    const tokenB = liveToken("partial-logout-account-b");
+    let releaseLoginB: () => void = () => {};
+    const loginBGate = new Promise<void>((resolve) => {
+      releaseLoginB = resolve;
+    });
+    let markLoginBStarted: () => void = () => {};
+    const loginBStarted = new Promise<void>((resolve) => {
+      markLoginBStarted = resolve;
+    });
+    const unregister = registerStewardTokenPersistence(async (nextToken) => {
+      if (nextToken === tokenB) {
+        markLoginBStarted();
+        await loginBGate;
+      }
+      localStorage.setItem(STEWARD_TOKEN_KEY, nextToken);
+    });
+    let markRollbackObserved: () => void = () => {};
+    const rollbackObserved = new Promise<void>((resolve) => {
+      markRollbackObserved = resolve;
+    });
+    const logoutStateListener = () => markRollbackObserved();
+    window.addEventListener("eliza:sso-logout-state", logoutStateListener, {
+      once: true,
+    });
+    let loginB: Promise<void> | null = null;
+    const { fn } = fetchStub((url) => {
+      if (url.includes("/sso-bridge/exchange")) {
+        return json(200, { ok: true, token: tokenA });
+      }
+      loginB = writeStoredStewardToken(tokenB);
+      return json(401, {
+        error: "Session was signed out",
+        code: "session_ended",
+      });
+    });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
+
+    try {
+      const exchange = performSsoExchange(
+        CODE,
+        VERIFIER,
+        "cloud.eliza.app",
+        fn,
+      );
+      await Promise.all([loginBStarted, rollbackObserved]);
+      // A later logout can durably advance its generation, then fail before
+      // replacing the previous finalization intent. Its marker still wins.
+      localStorage.setItem(SSO_LOGOUT_GENERATION_KEY, "newer-partial-logout");
+      localStorage.setItem(SSO_LOGGED_OUT_KEY, "1");
+      releaseLoginB();
+
+      await expect(exchange).resolves.toEqual({
+        ok: false,
+        error: "SSO exchange superseded",
+      });
+      await loginB;
+    } finally {
+      releaseLoginB();
+      unregister();
+      window.removeEventListener("eliza:sso-logout-state", logoutStateListener);
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(localStorage.getItem(SSO_LOGOUT_GENERATION_KEY)).toBe(
+      "newer-partial-logout",
+    );
+    expect(isSsoLoggedOut()).toBe(true);
+  });
+
+  it("does not claim session_ended cleanup when cookie deletion is unconfirmed", async () => {
+    const token = liveToken("session-ended-unconfirmed-user");
+    const { fn } = fetchStub((url) =>
+      url.includes("/sso-bridge/exchange")
+        ? json(200, { ok: true, token })
+        : json(401, {
+            error: "Session was signed out",
+            code: "session_ended",
+          }),
+    );
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(503, { ok: false }))) as typeof fetch;
+
+    try {
+      await expect(
+        performSsoExchange(CODE, VERIFIER, "cloud.eliza.app", fn),
+      ).resolves.toEqual({
+        ok: false,
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBeNull();
+    expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
+    expect(shouldAutoBridgeToSso("cloud.eliza.app")).toBe(false);
   });
 
   it("lets the newer intent finish before a late older exchange response", async () => {
@@ -1300,7 +1774,8 @@ describe("performSsoExchange", () => {
 
       await expect(first).resolves.toEqual({
         ok: false,
-        error: "SSO exchange superseded",
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
       });
       await expect(second).resolves.toEqual({ ok: true });
       expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(secondToken);
@@ -1364,7 +1839,8 @@ describe("performSsoExchange", () => {
 
       await expect(first).resolves.toEqual({
         ok: false,
-        error: "SSO exchange superseded",
+        error:
+          "Could not establish or fully clean up the Eliza Cloud browser session",
       });
       await expect(second).resolves.toEqual({
         ok: false,
@@ -1422,7 +1898,8 @@ describe("performSsoExchange", () => {
 
     await expect(first).resolves.toEqual({
       ok: false,
-      error: "SSO exchange superseded",
+      error:
+        "Could not establish or fully clean up the Eliza Cloud browser session",
     });
     await expect(second).resolves.toEqual({ ok: true });
     expect(sessionPostCount).toBe(2);
@@ -1503,7 +1980,7 @@ describe("performSsoExchange", () => {
           if (released) return;
           released = true;
           order.push("cookie-delete-finish");
-          resolve(new Response(null, { status: 204 }));
+          resolve(json(200, { ok: true }));
         });
       });
     }) as typeof fetch;
@@ -1793,7 +2270,7 @@ describe("signOutFromSsoBridgedHost", () => {
   it("rejects when the hosted session cannot be ended", async () => {
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     try {
       const { fn } = fetchStub(() =>
         json(403, { error: "csrf_marker_required" }),
@@ -1806,12 +2283,45 @@ describe("signOutFromSsoBridgedHost", () => {
     }
   });
 
+  it("retains an expired retry credential when hosted logout returns 503", async () => {
+    const expired = jwt({
+      userId: "expired-sign-out-retry-user",
+      exp: Math.floor(Date.now() / 1000) - 60,
+    });
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    const cookieCleanupCalls: FetchCall[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      cookieCleanupCalls.push({ url: String(input), init });
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+    const { fn, calls } = fetchStub(() =>
+      json(503, { error: "logout_revocation_unavailable" }),
+    );
+
+    try {
+      await expect(
+        signOutFromSsoBridgedHost("cloud.eliza.app", fn),
+      ).rejects.toThrow("could not end the browser session (503)");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(new Headers(calls[0]?.init?.headers).has("authorization")).toBe(
+      false,
+    );
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
+    expect(isSsoLoggedOut()).toBe(true);
+    expect(cookieCleanupCalls).toEqual([]);
+  });
+
   it("retains bearer authority for a failed logout retry and clears only after 200", async () => {
     const token = liveToken("logout-retry-user");
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     let attempt = 0;
     const { fn, calls } = fetchStub(() => {
       attempt += 1;
@@ -1843,7 +2353,7 @@ describe("signOutFromSsoBridgedHost", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     try {
       const networkFailure = new TypeError("network unavailable");
       const fn = (() => Promise.reject(networkFailure)) as typeof fetch;
@@ -1923,10 +2433,17 @@ describe("signOutFromSsoBridgedHost", () => {
     });
     localStorage.setItem(STEWARD_TOKEN_KEY, expired);
     const { fn, calls } = fetchStub(logoutAlreadyAbsentResponse);
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (() =>
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
 
-    await expect(
-      signOutFromSsoBridgedHost("cloud.eliza.app", fn),
-    ).resolves.toBeUndefined();
+    try {
+      await expect(
+        signOutFromSsoBridgedHost("cloud.eliza.app", fn),
+      ).resolves.toBeUndefined();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
     expect(calls[0]?.init?.headers).not.toMatchObject({
       Authorization: expect.any(String),
     });
@@ -1957,7 +2474,7 @@ describe("signOutFromSsoBridgedHost", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     let resolveLogout: (response: Response) => void = () => {};
     const logoutResponse = new Promise<Response>((resolve) => {
       resolveLogout = resolve;
@@ -1983,7 +2500,7 @@ describe("signOutFromSsoBridgedHost", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     const calls: FetchCall[] = [];
     const hangingFetch = ((input: RequestInfo | URL, init?: RequestInit) => {
       calls.push({ url: String(input), init });
@@ -2054,6 +2571,39 @@ describe("prepareSsoAccountSwitch", () => {
     }
   });
 
+  it("retains an expired retry credential when account-switch logout returns 503", async () => {
+    const expired = jwt({
+      userId: "expired-account-switch-retry-user",
+      exp: Math.floor(Date.now() / 1000) - 60,
+    });
+    localStorage.setItem(STEWARD_TOKEN_KEY, expired);
+    const cookieCleanupCalls: FetchCall[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
+      cookieCleanupCalls.push({ url: String(input), init });
+      return Promise.resolve(json(200, { ok: true }));
+    }) as typeof fetch;
+    const { fn, calls } = fetchStub(() =>
+      json(503, { error: "logout_revocation_unavailable" }),
+    );
+
+    try {
+      await expect(prepareSsoAccountSwitch("eliza.app", fn)).rejects.toThrow(
+        "could not end the previous browser session (503)",
+      );
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+
+    expect(calls).toHaveLength(1);
+    expect(new Headers(calls[0]?.init?.headers).has("authorization")).toBe(
+      false,
+    );
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe(expired);
+    expect(isSsoLoggedOut()).toBe(true);
+    expect(cookieCleanupCalls).toEqual([]);
+  });
+
   it("propagates caller cancellation to account-switch logout", async () => {
     const token = liveToken("cancelled-account-switch-user");
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
@@ -2081,7 +2631,7 @@ describe("prepareSsoAccountSwitch", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, token);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     try {
       const { fn, calls } = fetchStub(logoutBarrierResponse);
       await prepareSsoAccountSwitch("eliza.app", fn);
@@ -2123,7 +2673,7 @@ describe("prepareSsoAccountSwitch", () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, expired);
     const realFetch = globalThis.fetch;
     globalThis.fetch = (() =>
-      Promise.resolve(new Response(null, { status: 204 }))) as typeof fetch;
+      Promise.resolve(json(200, { ok: true }))) as typeof fetch;
     try {
       const { fn, calls } = fetchStub(logoutAlreadyAbsentResponse);
       await expect(

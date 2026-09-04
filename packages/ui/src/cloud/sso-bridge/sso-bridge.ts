@@ -63,6 +63,7 @@ import { appModeNavigation } from "../app-mode/app-mode";
 import { decodeJwtPayload } from "../lib/jwt";
 import {
   invalidateStewardServerCookieSyncMarker,
+  invalidateStewardServerCookieSyncMarkerIfOwned,
   markStewardServerCookieSynced,
 } from "../lib/steward-session-cookie-sync-marker";
 import {
@@ -349,6 +350,10 @@ export function clearSsoBridgeAttempt(): void {
 const SSO_LOGGED_OUT_KEY = "eliza_sso_logged_out";
 const SSO_LOGOUT_GENERATION_KEY = "eliza_sso_logout_generation";
 const SSO_FINALIZATION_INTENT_KEY = "eliza_sso_finalization_intent";
+export const SSO_LOGOUT_STATE_EVENT = "eliza:sso-logout-state";
+export type SsoLogoutStateChangeDetail = {
+  state: "logged_out" | "cleared";
+};
 let ssoLogoutEpoch = 0;
 let activeSsoCookieSyncAbortController: AbortController | null = null;
 
@@ -414,7 +419,7 @@ function finalizationIntentMatches(nonce: string | null): boolean {
 
 function requireFinalizationIntent(
   nonce: string,
-  operation: "account switch" | "sign-out",
+  operation: "account switch" | "sign-out" | "exchange rollback",
 ): void {
   const current = readStoredGeneration(SSO_FINALIZATION_INTENT_KEY);
   if (!current.readable) {
@@ -429,11 +434,14 @@ function requireFinalizationIntent(
 
 function reassertSsoLoggedOutMarker(
   nonce: string,
-  operation: "account switch" | "sign-out",
+  operation: "account switch" | "sign-out" | "exchange rollback",
 ): void {
   requireFinalizationIntent(nonce, operation);
   try {
     shellLocalStorage.setItem(SSO_LOGGED_OUT_KEY, "1");
+    if (localStorage.getItem(SSO_LOGGED_OUT_KEY) !== "1") {
+      throw new Error("logout marker did not round-trip");
+    }
   } catch (error) {
     throw new Error(`SSO ${operation} could not persist its logout marker.`, {
       cause: error,
@@ -481,6 +489,16 @@ export function markSsoLoggedOut(): string | null {
     // error-policy:J6 best-effort marker; isSsoLoggedOut fails closed when
     // storage is unavailable.
   }
+  try {
+    window.dispatchEvent(
+      new CustomEvent<SsoLogoutStateChangeDetail>(SSO_LOGOUT_STATE_EVENT, {
+        detail: { state: "logged_out" },
+      }),
+    );
+  } catch {
+    // error-policy:J6 storage remains authoritative when an optional same-tab
+    // notification surface is unavailable.
+  }
   return logoutIntent;
 }
 
@@ -490,6 +508,16 @@ export function clearSsoLoggedOut(): void {
   } catch {
     // error-policy:J6 best-effort cleanup; an over-persistent marker only
     // suppresses auto-bridge, never login itself.
+  }
+  try {
+    window.dispatchEvent(
+      new CustomEvent<SsoLogoutStateChangeDetail>(SSO_LOGOUT_STATE_EVENT, {
+        detail: { state: "cleared" },
+      }),
+    );
+  } catch {
+    // error-policy:J6 listeners re-read durable storage on their next normal
+    // token/session event if same-tab notification is unavailable.
   }
 }
 
@@ -981,15 +1009,15 @@ async function readSsoLogoutBarrierProof(
 
 async function scrubPersistedExchangeTokenIfOwned(
   token: string,
-): Promise<void> {
-  invalidateStewardServerCookieSyncMarker();
+): Promise<{ cookieCleanupConfirmed: boolean }> {
+  invalidateStewardServerCookieSyncMarkerIfOwned(token);
   const cleared = await clearStoredStewardTokenIfCurrent(token);
-  if (!cleared) return;
+  if (!cleared) return { cookieCleanupConfirmed: false };
   // Do not forward the component-lifetime signal here: once this token was
   // durably published, its cookie POST may already have landed. Rollback must
   // survive route unmount; its own AbortController deadline still bounds lock
   // custody when the network is unavailable.
-  await clearServerStewardSessionCookies({
+  const cookieClear = await clearServerStewardSessionCookies({
     timeoutMs: SSO_COOKIE_SYNC_TIMEOUT_MS,
   });
   try {
@@ -1003,6 +1031,124 @@ async function scrubPersistedExchangeTokenIfOwned(
       severity: "warning",
     });
   }
+  return { cookieCleanupConfirmed: cookieClear.ok };
+}
+
+function unconfirmedExchangeCleanup(error: Error): SsoExchangeResult {
+  reportRendererDiagnostic({
+    scope: "steward.sso-bridge.cookie-cleanup",
+    error,
+    severity: "error",
+  });
+  return {
+    ok: false,
+    error:
+      "Could not establish or fully clean up the Eliza Cloud browser session",
+  };
+}
+
+type SsoExchangeCleanupResult = boolean | "superseded";
+type SsoExchangeCompensationResult =
+  | { ok: true }
+  | { ok: false; error: Error }
+  | { ok: false; superseded: true; error: Error };
+
+/**
+ * Publish a durable logout barrier around cleanup for an exchange whose
+ * session POST may already have planted HttpOnly cookies. The marker is
+ * round-tripped both before and after the awaited cleanup so reloads and other
+ * tabs cannot silently recover the half-committed session.
+ */
+async function compensatePublishedSsoExchange(
+  cleanup: () => Promise<SsoExchangeCleanupResult>,
+): Promise<SsoExchangeCompensationResult> {
+  const rollbackIntent = markSsoLoggedOut();
+  let rollbackMarkerConfirmed = false;
+  if (rollbackIntent) {
+    try {
+      reassertSsoLoggedOutMarker(rollbackIntent, "exchange rollback");
+      rollbackMarkerConfirmed = true;
+    } catch {
+      // Cleanup must still run because the session POST may have landed.
+    }
+  }
+
+  let cleanupResult: SsoExchangeCleanupResult = false;
+  let cleanupError: Error | null = null;
+  try {
+    cleanupResult = await cleanup();
+  } catch (error) {
+    cleanupError = error instanceof Error ? error : new Error(String(error));
+  }
+
+  if (cleanupResult === "superseded") {
+    if (!rollbackIntent) {
+      return {
+        ok: false,
+        error: new Error(
+          "Rollback coordination for the incomplete SSO exchange was not persisted",
+        ),
+      };
+    }
+    const logoutGeneration = readStoredGeneration(SSO_LOGOUT_GENERATION_KEY);
+    if (
+      finalizationIntentMatches(rollbackIntent) &&
+      logoutGeneration.readable &&
+      logoutGeneration.value === rollbackIntent
+    ) {
+      // This rollback published the marker, but a newer canonical bearer won
+      // the token mutation queue before A could be removed. Retire only a
+      // marker whose intent AND logout generation still belong to this exact
+      // rollback. A newer logout can publish its generation before a fallible
+      // intent write, and its marker must survive that partial failure.
+      clearSsoLoggedOut();
+      if (isSsoLoggedOut()) {
+        return {
+          ok: false,
+          error: new Error(
+            "Rollback coordination could not yield to the newer session",
+          ),
+        };
+      }
+    }
+    return {
+      ok: false,
+      superseded: true,
+      error: new Error("Exchange cleanup yielded to a newer session"),
+    };
+  }
+
+  if (rollbackIntent) {
+    try {
+      // Reattempt even when the pre-cleanup assertion failed: a transient
+      // storage denial may have recovered, and only this final round-trip is
+      // authoritative after the async DELETE/teardown boundary.
+      reassertSsoLoggedOutMarker(rollbackIntent, "exchange rollback");
+      rollbackMarkerConfirmed = true;
+    } catch {
+      rollbackMarkerConfirmed = false;
+    }
+  }
+
+  if (!rollbackMarkerConfirmed) {
+    return {
+      ok: false,
+      error: new Error(
+        "Rollback coordination for the incomplete SSO exchange was not persisted",
+      ),
+    };
+  }
+  if (!cleanupResult) {
+    return {
+      ok: false,
+      error:
+        cleanupError ??
+        new Error(
+          "Cookie cleanup for the incomplete SSO exchange was not acknowledged",
+        ),
+    };
+  }
+  return { ok: true };
 }
 
 /**
@@ -1217,7 +1363,35 @@ export async function performSsoExchange(
       const stillOwnsFinalization =
         stillOwnsAuthority() && readStoredStewardToken() === token;
       if (!stillOwnsFinalization) {
-        await scrubPersistedExchangeTokenIfOwned(token);
+        const abandonedWithOwnedCredentials =
+          finalizationIntentMatches(finalizationIntent) &&
+          readStoredStewardToken() === token;
+        if (abandonedWithOwnedCredentials) {
+          // A component lifetime ending is not itself a newer auth authority.
+          // If our exact intent and bearer still own storage, the session POST
+          // may nevertheless have planted cookies. Publish a durable rollback
+          // barrier before cleanup so a reload cannot recover them after an
+          // unacknowledged DELETE. A genuinely newer login changes the intent
+          // and/or bearer and deliberately bypasses this marker path.
+          const compensation = await compensatePublishedSsoExchange(
+            async () => {
+              const cleanup = await scrubPersistedExchangeTokenIfOwned(token);
+              return cleanup.cookieCleanupConfirmed;
+            },
+          );
+          if (!compensation.ok) {
+            return unconfirmedExchangeCleanup(compensation.error);
+          }
+          return { ok: false, error: "SSO exchange superseded" };
+        }
+        const cleanup = await scrubPersistedExchangeTokenIfOwned(token);
+        if (!cleanup.cookieCleanupConfirmed) {
+          return unconfirmedExchangeCleanup(
+            new Error(
+              "Cookie cleanup for the superseded SSO exchange was not acknowledged",
+            ),
+          );
+        }
         return { ok: false, error: "SSO exchange superseded" };
       }
       if (cookieSyncSessionEnded) {
@@ -1230,12 +1404,23 @@ export async function performSsoExchange(
           error: new Error("Session was ended by an explicit logout"),
           severity: "warning",
         });
-        markSsoLoggedOut();
-        await clearStaleStewardSession({
-          awaitCookieClear: true,
-          signal: coordination.signal,
-          timeoutMs: SSO_LOGOUT_TIMEOUT_MS,
+        const compensation = await compensatePublishedSsoExchange(async () => {
+          const cleared = await clearStaleStewardSession({
+            awaitCookieClear: true,
+            expectedToken: token,
+            signal: coordination.signal,
+            timeoutMs: SSO_LOGOUT_TIMEOUT_MS,
+          });
+          if (cleared) return true;
+          const currentToken = readStoredStewardToken();
+          return currentToken && currentToken !== token ? "superseded" : false;
         });
+        if (!compensation.ok) {
+          if ("superseded" in compensation) {
+            return { ok: false, error: "SSO exchange superseded" };
+          }
+          return unconfirmedExchangeCleanup(compensation.error);
+        }
         return { ok: false, error: "Session was signed out" };
       }
       if (!cookieSyncProven) {
@@ -1245,7 +1430,16 @@ export async function performSsoExchange(
         // Never publish a local bearer over an unavailable, rejected, or
         // malformed proof; compensate any Set-Cookie that may already have
         // landed before the response/body failed validation.
-        await scrubPersistedExchangeTokenIfOwned(token);
+        // Publish the durable rollback intent before network cleanup. This
+        // prevents another tab/reload from silently recovering the possibly
+        // live HttpOnly session while DELETE is pending or unavailable.
+        const compensation = await compensatePublishedSsoExchange(async () => {
+          const cleanup = await scrubPersistedExchangeTokenIfOwned(token);
+          return cleanup.cookieCleanupConfirmed;
+        });
+        if (!compensation.ok) {
+          return unconfirmedExchangeCleanup(compensation.error);
+        }
         return {
           ok: false,
           error: "Could not establish the Eliza Cloud browser session",
@@ -1255,7 +1449,13 @@ export async function performSsoExchange(
       // after durable persistence is removed before the route can publish
       // success or a cookie-sync proof.
       if (!tokenLooksHydratable(token)) {
-        await scrubPersistedExchangeTokenIfOwned(token);
+        const compensation = await compensatePublishedSsoExchange(async () => {
+          const cleanup = await scrubPersistedExchangeTokenIfOwned(token);
+          return cleanup.cookieCleanupConfirmed;
+        });
+        if (!compensation.ok) {
+          return unconfirmedExchangeCleanup(compensation.error);
+        }
         return { ok: false, error: "SSO exchange session expired" };
       }
       markStewardServerCookieSynced(token, sessionEndpoint);

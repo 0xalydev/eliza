@@ -230,18 +230,29 @@ function hasVerifiedPlaywrightTestSession(
   return claims?.userId === user.id && claims.organizationId === user.organization_id;
 }
 
-export async function getCurrentUser(c: AppContext): Promise<AuthedUser | null> {
-  const cached = c.get("user");
-  if (cached !== undefined) return cached;
-
-  const testUser = await getPlaywrightTestUser(c);
-  if (testUser) {
-    c.set("user", testUser);
-    c.set("authMethod", "session");
-    return testUser;
+export async function getCurrentUser(
+  c: AppContext,
+  stewardTokenOverride?: string,
+): Promise<AuthedUser | null> {
+  // Security boundaries such as logout may already have verified one exact
+  // credential after considering both the Authorization header and scoped
+  // HttpOnly cookie. An explicit token must bypass request-local auth state so
+  // a stale bearer cannot mask the selected credential during user hydration.
+  if (stewardTokenOverride === undefined) {
+    const cached = c.get("user");
+    if (cached !== undefined) return cached;
   }
 
-  const token = readStewardSessionToken(c);
+  if (stewardTokenOverride === undefined) {
+    const testUser = await getPlaywrightTestUser(c);
+    if (testUser) {
+      c.set("user", testUser);
+      c.set("authMethod", "session");
+      return testUser;
+    }
+  }
+
+  const token = stewardTokenOverride ?? readStewardSessionToken(c);
 
   if (!token) {
     c.set("user", null);

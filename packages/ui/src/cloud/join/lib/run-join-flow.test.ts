@@ -212,4 +212,40 @@ describe("runJoinFlow", () => {
     expect(h.setBaseUrl).not.toHaveBeenCalled();
     expect(h.savePersistedActiveServer).not.toHaveBeenCalled();
   });
+
+  test("does not configure or persist after session authority changes during resolution", async () => {
+    const h = harness();
+    let authCurrent = true;
+    h.ensurePersonalDedicatedEliza.mockImplementationOnce(async () => {
+      authCurrent = false;
+      return {
+        personalElizaId: PERSONAL_ID,
+        agentId: PERSONAL_ID,
+        activeAgentId: DEDICATED_ID,
+        agentName: "Eliza",
+        apiBase: PERSONAL_BASE,
+        runtime: "dedicated" as const,
+      };
+    });
+
+    await expect(
+      runJoinFlow({
+        client: h.client,
+        effects: h.effects,
+        cloudApiBase: CLOUD_API_BASE,
+        authToken: "account-a-token",
+        isAuthCurrent: () => authCurrent,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    expect(h.ensurePersonalDedicatedEliza).toHaveBeenCalledWith({
+      cloudApiBase: CLOUD_API_BASE,
+      authToken: "account-a-token",
+      isAuthCurrent: expect.any(Function),
+    });
+    expect(h.setBaseUrl).not.toHaveBeenCalled();
+    expect(h.setToken).not.toHaveBeenCalled();
+    expect(h.savePersistedActiveServer).not.toHaveBeenCalled();
+    expect(h.savePersistedFirstRunComplete).not.toHaveBeenCalled();
+  });
 });

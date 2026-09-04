@@ -2033,6 +2033,8 @@ declare module "./client-base" {
       cloudApiBase: string;
       authToken: string;
       signal?: AbortSignal;
+      /** Re-read canonical browser authority before every request boundary. */
+      isAuthCurrent?: () => boolean;
       onProgress?: (status: string, detail?: string) => void;
       /**
        * User-gesture boundary for an existing-row adoption. Silent startup
@@ -4619,9 +4621,18 @@ function inProgressDedicatedActivationPolicy(
 
 function throwIfDedicatedStartupDeadlineElapsed(
   deadline: number,
-  signal?: AbortSignal,
+  options: Pick<
+    EnsurePersonalDedicatedElizaOptions,
+    "signal" | "isAuthCurrent"
+  >,
 ): void {
-  signal?.throwIfAborted();
+  options.signal?.throwIfAborted();
+  if (options.isAuthCurrent && !options.isAuthCurrent()) {
+    throw new DOMException(
+      "The signed-in session authority changed",
+      "AbortError",
+    );
+  }
   if (Date.now() >= deadline) {
     throw new DOMException("The startup deadline elapsed", "TimeoutError");
   }
@@ -4772,7 +4783,7 @@ async function adoptSelectedPersonalDedicatedEliza(
 ): Promise<string | null> {
   const adoptionUrl = `${upgradeUrl}/adopt-existing`;
   const fetchCurrentQuote = async () => {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     const response = await directCloudJsonResponse<unknown>(adoptionUrl, {
       headers: {
         Accept: "application/json",
@@ -4780,14 +4791,14 @@ async function adoptSelectedPersonalDedicatedEliza(
       },
       ...(options.signal ? { signal: options.signal } : {}),
     });
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     return response;
   };
   let quoteResponse = await fetchCurrentQuote();
   let confirmationReason: "initial" | "quote_changed" = "initial";
   let firstTargetId: string | null = null;
   for (;;) {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     const quoteRoot = recordOrNull(quoteResponse.data);
     const responseCode = directCloudErrorMetadata(quoteResponse.data).code;
     if (
@@ -4852,7 +4863,7 @@ async function adoptSelectedPersonalDedicatedEliza(
       reason: confirmationReason,
       ...(options.signal ? { signal: options.signal } : {}),
     });
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     if (
       confirmation?.action !== "adopt_existing_dedicated" ||
       confirmation.quoteId !== quote.quoteId
@@ -4879,7 +4890,7 @@ async function adoptSelectedPersonalDedicatedEliza(
         ...(options.signal ? { signal: options.signal } : {}),
       },
     );
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     const adoptionRoot = recordOrNull(adoptionResponse.data);
     const adoptionCode = directCloudErrorMetadata(adoptionResponse.data).code;
     if (
@@ -4935,16 +4946,16 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
   options: EnsurePersonalDedicatedElizaOptions,
   deadline: number,
 ): ReturnType<ElizaClient["ensurePersonalDedicatedEliza"]> {
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(deadline, options);
   const personal = await this.getPersonalSharedEliza(options);
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(deadline, options);
   if (personal.runtime === "dedicated") {
     return { ...personal, runtime: "dedicated" as const };
   }
 
   const cloudApiBase = resolveDirectCloudAuthApiBase(options.cloudApiBase);
   const upgradeUrl = `${cloudApiBase}/api/v1/eliza/agents/${encodeURIComponent(personal.personalElizaId)}/upgrade-tier`;
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(deadline, options);
   options.onProgress?.("provisioning", "Starting your Dedicated agent…");
 
   const quoteResponse = await directCloudJsonResponse<unknown>(upgradeUrl, {
@@ -4954,7 +4965,7 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
     },
     ...(options.signal ? { signal: options.signal } : {}),
   });
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(deadline, options);
   const quoteRoot = recordOrNull(quoteResponse.data);
   const quote = recordOrNull(quoteRoot?.data);
   const quoteId = firstString(quote?.quoteId);
@@ -4983,7 +4994,7 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
     );
   }
 
-  throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+  throwIfDedicatedStartupDeadlineElapsed(deadline, options);
   const quoteActivation = recordOrNull(quote?.activation);
   const activationState = firstString(quoteActivation?.state);
   let quotedTargetId: string | null = null;
@@ -5070,7 +5081,7 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
         ...(options.signal ? { signal: options.signal } : {}),
       },
     );
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     const activationRoot = recordOrNull(activationResponse.data);
     const activation = recordOrNull(activationRoot?.data);
     let activatedTargetId = firstString(activation?.dedicatedAgentId);
@@ -5135,7 +5146,7 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
 
   const intervalMs = options.pollIntervalMs ?? 5_000;
   for (;;) {
-    throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+    throwIfDedicatedStartupDeadlineElapsed(deadline, options);
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) {
       throw new Error(
@@ -5150,7 +5161,7 @@ async function ensurePersonalDedicatedElizaWithinDeadline(
         authToken: options.authToken,
         signal: options.signal,
       });
-      throwIfDedicatedStartupDeadlineElapsed(deadline, options.signal);
+      throwIfDedicatedStartupDeadlineElapsed(deadline, options);
       options.onProgress?.("ready", "Connected to your Dedicated agent");
       return {
         personalElizaId: personal.personalElizaId,

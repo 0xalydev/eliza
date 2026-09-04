@@ -10,7 +10,7 @@ import {
   type StewardLogoutResponse,
 } from "@elizaos/shared/steward-session-client";
 import { Hono } from "hono";
-import { deleteCookie } from "hono/cookie";
+import { deleteCookie, getCookie } from "hono/cookie";
 import { getAuditDispatcher } from "@/api-app/services/audit-dispatcher-singleton";
 import { invalidateSessionCaches } from "@/lib/auth";
 import { checkElizaMutatingRequestOrigin } from "@/lib/auth/browser-origin-policy";
@@ -20,10 +20,7 @@ import {
   verifyStewardTokenWithResult,
 } from "@/lib/auth/steward-client";
 import { stewardCookieNames } from "@/lib/auth/steward-cookies";
-import {
-  getCurrentUser,
-  readStewardSessionToken,
-} from "@/lib/auth/workers-hono-auth";
+import { getCurrentUser } from "@/lib/auth/workers-hono-auth";
 import {
   getRequestIp,
   RateLimitPresets,
@@ -42,6 +39,17 @@ const app = new Hono<AppEnv>();
 
 app.use("*", rateLimit(RateLimitPresets.STANDARD));
 
+function readStewardBearerCandidate(c: {
+  req: { header: (name: string) => string | undefined };
+}): string | null {
+  const authorization = c.req.header("authorization");
+  if (!authorization?.startsWith("Bearer ")) return null;
+  const token = authorization.slice("Bearer ".length).trim();
+  if (!token) return null;
+  const segments = token.split(".");
+  return segments.length === 3 && segments.every(Boolean) ? token : null;
+}
+
 app.post("/", async (c) => {
   const originCheck = checkElizaMutatingRequestOrigin(
     c.req,
@@ -58,19 +66,29 @@ app.post("/", async (c) => {
   }
 
   const cookieNames = stewardCookieNames(c.env.ENVIRONMENT);
-  // Hosted SPAs authenticate with a localStorage JWT in Authorization, while
-  // auth-origin pages may use the environment-scoped cookie. Resolve both
-  // through the same JWT-only selection used by getCurrentUser; API-key
-  // bearers are deliberately excluded from browser-session teardown.
-  const stewardToken = readStewardSessionToken(c);
+  // A browser can present a localStorage bearer and an HttpOnly access cookie
+  // concurrently. Verify both independently: a stale bearer must not mask a
+  // valid cookie, and credentials for different users are an ambiguous
+  // authority boundary that must preserve every retry credential.
+  const bearerToken = readStewardBearerCandidate(c);
+  const cookieToken = getCookie(c, cookieNames.token) ?? null;
+  const stewardTokenCandidates = Array.from(
+    new Set(
+      [bearerToken, cookieToken].filter((token): token is string =>
+        Boolean(token),
+      ),
+    ),
+  );
+  const verificationResults = await Promise.all(
+    stewardTokenCandidates.map(async (token) => ({
+      token,
+      verification: await verifyStewardTokenWithResult(c.env, token, {
+        skipDistributedCache: true,
+      }),
+    })),
+  );
 
-  let verifiedClaims: StewardTokenClaims | null = null;
-  if (stewardToken) {
-    const verification = await verifyStewardTokenWithResult(
-      c.env,
-      stewardToken,
-      { skipDistributedCache: true },
-    );
+  for (const { verification } of verificationResults) {
     if (verification.kind === "unavailable") {
       // error-policy:J1 do not destroy the credential needed to retry a
       // security boundary whose verifier could not establish token authority.
@@ -88,23 +106,84 @@ app.post("/", async (c) => {
         503,
       );
     }
-    if (verification.kind === "valid") {
-      verifiedClaims = verification.claims;
-    }
+  }
+
+  const verifiedCandidates = verificationResults.flatMap(
+    ({ token, verification }) =>
+      verification.kind === "valid"
+        ? [{ token, claims: verification.claims }]
+        : [],
+  );
+  const verifiedUserIds = new Set(
+    verifiedCandidates.map(({ claims }) => claims.userId),
+  );
+  if (verifiedUserIds.size > 1) {
+    logger.error("[Logout] Conflicting valid browser-session credentials", {
+      validCredentialCount: verifiedCandidates.length,
+    });
+    return c.json(
+      {
+        error: "Logout revocation is temporarily unavailable",
+        code: "logout_revocation_unavailable" as const,
+      },
+      503,
+    );
+  }
+
+  // When both credentials represent the same user, use the newest issuance
+  // for the strong-revocation cutoff while the logout marker itself fences all
+  // prior bridge issuance for that user.
+  const verifiedCredential = verifiedCandidates.reduce<{
+    token: string;
+    claims: StewardTokenClaims;
+  } | null>(
+    (current, candidate) =>
+      !current || candidate.claims.issuedAt > current.claims.issuedAt
+        ? candidate
+        : current,
+    null,
+  );
+  const stewardToken = verifiedCredential?.token ?? null;
+  const verifiedClaims = verifiedCredential?.claims ?? null;
+
+  // A missing/expired scoped access JWT does not prove which session owns this
+  // host's HttpOnly refresh credential: an unrelated localStorage bearer must
+  // not stand in for that cookie lineage. Require the paired access cookie to
+  // verify before stamping a user marker or destroying the retry credential.
+  // Session recovery can rotate refresh into a verifiable access cookie and
+  // retry; a stable signed access/refresh session id remains the durable fix.
+  const refreshTokenPresent = Boolean(getCookie(c, cookieNames.refreshToken));
+  const cookieVerification = cookieToken
+    ? verificationResults.find(({ token }) => token === cookieToken)
+        ?.verification
+    : null;
+  const unresolvedRefreshAuthority =
+    refreshTokenPresent && cookieVerification?.kind !== "valid";
+  if (unresolvedRefreshAuthority) {
+    logger.warn(
+      "[Logout] Refresh authority remains without a verifiable access lineage",
+    );
+    return c.json(
+      {
+        error: "Logout revocation is temporarily unavailable",
+        code: "logout_revocation_unavailable" as const,
+      },
+      503,
+    );
   }
 
   let strongRevocationFailed = false;
   let ssoLogoutBarrierFailed = false;
-  if (verifiedClaims && isInferenceStrongRevocationEnabled(c.env)) {
+  if (verifiedCredential && isInferenceStrongRevocationEnabled(c.env)) {
     try {
-      const user = await getCurrentUser(c);
+      const user = await getCurrentUser(c, verifiedCredential.token);
       if (!user?.organization_id) {
         throw new Error("logout credential identity could not be resolved");
       }
       await revokeInferenceSessionsThrough(
         user.organization_id,
         user.id,
-        verifiedClaims.issuedAt,
+        verifiedCredential.claims.issuedAt,
       );
     } catch (error) {
       // error-policy:J1 preserve retry credentials and never claim a globally
@@ -181,15 +260,31 @@ app.post("/", async (c) => {
   deleteCookie(c, "eliza-anon-session", { path: "/" });
 
   try {
-    // Only tear down caches/sessions when the request presented a Steward JWT
-    // through this environment's scoped cookie or Authorization header.
-    if (stewardToken) {
-      await invalidateSessionCaches(stewardToken);
-      logger.debug("[Logout] Invalidated session caches for token");
+    // Both the scoped cookie and Authorization header may contain distinct,
+    // valid JWTs for the same user. Verification can warm each token cache, so
+    // drain every verified candidate even though only the newest credential is
+    // used for the strong-revocation cutoff and user hydration below.
+    if (verifiedCandidates.length > 0) {
+      const invalidationResults = await Promise.allSettled(
+        verifiedCandidates.map(({ token }) => invalidateSessionCaches(token)),
+      );
+      for (const result of invalidationResults) {
+        if (result.status === "rejected") {
+          logger.warn("[Logout] session-cache invalidation failed", {
+            error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : String(result.reason),
+          });
+        }
+      }
+      logger.debug("[Logout] Drained verified session-token caches", {
+        tokenCount: verifiedCandidates.length,
+      });
     }
 
     if (stewardToken) {
-      const user = await getCurrentUser(c);
+      const user = await getCurrentUser(c, stewardToken);
       if (user) {
         await userSessionsService.endAllUserSessions(user.id);
         await getAuditDispatcher()

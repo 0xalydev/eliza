@@ -15,7 +15,12 @@
 
 import { Capacitor } from "@capacitor/core";
 import { getElizaApiToken } from "@elizaos/shared";
-import { readStoredStewardToken } from "@elizaos/shared/steward-session-client";
+import {
+  readStoredStewardToken,
+  STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_TOKEN_KEY,
+  type StewardSessionChangeDetail,
+} from "@elizaos/shared/steward-session-client";
 import { useContext, useEffect, useState } from "react";
 import { isElectrobunRuntime } from "../../bridge/electrobun-runtime";
 import { getBootConfig } from "../../config/boot-config";
@@ -23,6 +28,11 @@ import {
   LocalStewardAuthContext,
   type LocalStewardAuthValue,
 } from "../shell/StewardProvider";
+import {
+  isSsoLoggedOut,
+  SSO_LOGOUT_STATE_EVENT,
+  type SsoLogoutStateChangeDetail,
+} from "../sso-bridge/sso-bridge";
 import { normalizeCloudApiKeyToken } from "./cloud-api-key-token";
 import { decodeJwtPayload } from "./jwt";
 
@@ -44,6 +54,8 @@ const STEWARD_AUTH_FALLBACK: Pick<
 const PLAYWRIGHT_TEST_AUTH_MARKER_COOKIE = "eliza-test-auth";
 const PLAYWRIGHT_TEST_USER_ID = "22222222-2222-4222-8222-222222222222";
 const PLAYWRIGHT_TEST_USER_EMAIL = "local-live-test-user@agent.local";
+const SSO_LOGGED_OUT_STORAGE_KEY = "eliza_sso_logged_out";
+const SSO_LOGOUT_GENERATION_STORAGE_KEY = "eliza_sso_logout_generation";
 
 /**
  * Read each env var by its literal name — Vite inlines custom `VITE_*` vars only
@@ -171,6 +183,13 @@ export function useSessionAuth(): SessionAuthState {
   const [storageUser, setStorageUser] = useState<StewardSessionUser>(
     readStewardSessionFromStorage,
   );
+  // The SDK context can remain authenticated briefly after another tab removes
+  // the canonical token. Once a real authority transition says that token is
+  // gone, never let the stale provider snapshot keep protected UI authenticated.
+  // A later durable `present` transition (or token storage event) lifts the
+  // override for the next session.
+  const [stewardSessionInvalidated, setStewardSessionInvalidated] =
+    useState(isSsoLoggedOut);
   const [apiKeyUser, setApiKeyUser] = useState<StewardSessionUser>(
     readNativeApiKeySession,
   );
@@ -179,34 +198,94 @@ export function useSessionAuth(): SessionAuthState {
   );
 
   useEffect(() => {
-    const handler = () => {
-      setStorageUser(readStewardSessionFromStorage());
+    const reread = ({
+      invalidateWhenMissing = false,
+      forceInvalidate = false,
+      allowRevalidate = false,
+    }: {
+      invalidateWhenMissing?: boolean;
+      forceInvalidate?: boolean;
+      allowRevalidate?: boolean;
+    } = {}) => {
+      const nextStorageUser = readStewardSessionFromStorage();
+      setStorageUser(nextStorageUser);
       setApiKeyUser(readNativeApiKeySession());
       setTestUser(readPlaywrightTestSession());
+      if (forceInvalidate || isSsoLoggedOut()) {
+        setStewardSessionInvalidated(true);
+      } else if (allowRevalidate && nextStorageUser) {
+        setStewardSessionInvalidated(false);
+      } else if (invalidateWhenMissing) {
+        setStewardSessionInvalidated(true);
+      }
     };
-    handler();
-    window.addEventListener("storage", handler);
-    window.addEventListener("steward-token-sync", handler);
-    const timer = setTimeout(handler, 250);
+    const storageHandler = (event: StorageEvent) => {
+      // `key === null` is localStorage.clear(). The undefined case preserves
+      // compatibility with browser/test shims that publish a plain Event.
+      const tokenAuthorityChanged =
+        event.key === STEWARD_TOKEN_KEY ||
+        event.key === null ||
+        typeof event.key === "undefined";
+      const logoutAdvanced =
+        event.key === SSO_LOGOUT_GENERATION_STORAGE_KEY ||
+        (event.key === SSO_LOGGED_OUT_STORAGE_KEY && event.newValue === "1");
+      reread({
+        invalidateWhenMissing: tokenAuthorityChanged,
+        forceInvalidate: logoutAdvanced,
+        allowRevalidate: tokenAuthorityChanged && event.newValue !== null,
+      });
+    };
+    const tokenSyncHandler = () =>
+      reread({ invalidateWhenMissing: true, allowRevalidate: true });
+    const sessionChangeHandler = (event: Event) => {
+      const detail = (event as CustomEvent<StewardSessionChangeDetail>).detail;
+      reread({
+        invalidateWhenMissing: detail?.state === "cleared",
+        forceInvalidate: detail?.state === "cleared",
+        allowRevalidate: detail?.state === "present",
+      });
+    };
+    const ssoLogoutStateHandler = (event: Event) => {
+      const detail = (event as CustomEvent<SsoLogoutStateChangeDetail>).detail;
+      reread({
+        forceInvalidate: detail?.state === "logged_out",
+        allowRevalidate: detail?.state === "cleared",
+      });
+    };
+    reread({ allowRevalidate: true });
+    window.addEventListener("storage", storageHandler);
+    window.addEventListener("steward-token-sync", tokenSyncHandler);
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, sessionChangeHandler);
+    window.addEventListener(SSO_LOGOUT_STATE_EVENT, ssoLogoutStateHandler);
+    const timer = setTimeout(() => reread({ allowRevalidate: true }), 250);
     return () => {
-      window.removeEventListener("storage", handler);
-      window.removeEventListener("steward-token-sync", handler);
+      window.removeEventListener("storage", storageHandler);
+      window.removeEventListener("steward-token-sync", tokenSyncHandler);
+      window.removeEventListener(
+        STEWARD_SESSION_CHANGE_EVENT,
+        sessionChangeHandler,
+      );
+      window.removeEventListener(SSO_LOGOUT_STATE_EVENT, ssoLogoutStateHandler);
       clearTimeout(timer);
     };
   }, []);
 
-  const providerUser: StewardSessionUser = providerAuth.user
-    ? {
-        id: providerAuth.user.id,
-        email: providerAuth.user.email ?? "",
-        walletAddress: providerAuth.user.walletAddress,
-      }
-    : null;
+  const providerUser: StewardSessionUser =
+    !stewardSessionInvalidated &&
+    providerAuth.user &&
+    (!storageUser || providerAuth.user.id === storageUser.id)
+      ? {
+          id: providerAuth.user.id,
+          email: providerAuth.user.email ?? "",
+          walletAddress: providerAuth.user.walletAddress,
+        }
+      : null;
 
-  const user = providerUser ?? storageUser ?? apiKeyUser ?? testUser;
+  const activeStorageUser = stewardSessionInvalidated ? null : storageUser;
+  const user = providerUser ?? activeStorageUser ?? apiKeyUser ?? testUser;
   const authenticated =
-    providerAuth.isAuthenticated ||
-    storageUser !== null ||
+    (!stewardSessionInvalidated &&
+      (providerAuth.isAuthenticated || storageUser !== null)) ||
     apiKeyUser !== null ||
     testUser !== null;
   const ready = !providerAuth.isLoading || isPlaywrightTestAuthEnabled();

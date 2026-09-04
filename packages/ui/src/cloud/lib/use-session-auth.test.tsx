@@ -10,6 +10,10 @@
  * bypass, source precedence, and the re-read listeners.
  */
 
+import {
+  STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_TOKEN_KEY,
+} from "@elizaos/shared/steward-session-client";
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -149,7 +153,7 @@ describe("useSessionAuth", () => {
       expect(result.current.user?.walletAddress).toBeUndefined();
     });
 
-    it("the provider session outranks a persisted localStorage JWT", () => {
+    it("the canonical persisted identity outranks a mismatched SDK snapshot", () => {
       storage.setItem(
         "steward_session_token",
         makeJwt({ userId: "jwt_user", exp: FUTURE_EXP }),
@@ -163,7 +167,7 @@ describe("useSessionAuth", () => {
         }),
       );
 
-      expect(result.current.user?.id).toBe("provider_user");
+      expect(result.current.user?.id).toBe("jwt_user");
     });
 
     it("is not ready while the provider is still loading", () => {
@@ -297,6 +301,139 @@ describe("useSessionAuth", () => {
 
       expect(result.current.authenticated).toBe(false);
       expect(result.current.user).toBeNull();
+    });
+
+    it("does not let a stale provider snapshot survive cross-tab token removal", () => {
+      const token = makeJwt({ userId: "u1", exp: FUTURE_EXP });
+      storage.setItem(STEWARD_TOKEN_KEY, token);
+      const { result } = renderSessionAuth(
+        makeProviderAuth({
+          isAuthenticated: true,
+          isLoading: false,
+          user: { id: "provider_user" },
+        }),
+      );
+      expect(result.current.authenticated).toBe(true);
+
+      storage.removeItem(STEWARD_TOKEN_KEY);
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent("storage", {
+            key: STEWARD_TOKEN_KEY,
+            oldValue: token,
+            newValue: null,
+          }),
+        );
+      });
+
+      expect(result.current.authenticated).toBe(false);
+      expect(result.current.user).toBeNull();
+    });
+
+    it("honors the canonical same-tab cleared transition immediately", () => {
+      const token = makeJwt({ userId: "u1", exp: FUTURE_EXP });
+      storage.setItem(STEWARD_TOKEN_KEY, token);
+      const { result } = renderSessionAuth(
+        makeProviderAuth({
+          isAuthenticated: true,
+          isLoading: false,
+          user: { id: "provider_user" },
+        }),
+      );
+
+      storage.removeItem(STEWARD_TOKEN_KEY);
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent(STEWARD_SESSION_CHANGE_EVENT, {
+            detail: { state: "cleared", sessionEpoch: 1 },
+          }),
+        );
+      });
+
+      expect(result.current.authenticated).toBe(false);
+      expect(result.current.user).toBeNull();
+    });
+
+    it("switches from stale provider A to canonical storage B", () => {
+      const tokenA = makeJwt({ userId: "account_a", exp: FUTURE_EXP });
+      const tokenB = makeJwt({ userId: "account_b", exp: FUTURE_EXP });
+      storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+      const { result } = renderSessionAuth(
+        makeProviderAuth({
+          isAuthenticated: true,
+          isLoading: false,
+          user: { id: "account_a", email: "a@example.com" },
+        }),
+      );
+      expect(result.current.user?.id).toBe("account_a");
+
+      storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent("storage", {
+            key: STEWARD_TOKEN_KEY,
+            oldValue: tokenA,
+            newValue: tokenB,
+          }),
+        );
+      });
+
+      expect(result.current.authenticated).toBe(true);
+      expect(result.current.user?.id).toBe("account_b");
+    });
+
+    it("invalidates retained bearer and provider state when logout generation advances", () => {
+      const token = makeJwt({ userId: "account_a", exp: FUTURE_EXP });
+      storage.setItem(STEWARD_TOKEN_KEY, token);
+      const { result } = renderSessionAuth(
+        makeProviderAuth({
+          isAuthenticated: true,
+          isLoading: false,
+          user: { id: "account_a" },
+        }),
+      );
+
+      storage.setItem("eliza_sso_logout_generation", "logout-generation-2");
+      act(() => {
+        window.dispatchEvent(
+          new StorageEvent("storage", {
+            key: "eliza_sso_logout_generation",
+            newValue: "logout-generation-2",
+          }),
+        );
+      });
+
+      expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+      expect(result.current.authenticated).toBe(false);
+      expect(result.current.user).toBeNull();
+    });
+
+    it("honors same-tab logout and explicit-login state events with a retained token", () => {
+      storage.setItem(
+        STEWARD_TOKEN_KEY,
+        makeJwt({ userId: "account_a", exp: FUTURE_EXP }),
+      );
+      const { result } = renderSessionAuth();
+      expect(result.current.authenticated).toBe(true);
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent("eliza:sso-logout-state", {
+            detail: { state: "logged_out" },
+          }),
+        );
+      });
+      expect(result.current.authenticated).toBe(false);
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent("eliza:sso-logout-state", {
+            detail: { state: "cleared" },
+          }),
+        );
+      });
+      expect(result.current.authenticated).toBe(true);
+      expect(result.current.user?.id).toBe("account_a");
     });
   });
 

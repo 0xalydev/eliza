@@ -36,6 +36,8 @@ import { clearStaleStewardSession } from "./StewardProviderShared";
 const stewardAuthState = vi.hoisted(() => ({
   isAuthenticated: false,
   user: null as { id: string } | null,
+  session: null as { token: string } | null,
+  signOut: vi.fn(),
 }));
 
 vi.mock("@stwd/react", () => ({
@@ -44,8 +46,8 @@ vi.mock("@stwd/react", () => ({
     isAuthenticated: stewardAuthState.isAuthenticated,
     isLoading: false,
     user: stewardAuthState.user,
-    session: null,
-    signOut: () => {},
+    session: stewardAuthState.session,
+    signOut: stewardAuthState.signOut,
     getToken: () => "",
     verifyEmailCallback: async () => ({ token: "" }),
   }),
@@ -143,6 +145,8 @@ beforeEach(() => {
   calls = [];
   stewardAuthState.isAuthenticated = false;
   stewardAuthState.user = null;
+  stewardAuthState.session = null;
+  stewardAuthState.signOut.mockReset();
   storage = createMemoryStorage();
   vi.stubGlobal("localStorage", storage);
   Object.defineProperty(window, "localStorage", {
@@ -386,6 +390,236 @@ describe("AuthTokenSync", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(postsTo("steward-session")).toHaveLength(1);
+  });
+
+  it("retires stale SDK auth when another tab removes the canonical token", async () => {
+    const token = makeJwt({
+      sub: "u1",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    stewardAuthState.isAuthenticated = true;
+    stewardAuthState.user = { id: "u1" };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+        });
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+    await waitFor(() => expect(postsTo("steward-session")).toHaveLength(1));
+
+    storage.removeItem(STEWARD_TOKEN_KEY);
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: STEWARD_TOKEN_KEY,
+          oldValue: token,
+          newValue: null,
+        }),
+      );
+    });
+
+    expect(stewardAuthState.signOut).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires SDK account A when canonical storage already belongs to B", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      tenantId: "tenant-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      tenantId: "tenant-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    stewardAuthState.isAuthenticated = true;
+    stewardAuthState.user = null;
+    stewardAuthState.session = { token: tokenA };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+        });
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+
+    await waitFor(() => expect(postsTo("steward-session")).toHaveLength(1));
+    expect(stewardAuthState.signOut).toHaveBeenCalledTimes(1);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+  });
+
+  it("keeps matching SDK auth when its tenant claim uses snake_case", async () => {
+    const token = makeJwt({
+      sub: "account-a",
+      tenant_id: "tenant-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    stewardAuthState.isAuthenticated = true;
+    stewardAuthState.user = null;
+    stewardAuthState.session = { token };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+        });
+        return Response.json({ ok: true });
+      }),
+    );
+
+    mount();
+
+    await waitFor(() => expect(postsTo("steward-session")).toHaveLength(1));
+    expect(stewardAuthState.signOut).not.toHaveBeenCalled();
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+  });
+
+  it("suppresses a retained bearer when a logout marker is already active", async () => {
+    const token = makeJwt({
+      sub: "u1",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, token);
+    storage.setItem("eliza_sso_logged_out", "1");
+    stewardAuthState.isAuthenticated = true;
+    stewardAuthState.user = { id: "u1" };
+    stewardAuthState.session = { token };
+
+    mount();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(stewardAuthState.signOut).toHaveBeenCalledTimes(1);
+    expect(postsTo("steward-session")).toHaveLength(0);
+    expect(postsTo("steward-refresh")).toHaveLength(0);
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(token);
+  });
+
+  it("bounds an authenticated SDK snapshot that never gains a canonical token", async () => {
+    vi.useFakeTimers();
+    stewardAuthState.isAuthenticated = true;
+    stewardAuthState.user = { id: "orphan-sdk-user" };
+
+    try {
+      mount();
+      await vi.advanceTimersByTimeAsync(9_999);
+      expect(stewardAuthState.signOut).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(stewardAuthState.signOut).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a delayed refresh for A overwrite canonical account B", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 60,
+    });
+    const rotatedA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    let resolveRefresh: (response: Response) => void = () => {};
+    const refreshResponse = new Promise<Response>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, method: init?.method ?? "GET" });
+        if (url.includes("steward-refresh")) return refreshResponse;
+        return Promise.resolve(Response.json({ ok: true }));
+      }),
+    );
+
+    mount();
+    await waitFor(() => expect(postsTo("steward-refresh")).toHaveLength(1));
+    storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: STEWARD_TOKEN_KEY,
+          oldValue: tokenA,
+          newValue: tokenB,
+        }),
+      );
+    });
+    resolveRefresh(Response.json({ token: rotatedA }));
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+  });
+
+  it("does not let a delayed session_ended response for A clear B", async () => {
+    const tokenA = makeJwt({
+      sub: "account-a",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const tokenB = makeJwt({
+      sub: "account-b",
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    });
+    storage.setItem(STEWARD_TOKEN_KEY, tokenA);
+    let resolveSessionA: (response: Response) => void = () => {};
+    const sessionAResponse = new Promise<Response>((resolve) => {
+      resolveSessionA = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        calls.push({ url, method: init?.method ?? "GET" });
+        if (url.includes("steward-session")) {
+          const body = JSON.parse(String(init?.body)) as { token?: string };
+          if (body.token === tokenA) return sessionAResponse;
+        }
+        return Promise.resolve(Response.json({ ok: true }));
+      }),
+    );
+
+    mount();
+    await waitFor(() => expect(postsTo("steward-session")).toHaveLength(1));
+    storage.setItem(STEWARD_TOKEN_KEY, tokenB);
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: STEWARD_TOKEN_KEY,
+          oldValue: tokenA,
+          newValue: tokenB,
+        }),
+      );
+    });
+    resolveSessionA(
+      Response.json(
+        { error: "Session was signed out", code: "session_ended" },
+        { status: 401 },
+      ),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(storage.getItem(STEWARD_TOKEN_KEY)).toBe(tokenB);
+    expect(storage.getItem("eliza_sso_logged_out")).toBeNull();
   });
 
   it("never carries a pending Telegram account claim through the passive token sync", async () => {

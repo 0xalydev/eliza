@@ -18,6 +18,11 @@ import {
   formatUSD,
 } from "@elizaos/cloud-sdk/browser-contracts";
 import { BRAND_PATHS, LOGO_FILES } from "@elizaos/shared/brand";
+import {
+  STEWARD_SESSION_CHANGE_EVENT,
+  STEWARD_TOKEN_KEY,
+  type StewardSessionChangeDetail,
+} from "@elizaos/shared/steward-session-client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Navigate } from "react-router-dom";
 import { client } from "../../api";
@@ -36,6 +41,7 @@ import { publishPersonalEntryHandoff } from "../app-mode/use-personal-entry";
 import { useCloudT } from "../shell/CloudI18nProvider";
 import {
   buildSsoBridgeErrorUrl,
+  isSsoLoggedOut,
   redirectToSsoBridge,
   shouldAutoBridgeToSso,
 } from "../sso-bridge/sso-bridge";
@@ -66,6 +72,55 @@ interface PendingDedicatedAdoptionDecision {
   onAbort?: () => void;
 }
 
+const SSO_LOGOUT_GENERATION_STORAGE_KEY = "eliza_sso_logout_generation";
+
+type LogoutGenerationSnapshot =
+  | { readable: true; value: string | null }
+  | { readable: false };
+
+interface ActiveJoinAttempt {
+  authToken: string;
+  controller: AbortController;
+  logoutGeneration: LogoutGenerationSnapshot;
+  promise: Promise<void> | null;
+}
+
+function readLogoutGeneration(): LogoutGenerationSnapshot {
+  if (typeof window === "undefined") return { readable: false };
+  try {
+    return {
+      readable: true,
+      value: window.localStorage.getItem(SSO_LOGOUT_GENERATION_STORAGE_KEY),
+    };
+  } catch {
+    // error-policy:J4 logout coordination is an authority input. If it cannot
+    // be read, a captured bearer cannot safely authorize Dedicated adoption.
+    return { readable: false };
+  }
+}
+
+function readCurrentJoinAuthToken(): string | null {
+  try {
+    return resolveJoinAuthToken();
+  } catch {
+    // error-policy:J4 an unreadable canonical token is unauthenticated.
+    return null;
+  }
+}
+
+function activeJoinAuthorityIsCurrent(attempt: ActiveJoinAttempt): boolean {
+  if (attempt.controller.signal.aborted || !attempt.logoutGeneration.readable) {
+    return false;
+  }
+  const currentGeneration = readLogoutGeneration();
+  return (
+    currentGeneration.readable &&
+    currentGeneration.value === attempt.logoutGeneration.value &&
+    readCurrentJoinAuthToken() === attempt.authToken &&
+    !isSsoLoggedOut()
+  );
+}
+
 function describeJoinError(err: unknown): string {
   if (
     err instanceof Error &&
@@ -92,6 +147,8 @@ export default function JoinPage(): React.JSX.Element {
     useState<DedicatedAdoptionReview | null>(null);
   const pendingAdoptionDecisionRef =
     useRef<PendingDedicatedAdoptionDecision | null>(null);
+  const authInvalidatedRef = useRef(false);
+  const [authInvalidated, setAuthInvalidated] = useState(false);
   const appHandoff =
     typeof window === "undefined"
       ? null
@@ -101,10 +158,8 @@ export default function JoinPage(): React.JSX.Element {
   const [ssoBridgeFailed, setSsoBridgeFailed] = useState(false);
   // Guard so React StrictMode's double-mount does not duplicate identity reads.
   const startedRef = useRef(false);
-  const activeAttemptRef = useRef<{
-    controller: AbortController;
-    promise: Promise<void>;
-  } | null>(null);
+  const activeAttemptRef = useRef<ActiveJoinAttempt | null>(null);
+  const entryLogoutGenerationRef = useRef(readLogoutGeneration());
 
   const settleDedicatedAdoption = useCallback(
     (
@@ -125,10 +180,28 @@ export default function JoinPage(): React.JSX.Element {
     [],
   );
 
+  const invalidateActiveJoin = useCallback(() => {
+    authInvalidatedRef.current = true;
+    setAuthInvalidated(true);
+    activeAttemptRef.current?.controller.abort(
+      new DOMException("Join session authority changed", "AbortError"),
+    );
+    settleDedicatedAdoption(null);
+  }, [settleDedicatedAdoption]);
+
   const requestDedicatedAdoptionConfirmation =
     useCallback<DedicatedAdoptionConfirmationRequester>(
       (quote, context) => {
         if (context.signal?.aborted) return Promise.resolve(null);
+        const activeAttempt = activeAttemptRef.current;
+        if (
+          authInvalidatedRef.current ||
+          !activeAttempt ||
+          !activeJoinAuthorityIsCurrent(activeAttempt)
+        ) {
+          invalidateActiveJoin();
+          return Promise.resolve(null);
+        }
         // A replacement request can only follow a settled quote, but fail
         // closed if a future caller violates that ordering.
         settleDedicatedAdoption(null);
@@ -150,13 +223,18 @@ export default function JoinPage(): React.JSX.Element {
           setAdoptionReview({ quote, reason: context.reason });
         });
       },
-      [settleDedicatedAdoption],
+      [invalidateActiveJoin, settleDedicatedAdoption],
     );
 
   const start = useCallback(async () => {
-    const authToken = resolveJoinAuthToken();
+    const authToken = readCurrentJoinAuthToken();
     if (!authToken) {
       // No session — the auth gate below redirects to login; bail quietly.
+      return;
+    }
+    const logoutGeneration = readLogoutGeneration();
+    if (!logoutGeneration.readable || isSsoLoggedOut()) {
+      invalidateActiveJoin();
       return;
     }
     setPhase("connecting");
@@ -166,6 +244,13 @@ export default function JoinPage(): React.JSX.Element {
       new DOMException("Join attempt superseded", "AbortError"),
     );
     const controller = new AbortController();
+    const activeAttempt: ActiveJoinAttempt = {
+      authToken,
+      controller,
+      logoutGeneration,
+      promise: null,
+    };
+    activeAttemptRef.current = activeAttempt;
     const attempt = (async () => {
       try {
         const result = await runJoinFlow({
@@ -177,12 +262,17 @@ export default function JoinPage(): React.JSX.Element {
           cloudApiBase: resolveJoinCloudApiBase(),
           authToken,
           signal: controller.signal,
+          isAuthCurrent: () => activeJoinAuthorityIsCurrent(activeAttempt),
           requestDedicatedAdoptionConfirmation,
           onProgress: (_status, progressDetail) => {
             if (progressDetail) setDetail(progressDetail);
           },
         });
         controller.signal.throwIfAborted();
+        if (!activeJoinAuthorityIsCurrent(activeAttempt)) {
+          invalidateActiveJoin();
+          return;
+        }
         publishPersonalEntryHandoff(authToken, result);
         setPhase("ready");
         // The flow has configured the in-memory client and persisted the exact
@@ -194,12 +284,50 @@ export default function JoinPage(): React.JSX.Element {
         setPhase("error");
       }
     })();
-    activeAttemptRef.current = { controller, promise: attempt };
+    activeAttempt.promise = attempt;
     await attempt;
     if (activeAttemptRef.current?.controller === controller) {
       activeAttemptRef.current = null;
     }
-  }, [requestDedicatedAdoptionConfirmation, settleDedicatedAdoption]);
+  }, [
+    invalidateActiveJoin,
+    requestDedicatedAdoptionConfirmation,
+    settleDedicatedAdoption,
+  ]);
+
+  useEffect(() => {
+    const sessionChangeHandler = (event: Event) => {
+      const detail = (event as CustomEvent<StewardSessionChangeDetail>).detail;
+      if (detail?.state === "cleared") invalidateActiveJoin();
+    };
+    const storageHandler = (event: StorageEvent) => {
+      if (
+        event.key !== null &&
+        event.key !== STEWARD_TOKEN_KEY &&
+        event.key !== SSO_LOGOUT_GENERATION_STORAGE_KEY
+      ) {
+        return;
+      }
+      const activeAttempt = activeAttemptRef.current;
+      if (activeAttempt && !activeJoinAuthorityIsCurrent(activeAttempt)) {
+        invalidateActiveJoin();
+        return;
+      }
+      if (!readCurrentJoinAuthToken()) {
+        invalidateActiveJoin();
+      }
+    };
+
+    window.addEventListener(STEWARD_SESSION_CHANGE_EVENT, sessionChangeHandler);
+    window.addEventListener("storage", storageHandler);
+    return () => {
+      window.removeEventListener(
+        STEWARD_SESSION_CHANGE_EVENT,
+        sessionChangeHandler,
+      );
+      window.removeEventListener("storage", storageHandler);
+    };
+  }, [invalidateActiveJoin]);
 
   useEffect(
     () => () => {
@@ -217,7 +345,10 @@ export default function JoinPage(): React.JSX.Element {
 
   useEffect(() => {
     if (!session.ready) return;
-    if (!session.authenticated) {
+    if (!session.authenticated || authInvalidated) {
+      if (!session.authenticated && !authInvalidated) {
+        invalidateActiveJoin();
+      }
       if (ssoDecisionRef.current) return;
       ssoDecisionRef.current = true;
       if (!shouldAutoBridgeToSso()) {
@@ -241,6 +372,18 @@ export default function JoinPage(): React.JSX.Element {
       return;
     }
     if (appHandoff) {
+      const currentGeneration = readLogoutGeneration();
+      const entryGeneration = entryLogoutGenerationRef.current;
+      if (
+        !readCurrentJoinAuthToken() ||
+        isSsoLoggedOut() ||
+        !entryGeneration.readable ||
+        !currentGeneration.readable ||
+        currentGeneration.value !== entryGeneration.value
+      ) {
+        invalidateActiveJoin();
+        return;
+      }
       // The apex is the billing console and cannot boot chat. Hand off before
       // any Shared identity request. Preserve /join so the app host restores
       // the domain-wide session before opening the same account-native Eliza.
@@ -250,12 +393,38 @@ export default function JoinPage(): React.JSX.Element {
     if (startedRef.current) return;
     startedRef.current = true;
     void start();
-  }, [session.ready, session.authenticated, appHandoff, start]);
+  }, [
+    session.ready,
+    session.authenticated,
+    authInvalidated,
+    appHandoff,
+    invalidateActiveJoin,
+    start,
+  ]);
 
   const handleRetry = useCallback(() => {
     startedRef.current = true;
     void start();
   }, [start]);
+
+  const confirmDedicatedAdoption = useCallback(
+    (quoteId: string) => {
+      const activeAttempt = activeAttemptRef.current;
+      if (
+        authInvalidatedRef.current ||
+        !activeAttempt ||
+        !activeJoinAuthorityIsCurrent(activeAttempt)
+      ) {
+        invalidateActiveJoin();
+        return;
+      }
+      settleDedicatedAdoption({
+        action: "adopt_existing_dedicated",
+        quoteId,
+      });
+    },
+    [invalidateActiveJoin, settleDedicatedAdoption],
+  );
 
   const handleSignOut = useCallback(async () => {
     if (signingOut) return;
@@ -299,12 +468,14 @@ export default function JoinPage(): React.JSX.Element {
   );
 
   // Signed out → send to login, returning here once authenticated.
-  if (session.ready && !session.authenticated && ssoBridgeFailed) {
+  const authenticated = session.authenticated && !authInvalidated;
+
+  if (session.ready && !authenticated && ssoBridgeFailed) {
     return (
       <Navigate to={buildSsoBridgeErrorUrl("auth_failed", "/join")} replace />
     );
   }
-  if (session.ready && !session.authenticated && ssoBridging === false) {
+  if (session.ready && !authenticated && ssoBridging === false) {
     return <Navigate to="/login?returnTo=/join" replace />;
   }
 
@@ -449,10 +620,7 @@ export default function JoinPage(): React.JSX.Element {
                 type="button"
                 data-testid="dedicated-adoption-confirm"
                 onClick={() =>
-                  settleDedicatedAdoption({
-                    action: "adopt_existing_dedicated",
-                    quoteId: adoptionReview.quote.quoteId,
-                  })
+                  confirmDedicatedAdoption(adoptionReview.quote.quoteId)
                 }
               >
                 {adoptionReview.quote.startsCompute

@@ -37,6 +37,7 @@ vi.mock("../shell/CloudI18nProvider", () => ({
 }));
 vi.mock("../sso-bridge/sso-bridge", () => ({
   clearSsoLoggedOut: vi.fn(),
+  isSsoLoggedOut: vi.fn(() => false),
   redirectToSsoBridge: vi.fn(() => Promise.resolve(false)),
   shouldAutoBridgeToSso: vi.fn(() => false),
   signOutFromSsoBridgedHost: signOutMock,

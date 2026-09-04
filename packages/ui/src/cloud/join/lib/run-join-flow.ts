@@ -14,6 +14,7 @@ export interface JoinFlowClient {
     cloudApiBase: string;
     authToken: string;
     signal?: AbortSignal;
+    isAuthCurrent?: () => boolean;
     onProgress?: (status: string, detail?: string) => void;
     requestDedicatedAdoptionConfirmation?: DedicatedAdoptionConfirmationRequester;
   }): Promise<{
@@ -49,6 +50,7 @@ export interface RunJoinFlowArgs {
   authToken: string;
   onProgress?: (status: string, detail?: string) => void;
   signal?: AbortSignal;
+  isAuthCurrent?: () => boolean;
   requestDedicatedAdoptionConfirmation?: DedicatedAdoptionConfirmationRequester;
 }
 
@@ -72,6 +74,7 @@ export async function runJoinFlow(
     authToken,
     onProgress,
     signal,
+    isAuthCurrent,
     requestDedicatedAdoptionConfirmation,
   } = args;
   signal?.throwIfAborted();
@@ -82,11 +85,18 @@ export async function runJoinFlow(
     authToken,
     ...(onProgress ? { onProgress } : {}),
     ...(signal ? { signal } : {}),
+    ...(isAuthCurrent ? { isAuthCurrent } : {}),
     ...(requestDedicatedAdoptionConfirmation
       ? { requestDedicatedAdoptionConfirmation }
       : {}),
   });
   signal?.throwIfAborted();
+  if (isAuthCurrent && !isAuthCurrent()) {
+    throw new DOMException(
+      "The signed-in session authority changed",
+      "AbortError",
+    );
+  }
 
   onProgress?.("connecting", "Connecting to your Dedicated agent…");
 

@@ -7,10 +7,13 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 const getCurrentUserMock = mock(
-  async (): Promise<{ id: string; organization_id: string } | null> => null,
+  async (
+    _context?: unknown,
+    _stewardTokenOverride?: string,
+  ): Promise<{ id: string; organization_id: string } | null> => null,
 );
-const readStewardSessionTokenMock = mock((): string | null => null);
 const endAllUserSessionsMock = mock(async () => undefined);
+const invalidateSessionCachesMock = mock(async (_token: string) => undefined);
 type StewardVerificationResult =
   | {
       kind: "valid";
@@ -19,7 +22,10 @@ type StewardVerificationResult =
   | { kind: "invalid" }
   | { kind: "unavailable"; error: unknown };
 const verifyStewardTokenWithResultMock = mock(
-  async (): Promise<StewardVerificationResult> => ({
+  async (
+    _env: unknown,
+    _token: string,
+  ): Promise<StewardVerificationResult> => ({
     kind: "valid",
     claims: {
       userId: "steward-1",
@@ -31,12 +37,11 @@ const revokeInferenceSessionsThroughMock = mock(async () => undefined);
 const markSsoBridgeLogoutMock = mock(async () => undefined);
 
 mock.module("@/lib/auth", () => ({
-  invalidateSessionCaches: mock(async () => undefined),
+  invalidateSessionCaches: invalidateSessionCachesMock,
 }));
 
 mock.module("@/lib/auth/workers-hono-auth", () => ({
   getCurrentUser: getCurrentUserMock,
-  readStewardSessionToken: readStewardSessionTokenMock,
 }));
 mock.module("@/lib/auth/steward-client", () => ({
   verifyStewardTokenWithResult: verifyStewardTokenWithResultMock,
@@ -87,7 +92,8 @@ function deletedCookieNames(res: Response): string[] {
 
 beforeEach(() => {
   getCurrentUserMock.mockResolvedValue(null);
-  readStewardSessionTokenMock.mockReturnValue(null);
+  invalidateSessionCachesMock.mockClear();
+  invalidateSessionCachesMock.mockResolvedValue(undefined);
   verifyStewardTokenWithResultMock.mockClear();
   verifyStewardTokenWithResultMock.mockResolvedValue({
     kind: "valid",
@@ -103,8 +109,6 @@ beforeEach(() => {
 
 describe("POST /api/auth/logout cookie clearing", () => {
   test("stamps logout authority for a bearer-authenticated hosted session", async () => {
-    readStewardSessionTokenMock.mockReturnValue("header.payload.signature");
-
     const res = await app.request(
       "/",
       {
@@ -135,7 +139,6 @@ describe("POST /api/auth/logout cookie clearing", () => {
   });
 
   test("strong rollout commits the session cutoff before reporting logout success", async () => {
-    readStewardSessionTokenMock.mockReturnValue("prod-token");
     getCurrentUserMock.mockResolvedValue({
       id: "user-1",
       organization_id: "org-1",
@@ -169,7 +172,6 @@ describe("POST /api/auth/logout cookie clearing", () => {
   });
 
   test("strong rollout preserves retry credentials when the cutoff is unconfirmed", async () => {
-    readStewardSessionTokenMock.mockReturnValue("prod-token");
     getCurrentUserMock.mockResolvedValue({
       id: "user-1",
       organization_id: "org-1",
@@ -204,7 +206,6 @@ describe("POST /api/auth/logout cookie clearing", () => {
   });
 
   test("preserves retry credentials when the cross-host logout marker is unconfirmed", async () => {
-    readStewardSessionTokenMock.mockReturnValue("prod-token");
     markSsoBridgeLogoutMock.mockRejectedValue(new Error("marker unavailable"));
 
     const res = await app.request(
@@ -230,7 +231,6 @@ describe("POST /api/auth/logout cookie clearing", () => {
   });
 
   test("preserves retry authority when token verification is unavailable", async () => {
-    readStewardSessionTokenMock.mockReturnValue("prod-token");
     verifyStewardTokenWithResultMock.mockResolvedValue({
       kind: "unavailable",
       error: new Error("verifier unavailable"),
@@ -254,8 +254,44 @@ describe("POST /api/auth/logout cookie clearing", () => {
     expect(deletedCookieNames(res)).toEqual([]);
   });
 
+  test("preserves all authority when one of two credential verifications is unavailable", async () => {
+    verifyStewardTokenWithResultMock.mockImplementation(
+      async (
+        _env: unknown,
+        token: string,
+      ): Promise<StewardVerificationResult> =>
+        token === "valid.bearer.jwt"
+          ? {
+              kind: "valid",
+              claims: { userId: "same-user", issuedAt: 100 },
+            }
+          : {
+              kind: "unavailable",
+              error: new Error("cookie verifier unavailable"),
+            },
+    );
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer valid.bearer.jwt",
+          cookie: "steward-token=cookie-token",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(invalidateSessionCachesMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
   test("never claims a cross-host barrier for an invalid credential", async () => {
-    readStewardSessionTokenMock.mockReturnValue("invalid-token");
     verifyStewardTokenWithResultMock.mockResolvedValue({ kind: "invalid" });
 
     const res = await app.request(
@@ -281,6 +317,288 @@ describe("POST /api/auth/logout cookie clearing", () => {
     });
     expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
     expect(deletedCookieNames(res)).toContain("steward-token");
+  });
+
+  test("preserves a refresh-only session instead of falsely proving it absent", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          cookie: "steward-refresh-token=live-refresh",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect((await res.json()) as unknown).toEqual({
+      error: "Logout revocation is temporarily unavailable",
+      code: "logout_revocation_unavailable",
+    });
+    expect(verifyStewardTokenWithResultMock).not.toHaveBeenCalled();
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("preserves a staging-scoped refresh-only session", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api-staging.elizacloud.ai",
+          origin: "https://staging.eliza.app",
+          cookie: "steward-refresh-token-staging=live-staging-refresh",
+        },
+      },
+      { ENVIRONMENT: "staging", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(verifyStewardTokenWithResultMock).not.toHaveBeenCalled();
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("preserves refresh authority when the accompanying access token is invalid", async () => {
+    verifyStewardTokenWithResultMock.mockResolvedValue({ kind: "invalid" });
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          cookie:
+            "steward-token=expired-token; steward-refresh-token=live-refresh",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("a valid bearer cannot prove the lineage of a refresh-only cookie", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer valid.bearer.jwt",
+          cookie: "steward-refresh-token=unknown-lineage-refresh",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(invalidateSessionCachesMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("a valid bearer cannot mask an invalid access cookie beside refresh authority", async () => {
+    verifyStewardTokenWithResultMock.mockImplementation(
+      async (
+        _env: unknown,
+        token: string,
+      ): Promise<StewardVerificationResult> =>
+        token === "valid.bearer.jwt"
+          ? {
+              kind: "valid",
+              claims: { userId: "bearer-user", issuedAt: 200 },
+            }
+          : { kind: "invalid" },
+    );
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer valid.bearer.jwt",
+          cookie:
+            "steward-token=expired-cookie-token; steward-refresh-token=unknown-lineage-refresh",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(invalidateSessionCachesMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("a stale bearer cannot mask a valid scoped access cookie", async () => {
+    getCurrentUserMock.mockResolvedValue({
+      id: "user-cookie",
+      organization_id: "org-cookie",
+    });
+    revokeInferenceSessionsThroughMock.mockClear();
+    verifyStewardTokenWithResultMock.mockImplementation(
+      async (
+        _env: unknown,
+        token: string,
+      ): Promise<StewardVerificationResult> =>
+        token === "stale.bearer.jwt"
+          ? { kind: "invalid" }
+          : {
+              kind: "valid",
+              claims: { userId: "cookie-user", issuedAt: 200 },
+            },
+    );
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer stale.bearer.jwt",
+          cookie: "steward-token=valid-cookie-token",
+        },
+      },
+      {
+        ENVIRONMENT: "production",
+        NODE_ENV: "production",
+        INFERENCE_STRONG_REVOCATION_ENABLED: "true",
+      },
+    );
+
+    expect(res.status).toBe(200);
+    expect(getCurrentUserMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "valid-cookie-token",
+    );
+    expect(revokeInferenceSessionsThroughMock).toHaveBeenCalledWith(
+      "org-cookie",
+      "user-cookie",
+      200,
+    );
+    expect(markSsoBridgeLogoutMock).toHaveBeenCalledWith("cookie-user");
+    expect(deletedCookieNames(res)).toContain("steward-token");
+  });
+
+  test("conflicting valid bearer and cookie identities fail closed", async () => {
+    verifyStewardTokenWithResultMock.mockImplementation(
+      async (
+        _env: unknown,
+        token: string,
+      ): Promise<StewardVerificationResult> => ({
+        kind: "valid",
+        claims: {
+          userId: token === "first.bearer.jwt" ? "bearer-user" : "cookie-user",
+          issuedAt: 200,
+        },
+      }),
+    );
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer first.bearer.jwt",
+          cookie: "steward-token=valid-cookie-token",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(503);
+    expect(markSsoBridgeLogoutMock).not.toHaveBeenCalled();
+    expect(deletedCookieNames(res)).toEqual([]);
+  });
+
+  test("verifies a duplicated bearer and cookie token only once", async () => {
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer same.token.jwt",
+          cookie: "steward-token=same.token.jwt",
+        },
+      },
+      { ENVIRONMENT: "production", NODE_ENV: "production" },
+    );
+
+    expect(res.status).toBe(200);
+    expect(verifyStewardTokenWithResultMock).toHaveBeenCalledTimes(1);
+    expect(invalidateSessionCachesMock).toHaveBeenCalledTimes(1);
+    expect(invalidateSessionCachesMock).toHaveBeenCalledWith("same.token.jwt");
+  });
+
+  test("uses the newest same-user credential and drains both token caches", async () => {
+    getCurrentUserMock.mockResolvedValue({
+      id: "user-1",
+      organization_id: "org-1",
+    });
+    verifyStewardTokenWithResultMock.mockImplementation(
+      async (
+        _env: unknown,
+        token: string,
+      ): Promise<StewardVerificationResult> => ({
+        kind: "valid",
+        claims: {
+          userId: "same-user",
+          issuedAt: token === "older.bearer.jwt" ? 100 : 200,
+        },
+      }),
+    );
+
+    const res = await app.request(
+      "/",
+      {
+        method: "POST",
+        headers: {
+          host: "api.elizacloud.ai",
+          origin: "https://eliza.app",
+          authorization: "Bearer older.bearer.jwt",
+          cookie: "steward-token=newer-cookie-token",
+        },
+      },
+      {
+        ENVIRONMENT: "production",
+        NODE_ENV: "production",
+        INFERENCE_STRONG_REVOCATION_ENABLED: "true",
+      },
+    );
+
+    expect(res.status).toBe(200);
+    expect(getCurrentUserMock).toHaveBeenCalledWith(
+      expect.anything(),
+      "newer-cookie-token",
+    );
+    expect(revokeInferenceSessionsThroughMock).toHaveBeenCalledWith(
+      "org-1",
+      "user-1",
+      200,
+    );
+    expect(invalidateSessionCachesMock).toHaveBeenCalledTimes(2);
+    expect(invalidateSessionCachesMock).toHaveBeenCalledWith(
+      "older.bearer.jwt",
+    );
+    expect(invalidateSessionCachesMock).toHaveBeenCalledWith(
+      "newer-cookie-token",
+    );
   });
 
   test("staging legacy-only logout does not end production user sessions", async () => {

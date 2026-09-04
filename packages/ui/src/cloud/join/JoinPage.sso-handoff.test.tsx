@@ -138,13 +138,16 @@ describe("JoinPage managed-app SSO handoff", () => {
     expect(replacedUrls).toEqual([]);
   });
 
-  it("does not erase an in-flight logout marker while old auth is still rendered", async () => {
+  it("blocks old rendered auth while a logout marker is already active", async () => {
     authenticatedRef.current = true;
     markSsoLoggedOut();
     runJoinFlowMock.mockResolvedValue({ agentId: "agent-1" });
     render(<JoinPage />);
 
-    await waitFor(() => expect(runJoinFlowMock).toHaveBeenCalledTimes(1));
+    expect((await screen.findByTestId("navigate")).textContent).toBe(
+      "/login?returnTo=/join",
+    );
+    expect(runJoinFlowMock).not.toHaveBeenCalled();
     expect(localStorage.getItem("eliza_sso_logged_out")).toBe("1");
   });
 

@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   consumeStewardServerCookieSynced,
   invalidateStewardServerCookieSyncMarker,
+  invalidateStewardServerCookieSyncMarkerIfOwned,
   markStewardServerCookieSynced,
 } from "./steward-session-cookie-sync-marker";
 
@@ -71,5 +72,16 @@ describe("Steward server-cookie sync marker", () => {
     expect(
       consumeStewardServerCookieSynced("token-a", "/api/auth/steward-session"),
     ).toBe(false);
+  });
+
+  it("preserves a newer token's proof during an obsolete teardown", () => {
+    markStewardServerCookieSynced("token-b", "/api/auth/steward-session");
+
+    expect(invalidateStewardServerCookieSyncMarkerIfOwned("token-a")).toBe(
+      false,
+    );
+    expect(
+      consumeStewardServerCookieSynced("token-b", "/api/auth/steward-session"),
+    ).toBe(true);
   });
 });

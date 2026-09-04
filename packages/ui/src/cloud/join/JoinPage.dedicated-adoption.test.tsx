@@ -1,24 +1,31 @@
 /** Verifies /join exposes the server-owned Dedicated adoption quote before any mutating confirmation. */
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DedicatedAdoptionConfirmationQuote } from "../../api/client-cloud";
 
 const runJoinFlowMock = vi.hoisted(() => vi.fn());
+const joinAuthState = vi.hoisted(() => ({
+  authenticated: true,
+  token: "steward-token" as string | null,
+}));
 
 vi.mock("react-router-dom", () => ({
   Navigate: ({ to }: { to: string }) => <div data-testid="navigate">{to}</div>,
 }));
 vi.mock("./lib/use-join-session", () => ({
-  useJoinSessionAuth: () => ({ ready: true, authenticated: true }),
+  useJoinSessionAuth: () => ({
+    ready: true,
+    authenticated: joinAuthState.authenticated,
+  }),
 }));
 vi.mock("./lib/run-join-flow", () => ({
   runJoinFlow: runJoinFlowMock,
 }));
 vi.mock("./lib/resolve-cloud-connection", () => ({
-  resolveJoinAuthToken: () => "steward-token",
+  resolveJoinAuthToken: () => joinAuthState.token,
   resolveJoinCloudApiBase: () => "https://api.eliza.app",
 }));
 vi.mock("../shell/CloudI18nProvider", () => ({
@@ -67,6 +74,10 @@ const CONNECTED = {
 describe("JoinPage Dedicated adoption consent", () => {
   beforeEach(() => {
     runJoinFlowMock.mockReset();
+    joinAuthState.authenticated = true;
+    joinAuthState.token = "steward-token";
+    window.localStorage.removeItem("eliza_sso_logged_out");
+    window.localStorage.removeItem("eliza_sso_logout_generation");
   });
 
   afterEach(cleanup);
@@ -158,5 +169,108 @@ describe("JoinPage Dedicated adoption consent", () => {
     ).toBeTruthy();
     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
     expect(screen.queryByTestId("navigate")).toBeNull();
+  });
+
+  it("aborts a pending adoption quote when another tab advances logout generation", async () => {
+    let submitted:
+      | { action: "adopt_existing_dedicated"; quoteId: string }
+      | null
+      | undefined;
+    let joinSignal: AbortSignal | undefined;
+    runJoinFlowMock.mockImplementation(
+      async ({ requestDedicatedAdoptionConfirmation, signal }) => {
+        joinSignal = signal;
+        submitted = await requestDedicatedAdoptionConfirmation(QUOTE, {
+          reason: "initial",
+          signal,
+        });
+        if (!submitted)
+          throw new Error("Dedicated adoption was not confirmed.");
+        return CONNECTED;
+      },
+    );
+
+    render(<JoinPage />);
+    await screen.findByRole("button", { name: "Start Dedicated" });
+
+    window.localStorage.setItem(
+      "eliza_sso_logout_generation",
+      "another-tab-logout",
+    );
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "eliza_sso_logout_generation",
+          newValue: "another-tab-logout",
+        }),
+      );
+    });
+
+    await waitFor(() => expect(joinSignal?.aborted).toBe(true));
+    expect(submitted).toBeNull();
+    expect(screen.queryByTestId("dedicated-adoption-confirm")).toBeNull();
+    expect(screen.queryByText("/")).toBeNull();
+  });
+
+  it("aborts a pending adoption quote when rendered auth is lost", async () => {
+    let submitted:
+      | { action: "adopt_existing_dedicated"; quoteId: string }
+      | null
+      | undefined;
+    let joinSignal: AbortSignal | undefined;
+    runJoinFlowMock.mockImplementation(
+      async ({ requestDedicatedAdoptionConfirmation, signal }) => {
+        joinSignal = signal;
+        submitted = await requestDedicatedAdoptionConfirmation(QUOTE, {
+          reason: "initial",
+          signal,
+        });
+        if (!submitted)
+          throw new Error("Dedicated adoption was not confirmed.");
+        return CONNECTED;
+      },
+    );
+
+    const view = render(<JoinPage />);
+    await screen.findByRole("button", { name: "Start Dedicated" });
+
+    joinAuthState.authenticated = false;
+    view.rerender(<JoinPage />);
+
+    await waitFor(() => expect(joinSignal?.aborted).toBe(true));
+    expect(submitted).toBeNull();
+    expect(screen.queryByTestId("dedicated-adoption-confirm")).toBeNull();
+  });
+
+  it("rechecks the canonical bearer before resolving adoption consent", async () => {
+    let submitted:
+      | { action: "adopt_existing_dedicated"; quoteId: string }
+      | null
+      | undefined;
+    runJoinFlowMock.mockImplementation(
+      async ({ requestDedicatedAdoptionConfirmation, signal }) => {
+        submitted = await requestDedicatedAdoptionConfirmation(QUOTE, {
+          reason: "initial",
+          signal,
+        });
+        if (!submitted)
+          throw new Error("Dedicated adoption was not confirmed.");
+        return CONNECTED;
+      },
+    );
+
+    render(<JoinPage />);
+    const confirm = await screen.findByRole("button", {
+      name: "Start Dedicated",
+    });
+
+    // The other tab's storage event may not have been delivered yet. The
+    // click boundary still reads canonical authority synchronously, so the
+    // already-captured bearer can never be submitted after its removal.
+    joinAuthState.token = null;
+    await userEvent.click(confirm);
+
+    await waitFor(() => expect(submitted).toBeNull());
+    expect(screen.queryByTestId("navigate")?.textContent).not.toBe("/");
   });
 });

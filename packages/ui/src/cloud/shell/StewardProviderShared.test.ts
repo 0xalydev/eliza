@@ -52,6 +52,7 @@ function setHostname(hostname: string): void {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
 });
 
@@ -133,6 +134,13 @@ function makeJwt(payload: Record<string, unknown>): string {
       .replace(/\//g, "_")
       .replace(/=+$/, "");
   return `${b64url({ alg: "HS256", typ: "JWT" })}.${b64url(payload)}.sig`;
+}
+
+function cookieClearAcknowledgement(): Response {
+  return new Response(JSON.stringify({ ok: true }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 describe("clearStaleStewardSession", () => {
@@ -272,15 +280,75 @@ describe("clearStaleStewardSession", () => {
       ),
     ).toBe(false);
   });
+
+  it("does not apply a delayed token-A teardown to canonical account B", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+    savePersistedActiveServer({
+      id: "cloud:account-b-agent",
+      kind: "cloud",
+      label: "Account B",
+      apiBase: "https://account-b-agent.eliza.app",
+      accessToken: "account-b-token",
+    });
+    saveAgentProfileRegistry({
+      version: 1,
+      activeProfileId: "account-b-profile",
+      profiles: [
+        {
+          id: "account-b-profile",
+          label: "Account B",
+          kind: "cloud",
+          apiBase: "https://account-b-agent.eliza.app",
+          accessToken: "account-b-token",
+          createdAt: "2026-09-05T00:00:00.000Z",
+        },
+      ],
+    });
+    markStewardServerCookieSynced(
+      "account-b-token",
+      "/api/auth/steward-session",
+    );
+    await clearStaleStewardSession({ expectedToken: "account-a-token" });
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b-token");
+    expect(loadPersistedActiveServer()?.accessToken).toBe("account-b-token");
+    expect(loadAgentProfileRegistry().profiles[0]?.accessToken).toBe(
+      "account-b-token",
+    );
+    expect(
+      consumeStewardServerCookieSynced(
+        "account-b-token",
+        "/api/auth/steward-session",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("clearServerStewardSessionCookies", () => {
+  it("deduplicates relative and absolute forms of a canonical host route", async () => {
+    setHostname("eliza.app");
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async () => cookieClearAcknowledgement());
+
+    await expect(clearServerStewardSessionCookies()).resolves.toEqual({
+      ok: true,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(fetchSpy.mock.calls[0]?.[0])).toBe(
+      "/api/auth/steward-session",
+    );
+  });
+
   it("marks every cookie-clearing DELETE as a non-simple request", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 204 }));
+      .mockImplementation(async () => cookieClearAcknowledgement());
 
-    await clearServerStewardSessionCookies();
+    await expect(clearServerStewardSessionCookies()).resolves.toEqual({
+      ok: true,
+    });
 
     expect(fetchSpy).toHaveBeenCalled();
     for (const [url, init] of fetchSpy.mock.calls) {
@@ -308,7 +376,32 @@ describe("clearServerStewardSessionCookies", () => {
       expect(signals.every((signal) => !signal.aborted)).toBe(true);
 
       await vi.advanceTimersByTimeAsync(25);
-      await expect(cleanup).resolves.toBeUndefined();
+      await expect(cleanup).resolves.toEqual({ ok: false });
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds an unresolved DELETE response body before reporting success", async () => {
+    const signals: AbortSignal[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      if (init?.signal instanceof AbortSignal) signals.push(init.signal);
+      const response = cookieClearAcknowledgement();
+      vi.spyOn(response, "json").mockImplementation(
+        () => new Promise<never>(() => {}),
+      );
+      return response;
+    });
+    vi.useFakeTimers();
+
+    try {
+      const cleanup = clearServerStewardSessionCookies({ timeoutMs: 25 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(signals.length).toBeGreaterThan(0);
+
+      await vi.advanceTimersByTimeAsync(25);
+      await expect(cleanup).resolves.toEqual({ ok: false });
       expect(signals.every((signal) => signal.aborted)).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -331,8 +424,62 @@ describe("clearServerStewardSessionCookies", () => {
     expect(requestSignals.length).toBeGreaterThan(0);
     callerAbort.abort();
 
-    await expect(cleanup).resolves.toBeUndefined();
+    await expect(cleanup).resolves.toEqual({ ok: false });
     expect(requestSignals.every((signal) => signal.aborted)).toBe(true);
+  });
+
+  it("reports non-2xx DELETE responses even when the body claims success", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ ok: true }), {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+
+    await expect(clearServerStewardSessionCookies()).resolves.toEqual({
+      ok: false,
+    });
+  });
+
+  it.each([
+    ["non-JSON", new Response("not-json", { status: 200 })],
+    ["wrong discriminant", new Response(JSON.stringify({ ok: false }))],
+    [
+      "non-exact envelope",
+      new Response(JSON.stringify({ ok: true, ignored: "field" })),
+    ],
+  ])(
+    "reports a 2xx %s DELETE body as unconfirmed",
+    async (_label, response) => {
+      vi.spyOn(globalThis, "fetch").mockImplementation(async () =>
+        response.clone(),
+      );
+
+      await expect(clearServerStewardSessionCookies()).resolves.toEqual({
+        ok: false,
+      });
+    },
+  );
+
+  it("reports a DELETE transport failure as unconfirmed", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(
+      new TypeError("network unavailable"),
+    );
+
+    await expect(clearServerStewardSessionCookies()).resolves.toEqual({
+      ok: false,
+    });
+  });
+
+  it("rejects awaited stale-session cleanup when DELETE is unconfirmed", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), { status: 503 }),
+    );
+
+    await expect(
+      clearStaleStewardSession({ awaitCookieClear: true }),
+    ).rejects.toThrow("session-cookie cleanup was not acknowledged");
   });
 });
 

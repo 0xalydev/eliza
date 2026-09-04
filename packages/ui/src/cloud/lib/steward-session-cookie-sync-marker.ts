@@ -48,6 +48,19 @@ export function invalidateStewardServerCookieSyncMarker(): void {
   pendingServerCookieSync = null;
 }
 
+/**
+ * Retire a proof only when it belongs to the exact token being torn down.
+ * A delayed cleanup for account A must not consume account B's newer proof and
+ * trigger a second passive cookie-planting POST for B.
+ */
+export function invalidateStewardServerCookieSyncMarkerIfOwned(
+  token: string,
+): boolean {
+  if (pendingServerCookieSync?.token !== token) return false;
+  pendingServerCookieSync = null;
+  return true;
+}
+
 export function consumeStewardServerCookieSynced(
   token: string,
   endpoint: string,

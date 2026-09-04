@@ -13,6 +13,8 @@ export interface StewardTokenClaims {
   exp?: number;
   userId?: string;
   sub?: string;
+  tenantId?: string;
+  tenant_id?: string;
   email?: string;
   address?: string;
 }
