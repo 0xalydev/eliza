@@ -142,6 +142,41 @@ describe("restore-v3 candidate seal authority on PGlite", () => {
     expect(JSON.stringify(durableAuthorization.rows)).not.toContain(session.executionToken);
     expect(JSON.stringify(durableAuthorization.rows)).not.toContain(authorization.proofToken);
 
+    const inFlightAbort = new AbortController();
+    const mutableControl = {
+      signal: inFlightAbort.signal,
+      deadlineEpochMs: Date.now() + 60_000,
+    };
+    const cancelledInFlight = sealAgentBackupRestoreV3Candidate(
+      session,
+      receipt,
+      authorization,
+      mutableControl,
+    );
+    mutableControl.signal = new AbortController().signal;
+    mutableControl.deadlineEpochMs += 60_000;
+    inFlightAbort.abort(new Error("synthetic in-flight cancellation"));
+    await expect(cancelledInFlight).rejects.toHaveProperty("name", "AbortError");
+
+    const stillActive = await database.query<{
+      candidate_state: string;
+      authorization_state: string;
+      terminal_count: number;
+    }>(
+      `SELECT candidate.state AS candidate_state, seal_auth.state AS authorization_state,
+      (SELECT count(*)::integer
+       FROM agent_backup_restore_v3_candidate_terminal_commands AS terminal
+       WHERE terminal.candidate_id = candidate.id) AS terminal_count
+      FROM agent_backup_restore_v3_candidates AS candidate
+      JOIN agent_backup_restore_v3_candidate_seal_authorizations AS seal_auth
+        ON seal_auth.candidate_id = candidate.id
+      WHERE candidate.id = $1`,
+      [session.stagingHandle],
+    );
+    expect(stillActive.rows).toEqual([
+      { authorization_state: "active", candidate_state: "active", terminal_count: 0 },
+    ]);
+
     const sealed = await sealAgentBackupRestoreV3Candidate(
       session,
       receipt,
@@ -151,6 +186,12 @@ describe("restore-v3 candidate seal authority on PGlite", () => {
     expect(sealed).toEqual(receipt);
     expect(
       await sealAgentBackupRestoreV3Candidate(session, receipt, authorization, CONTROL),
+    ).toEqual(receipt);
+    expect(
+      await sealAgentBackupRestoreV3Candidate(session, receipt, authorization, {
+        signal: new AbortController().signal,
+        deadlineEpochMs: Date.now() - 1,
+      }),
     ).toEqual(receipt);
     await Bun.sleep(Math.max(1, authorization.expiresAtEpochMs - Date.now() + 25));
     expect(() => authority.authorize(request, CONTROL)).toThrow(

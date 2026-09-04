@@ -13,7 +13,7 @@ import {
   type AgentBackupRestoreV3StagingSession,
   type AgentBackupRestoreV3StreamComponentName,
 } from "@elizaos/shared";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_MAXIMUM_BYTES,
   materializeAgentBackupRestoreV3CandidateCharacter,
@@ -23,6 +23,7 @@ import {
   type AgentBackupRestoreV3CandidateFs,
   openAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
+import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
 import { stageAgentBackupRestoreV3CandidateRecord } from "./agent-backup-restore-v3-candidate-records";
 
 const roots = new Set<string>();
@@ -185,6 +186,42 @@ describe("restore-v3 candidate character materializer", () => {
       { payload: bytes.subarray(0, 7), entry: null },
       { payload: bytes.subarray(7), entry: null },
     ]);
+    const filePath = path.join(
+      attemptRoot,
+      "components",
+      "character",
+      "character.json",
+    );
+    await expect(
+      materializeAgentBackupRestoreV3CandidateCharacter({
+        candidateFs,
+        session: SESSION,
+        receipt,
+        control: operationControl(),
+        testOnlyLifecycle: {
+          afterInboxValidated() {
+            throw new Error("crash after character inbox validation");
+          },
+        },
+      }),
+    ).rejects.toThrow("crash after character inbox validation");
+    await expect(fs.lstat(filePath)).rejects.toMatchObject({ code: "ENOENT" });
+
+    let publishedProof: unknown;
+    await expect(
+      materializeAgentBackupRestoreV3CandidateCharacter({
+        candidateFs,
+        session: SESSION,
+        receipt,
+        control: operationControl(),
+        testOnlyLifecycle: {
+          afterFilePublished(proof) {
+            publishedProof = proof;
+            throw new Error("crash after character file publication");
+          },
+        },
+      }),
+    ).rejects.toThrow("crash after character file publication");
     let lost = true;
     await expect(
       materializeAgentBackupRestoreV3CandidateCharacter({
@@ -208,19 +245,20 @@ describe("restore-v3 candidate character materializer", () => {
       receipt,
       control: operationControl(),
     });
-    const filePath = path.join(
-      attemptRoot,
-      "components",
-      "character",
-      "character.json",
-    );
     expect(await fs.readFile(filePath, "utf8")).toBe(original);
+    expect(replayed.file).toEqual(publishedProof);
     expect(replayed.file.sha256).toBe(
       createHash("sha256").update(bytes).digest("hex"),
     );
     const stats = await fs.stat(filePath, { bigint: true });
     expect(Number(stats.mode & 0o777n)).toBe(0o600);
     expect(stats.mtimeNs).toBe(0n);
+    const { finishSha256, ...finishBody } = replayed;
+    expect(finishSha256).toBe(
+      createHash("sha256")
+        .update(candidateFsCanonicalJson(finishBody), "utf8")
+        .digest("hex"),
+    );
   });
 
   it("fails closed for null, invalid UTF-8, and oversized character bombs without defaults", async () => {
@@ -283,6 +321,69 @@ describe("restore-v3 candidate character materializer", () => {
     ).rejects.toMatchObject({
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_LIMIT",
     });
+  });
+
+  it("rejects accessors and production lifecycle hooks before any durable mutation", async () => {
+    const boundary = await fixture();
+    const bytes = new TextEncoder().encode('{"name":"Boundary"}');
+    const receipt = await stageComponent(boundary.candidateFs, "character", [
+      { payload: bytes, entry: null },
+    ]);
+    let accessorCalls = 0;
+    const accessorInput = {
+      session: SESSION,
+      receipt,
+      control: operationControl(),
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorInput, "candidateFs", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error("character boundary accessor must not run");
+      },
+    });
+    let boundaryFailure: unknown;
+    try {
+      await materializeAgentBackupRestoreV3CandidateCharacter(
+        accessorInput as never,
+      );
+    } catch (cause) {
+      boundaryFailure = cause;
+    }
+    expect(boundaryFailure).toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_INPUT_INVALID",
+    });
+    expect(accessorCalls).toBe(0);
+
+    const production = await fixture();
+    const productionReceipt = await stageComponent(
+      production.candidateFs,
+      "character",
+      [{ payload: bytes, entry: null }],
+    );
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() =>
+        materializeAgentBackupRestoreV3CandidateCharacter({
+          candidateFs: production.candidateFs,
+          session: SESSION,
+          receipt: productionReceipt,
+          control: operationControl(),
+          testOnlyLifecycle: { afterFilePublished: () => undefined },
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_TEST_HOOK_FORBIDDEN",
+        }),
+      );
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
+    await expect(
+      fs.lstat(path.join(production.attemptRoot, "components")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
@@ -807,6 +908,45 @@ describe("restore-v3 candidate file-set materializer", () => {
     });
     expect(proxyTraps).toBe(0);
 
+    const proxiedLimits = new Proxy(
+      { maximumBytes: 1 },
+      {
+        get() {
+          proxyTraps += 1;
+          throw new Error("Limits Proxy trap must not run");
+        },
+      },
+    );
+    await expect(
+      intrinsicCase.candidateFs.createFileTreeFile(
+        "components/media",
+        { path: "limits", sizeBytes: 1, mode: 0o600, mtimeMs: 0 },
+        proxiedLimits,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT_INVALID",
+    });
+    expect(proxyTraps).toBe(0);
+
+    const proxiedExpected = new Proxy([], {
+      get() {
+        proxyTraps += 1;
+        throw new Error("Expected-proof Proxy trap must not run");
+      },
+    });
+    await expect(
+      intrinsicCase.candidateFs.proveFileTree(
+        "components/media",
+        proxiedExpected,
+        undefined,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT",
+    });
+    expect(proxyTraps).toBe(0);
+
     const writer = await intrinsicCase.candidateFs.createFileTreeFile(
       "components/media",
       { path: "iterator", sizeBytes: 1, mode: 0o600, mtimeMs: 0 },
@@ -825,5 +965,414 @@ describe("restore-v3 candidate file-set materializer", () => {
     expect(() => writer.write(fragment, operationControl())).toThrow();
     expect(iteratorCalls).toBe(0);
     await writer.close();
+  });
+
+  it("rejects accessors and production lifecycle hooks before file-set mutation", async () => {
+    const boundary = await fixture();
+    const receipt = await stageComponent(
+      boundary.candidateFs,
+      "media",
+      fileRecords({
+        path: "boundary.txt",
+        bytes: "boundary",
+        mode: 0o600,
+        mtimeMs: 0,
+      }),
+    );
+    let accessorCalls = 0;
+    const accessorInput = {
+      session: SESSION,
+      receipt,
+      control: operationControl(),
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorInput, "candidateFs", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        throw new Error("file-set boundary accessor must not run");
+      },
+    });
+    let boundaryFailure: unknown;
+    try {
+      await materializeAgentBackupRestoreV3CandidateFileSet(
+        accessorInput as never,
+      );
+    } catch (cause) {
+      boundaryFailure = cause;
+    }
+    expect(boundaryFailure).toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
+    });
+    expect(accessorCalls).toBe(0);
+
+    const production = await fixture();
+    const productionReceipt = await stageComponent(
+      production.candidateFs,
+      "media",
+      fileRecords({
+        path: "production.txt",
+        bytes: "production",
+        mode: 0o600,
+        mtimeMs: 0,
+      }),
+    );
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() =>
+        materializeAgentBackupRestoreV3CandidateFileSet({
+          candidateFs: production.candidateFs,
+          session: SESSION,
+          receipt: productionReceipt,
+          control: operationControl(),
+          testOnlyLifecycle: { afterFilePublished: () => undefined },
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_TEST_HOOK_FORBIDDEN",
+        }),
+      );
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
+    await expect(
+      fs.lstat(path.join(production.attemptRoot, "components")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a same-inode rewrite after the file was individually proved", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const control = operationControl();
+    await candidateFs.ensureFileTreeDirectory("components/media", control);
+    const proofs = [];
+    for (const [filePath, contents] of [
+      ["a.txt", "aaaa"],
+      ["b.txt", "bbbb"],
+    ] as const) {
+      const writer = await candidateFs.createFileTreeFile(
+        "components/media",
+        {
+          path: filePath,
+          sizeBytes: contents.length,
+          mode: 0o600,
+          mtimeMs: 0,
+        },
+        undefined,
+        control,
+      );
+      await writer.write(new TextEncoder().encode(contents), control);
+      proofs.push(await writer.finalize(control));
+    }
+    const firstPath = path.join(attemptRoot, "components", "media", "a.txt");
+    const firstBefore = await fs.stat(firstPath, { bigint: true });
+    const probe = await fs.open(firstPath, "r");
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      read: typeof probe.read;
+    };
+    const originalRead = handlePrototype.read;
+    await probe.close();
+    let reads = 0;
+    const readSpy = vi
+      .spyOn(handlePrototype, "read")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.read>
+      ) {
+        const result = await Reflect.apply(originalRead, this, args);
+        reads += 1;
+        if (reads === 2) {
+          writeFileSync(firstPath, "evil");
+          utimesSync(firstPath, new Date(0), new Date(0));
+        }
+        return result;
+      });
+    try {
+      await expect(
+        candidateFs.proveFileTree(
+          "components/media",
+          proofs,
+          undefined,
+          control,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+      });
+    } finally {
+      readSpy.mockRestore();
+    }
+    const firstAfter = await fs.stat(firstPath, { bigint: true });
+    expect(firstAfter.ino).toBe(firstBefore.ino);
+    expect(firstAfter.mtimeNs).toBe(0n);
+    expect(firstAfter.ctimeNs).not.toBe(firstBefore.ctimeNs);
+  });
+
+  it("releases caller lock use even when a proof descriptor close fails", async () => {
+    const { candidateFs } = await fixture();
+    const control = operationControl();
+    await candidateFs.ensureFileTreeDirectory("components/media", control);
+    const writer = await candidateFs.createFileTreeFile(
+      "components/media",
+      { path: "cleanup.txt", sizeBytes: 7, mode: 0o600, mtimeMs: 0 },
+      undefined,
+      control,
+    );
+    await writer.write(new TextEncoder().encode("cleanup"), control);
+    const proof = await writer.finalize(control);
+    const heldLock = await candidateFs.acquireLock(
+      "file-tree-cleanup.lock",
+      control,
+    );
+    const originalOpen = fs.open;
+    let injected = false;
+    const cleanupState: {
+      closeLeakedHandle: (() => Promise<void>) | null;
+    } = { closeLeakedHandle: null };
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await Reflect.apply(originalOpen, fs, args);
+      if (String(args[0]).endsWith(`${path.sep}components${path.sep}media`)) {
+        const exactClose = handle.close;
+        handle.close = async () => {
+          if (!injected) {
+            injected = true;
+            cleanupState.closeLeakedHandle = () =>
+              Reflect.apply(exactClose, handle, []);
+            throw new Error("injected file-tree descriptor close failure");
+          }
+          return Reflect.apply(exactClose, handle, []);
+        };
+      }
+      return handle;
+    });
+    try {
+      await expect(
+        candidateFs.proveFileTree(
+          "components/media",
+          [proof],
+          undefined,
+          control,
+          heldLock,
+        ),
+      ).rejects.toThrow("injected file-tree descriptor close failure");
+    } finally {
+      openSpy.mockRestore();
+      if (cleanupState.closeLeakedHandle) {
+        await cleanupState.closeLeakedHandle();
+      }
+    }
+    expect(injected).toBe(true);
+    const released = await Promise.race([
+      heldLock.release(control).then(() => true),
+      new Promise<false>((resolve) => {
+        setTimeout(() => resolve(false), 2_000);
+      }),
+    ]);
+    expect(released).toBe(true);
+  });
+
+  it("keeps a caller-held lock alive until a blocked file-tree write settles", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const control = operationControl();
+    const heldLock = await candidateFs.acquireLock(
+      "file-tree-write.lock",
+      control,
+    );
+    await candidateFs.ensureFileTreeDirectory(
+      "components/media",
+      control,
+      heldLock,
+    );
+    const writer = await candidateFs.createFileTreeFile(
+      "components/media",
+      { path: "blocked.txt", sizeBytes: 7, mode: 0o600, mtimeMs: 0 },
+      undefined,
+      control,
+      heldLock,
+    );
+    const probe = await fs.open(path.join(attemptRoot, "write-probe"), "w");
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      write: typeof probe.write;
+    };
+    const originalWrite = handlePrototype.write;
+    await probe.close();
+    let enterWrite: () => void = () => undefined;
+    let unblockWrite: () => void = () => undefined;
+    const writeEntered = new Promise<void>((resolve) => {
+      enterWrite = resolve;
+    });
+    const writeGate = new Promise<void>((resolve) => {
+      unblockWrite = resolve;
+    });
+    let intercepted = false;
+    const writeSpy = vi
+      .spyOn(handlePrototype, "write")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.write>
+      ) {
+        if (!intercepted) {
+          intercepted = true;
+          enterWrite();
+          await writeGate;
+        }
+        return Reflect.apply(originalWrite, this, args);
+      });
+    let releaseSettled = false;
+    let releasePromise: Promise<void> | null = null;
+    try {
+      const pendingWrite = writer.write(
+        new TextEncoder().encode("blocked"),
+        control,
+      );
+      await writeEntered;
+      releasePromise = heldLock.release(control).then(() => {
+        releaseSettled = true;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(releaseSettled).toBe(false);
+      unblockWrite();
+      await expect(pendingWrite).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LOCK_INVALID",
+      });
+      await releasePromise;
+      expect(releaseSettled).toBe(true);
+    } finally {
+      unblockWrite();
+      writeSpy.mockRestore();
+      await writer.close();
+      if (releasePromise) await releasePromise;
+      if (!releaseSettled) await heldLock.release(operationControl());
+    }
+  });
+
+  it("keeps materializer plaintext away from poisoned byte-array intrinsics", async () => {
+    const character = await fixture();
+    const characterBytes = new TextEncoder().encode('{"name":"Intrinsic"}');
+    const characterReceipt = await stageComponent(
+      character.candidateFs,
+      "character",
+      [{ payload: characterBytes, entry: null }],
+    );
+    const fileSet = await fixture();
+    const fileSetReceipt = await stageComponent(
+      fileSet.candidateFs,
+      "vault",
+      fileRecords({
+        path: "secret.bin",
+        bytes: new TextEncoder().encode(
+          "file-set-intrinsic-plaintext-sentinel-7f13d0a9",
+        ),
+        mode: 0o600,
+        mtimeMs: 0,
+        splitAt: 23,
+      }),
+    );
+    const descriptors = {
+      fill: Object.getOwnPropertyDescriptor(Uint8Array.prototype, "fill"),
+      set: Object.getOwnPropertyDescriptor(Uint8Array.prototype, "set"),
+      subarray: Object.getOwnPropertyDescriptor(
+        Uint8Array.prototype,
+        "subarray",
+      ),
+    };
+    const fillIntrinsic = Uint8Array.prototype.fill;
+    const setIntrinsic = Uint8Array.prototype.set;
+    const subarrayIntrinsic = Uint8Array.prototype.subarray;
+    const sensitiveSequences = [
+      characterBytes,
+      new TextEncoder().encode(
+        "file-set-intrinsic-plaintext-sentinel-7f13d0a9",
+      ),
+      new TextEncoder().encode("file-set-intrinsic-plai"),
+      new TextEncoder().encode("ntext-sentinel-7f13d0a9"),
+    ];
+    const containsSensitiveBytes = (value: unknown): boolean => {
+      if (!(value instanceof Uint8Array)) return false;
+      for (const sequence of sensitiveSequences) {
+        if (sequence.byteLength > value.byteLength) continue;
+        for (
+          let offset = 0;
+          offset <= value.byteLength - sequence.byteLength;
+          offset += 1
+        ) {
+          let matches = true;
+          for (let index = 0; index < sequence.byteLength; index += 1) {
+            if (value[offset + index] !== sequence[index]) {
+              matches = false;
+              break;
+            }
+          }
+          if (matches) return true;
+        }
+      }
+      return false;
+    };
+    let sensitiveIntrinsicCalls = 0;
+    const observe = (...values: readonly unknown[]): void => {
+      if (values.some(containsSensitiveBytes)) sensitiveIntrinsicCalls += 1;
+    };
+    try {
+      Object.defineProperty(Uint8Array.prototype, "fill", {
+        ...descriptors.fill,
+        value(this: Uint8Array, ...args: readonly unknown[]) {
+          observe(this);
+          return Reflect.apply(fillIntrinsic, this, args);
+        },
+      });
+      Object.defineProperty(Uint8Array.prototype, "set", {
+        ...descriptors.set,
+        value(this: Uint8Array, ...args: readonly unknown[]) {
+          observe(this, args[0]);
+          return Reflect.apply(setIntrinsic, this, args);
+        },
+      });
+      Object.defineProperty(Uint8Array.prototype, "subarray", {
+        ...descriptors.subarray,
+        value(this: Uint8Array, ...args: readonly unknown[]) {
+          observe(this);
+          return Reflect.apply(subarrayIntrinsic, this, args);
+        },
+      });
+      await materializeAgentBackupRestoreV3CandidateCharacter({
+        candidateFs: character.candidateFs,
+        session: SESSION,
+        receipt: characterReceipt,
+        control: operationControl(),
+      });
+      await materializeAgentBackupRestoreV3CandidateFileSet({
+        candidateFs: fileSet.candidateFs,
+        session: SESSION,
+        receipt: fileSetReceipt,
+        control: operationControl(),
+      });
+    } finally {
+      for (const [name, descriptor] of Object.entries(descriptors)) {
+        if (descriptor) {
+          Object.defineProperty(Uint8Array.prototype, name, descriptor);
+        } else {
+          Reflect.deleteProperty(Uint8Array.prototype, name);
+        }
+      }
+    }
+    expect(sensitiveIntrinsicCalls).toBe(0);
+  });
+
+  it("rejects raw invalid UTF-8 names in exact file-tree proofs on Linux", async () => {
+    if (process.platform !== "linux") return;
+    const { candidateFs, attemptRoot } = await fixture();
+    const control = operationControl();
+    await candidateFs.ensureFileTreeDirectory("components/media", control);
+    const root = path.join(attemptRoot, "components", "media");
+    const invalidName = Buffer.concat([
+      Buffer.from(`${root}${path.sep}`),
+      Buffer.from([0xff]),
+    ]);
+    await fs.writeFile(invalidName, "invalid", { flag: "wx", mode: 0o600 });
+    await expect(
+      candidateFs.proveFileTree("components/media", [], undefined, control),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_UNSAFE",
+    });
   });
 });

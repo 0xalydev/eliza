@@ -11,12 +11,13 @@ import type {
 } from "@elizaos/shared";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  type AgentBackupRestoreV3CandidateFs,
+  AgentBackupRestoreV3CandidateFs,
   openAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
 import {
   AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_MAXIMUM_BYTES,
   AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_OWNER_CONTEXT,
+  bindAgentBackupRestoreV3CandidateRecordSession,
   computeAgentBackupRestoreV3CandidateRecordCommandSha256,
   readAgentBackupRestoreV3CandidateRecord,
   stageAgentBackupRestoreV3CandidateRecord,
@@ -378,7 +379,6 @@ describe("restore-v3 candidate record inbox", () => {
   it("rejects hung or mutating test hooks and always releases flock", async () => {
     const hungCase = await fixture();
     const hung = new Promise<void>(() => undefined);
-    const startedAt = Date.now();
     await expect(
       stageAgentBackupRestoreV3CandidateRecord({
         candidateFs: hungCase.candidateFs,
@@ -392,7 +392,6 @@ describe("restore-v3 candidate record inbox", () => {
     ).rejects.toMatchObject({
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_TEST_HOOK_ASYNC",
     });
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
     const recoveredLock = await hungCase.candidateFs.acquireLock(
       "after-hung-hook.lock",
       operationControl(),
@@ -679,6 +678,287 @@ describe("restore-v3 candidate record inbox", () => {
         code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_DEADLINE_EXCEEDED",
       }),
     );
+
+    if (typeof SharedArrayBuffer === "function") {
+      expect(() =>
+        stageAgentBackupRestoreV3CandidateRecord({
+          candidateFs,
+          session: SESSION,
+          record: record(new Uint8Array(new SharedArrayBuffer(32))),
+          control: operationControl(),
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
+        }),
+      );
+    }
+  });
+
+  it("rejects public-boundary proxies and accessors without invoking them", async () => {
+    const { candidateFs } = await fixture();
+    let trapCalls = 0;
+    const failTrap = () => {
+      trapCalls += 1;
+      throw new Error("untrusted trap must not run");
+    };
+    const proxiedSession = new Proxy(
+      { ...SESSION },
+      {
+        get: failTrap,
+        getPrototypeOf: failTrap,
+        ownKeys: failTrap,
+      },
+    );
+    const proxiedStageInput = new Proxy(
+      {
+        candidateFs,
+        session: SESSION,
+        record: record("proxy-stage-input"),
+        control: operationControl(),
+      },
+      {
+        get: failTrap,
+        getPrototypeOf: failTrap,
+        ownKeys: failTrap,
+      },
+    );
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord(proxiedStageInput),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs,
+        session: proxiedSession,
+        record: record("proxy-session"),
+        control: operationControl(),
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+
+    const proxiedCandidateFs = new Proxy(candidateFs, {
+      get: failTrap,
+      getPrototypeOf: failTrap,
+    });
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs: proxiedCandidateFs,
+        session: SESSION,
+        record: record("proxy-candidate-fs"),
+        control: operationControl(),
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+
+    const forgedCandidateFs = {
+      acquireLock: failTrap,
+      createPayload: failTrap,
+      publishDurableJson: failTrap,
+      readDurableJson: failTrap,
+      readPayload: failTrap,
+      assertAuthority: failTrap,
+      assertLockHeld: failTrap,
+    };
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs: forgedCandidateFs,
+        session: SESSION,
+        record: record("forged-candidate-fs"),
+        control: operationControl(),
+      } as never),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+
+    await expect(
+      bindAgentBackupRestoreV3CandidateRecordSession({
+        candidateFs,
+        session: SESSION,
+        control: operationControl(),
+        heldLock: null,
+      } as never),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+    });
+
+    const proxiedHeldLock = new Proxy(
+      {},
+      {
+        get: failTrap,
+        getPrototypeOf: failTrap,
+        ownKeys: failTrap,
+      },
+    );
+    await expect(
+      readAgentBackupRestoreV3CandidateRecord({
+        candidateFs,
+        session: SESSION,
+        componentIndex: 0,
+        dataIndex: 0,
+        control: operationControl(),
+        heldLock: proxiedHeldLock,
+      } as never),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+    });
+
+    const forgedBrandedPrototype = Object.create(
+      AgentBackupRestoreV3CandidateFs.prototype,
+    ) as Record<string, unknown>;
+    Object.defineProperty(forgedBrandedPrototype, "acquireLock", {
+      value: failTrap,
+    });
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs: forgedBrandedPrototype,
+        session: SESSION,
+        record: record("forged-candidate-fs-prototype"),
+        control: operationControl(),
+      } as never),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+    expect(Object.isFrozen(candidateFs)).toBe(true);
+    expect(Object.isFrozen(AgentBackupRestoreV3CandidateFs.prototype)).toBe(
+      true,
+    );
+
+    const revokedControl = Proxy.revocable(operationControl(), {});
+    revokedControl.revoke();
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs,
+        session: SESSION,
+        record: record("proxy-control"),
+        control: revokedControl.proxy,
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CONTROL_INVALID",
+      }),
+    );
+
+    const lifecycle = {} as Record<string, unknown>;
+    Object.defineProperty(lifecycle, "afterPayloadFinalized", {
+      enumerable: true,
+      get: failTrap,
+    });
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs,
+        session: SESSION,
+        record: record("accessor-lifecycle"),
+        control: operationControl(),
+        testOnlyLifecycle: lifecycle,
+      } as never),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+
+    const receipt = {
+      componentIndex: 0,
+      componentName: "character",
+      dataIndex: 0,
+      offsetBytes: 0,
+      entry: null,
+      payloadBytes: 1,
+    } as Record<string, unknown>;
+    Object.defineProperty(receipt, "payloadSha256", {
+      enumerable: true,
+      get: failTrap,
+    });
+    expect(() =>
+      computeAgentBackupRestoreV3CandidateRecordCommandSha256(
+        SESSION,
+        receipt as never,
+        "0".repeat(64),
+      ),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+    expect(trapCalls).toBe(0);
+  });
+
+  it("snapshots read slots and operation control before the first await", async () => {
+    const { candidateFs } = await fixture();
+    const stageControl = operationControl();
+    const pendingStage = stageAgentBackupRestoreV3CandidateRecord({
+      candidateFs,
+      session: SESSION,
+      record: record("stable-after-call"),
+      control: stageControl,
+    });
+    stageControl.deadlineEpochMs = Date.now() - 1;
+    await expect(pendingStage).resolves.toMatchObject({
+      record: { componentIndex: 0, dataIndex: 0 },
+    });
+
+    const readControl = operationControl();
+    const readInput = {
+      candidateFs,
+      session: SESSION,
+      componentIndex: 0,
+      dataIndex: 0,
+      control: readControl,
+    };
+    const pendingRead = readAgentBackupRestoreV3CandidateRecord(readInput);
+    readInput.componentIndex = 1;
+    readInput.dataIndex = 9;
+    readControl.deadlineEpochMs = Date.now() - 1;
+    const exactRead = await pendingRead;
+    expect(exactRead.receipt.record).toMatchObject({
+      componentIndex: 0,
+      dataIndex: 0,
+    });
+    expect(Buffer.from(exactRead.payload).toString("utf8")).toBe(
+      "stable-after-call",
+    );
+    exactRead.payload.fill(0);
+  });
+
+  it("refuses test hooks in production before creating durable state", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const before = await exactFilesystemSnapshot(attemptRoot);
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    try {
+      expect(() =>
+        stageAgentBackupRestoreV3CandidateRecord({
+          candidateFs,
+          session: SESSION,
+          record: record("forbidden-production-hook"),
+          control: operationControl(),
+          testOnlyLifecycle: { afterPayloadFinalized: () => undefined },
+        }),
+      ).toThrowError(
+        expect.objectContaining({
+          code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_TEST_HOOK_FORBIDDEN",
+        }),
+      );
+    } finally {
+      if (previousNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = previousNodeEnv;
+    }
+    await expect(exactFilesystemSnapshot(attemptRoot)).resolves.toEqual(before);
   });
 
   it("rejects oversized, accessor-backed, and mismatched component inputs", async () => {

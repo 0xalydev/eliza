@@ -21,7 +21,12 @@ import {
   type AgentBackupRestoreV3CandidateFileTreeWriter,
   type AgentBackupRestoreV3CandidateFs,
   type AgentBackupRestoreV3CandidateFsLock,
+  isAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
+import {
+  snapshotOperationControl,
+  snapshotOwnDataRecord,
+} from "./agent-backup-restore-v3-candidate-fs-control";
 import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
 import {
   AgentBackupRestoreV3CandidateRecordError,
@@ -43,6 +48,8 @@ const FILE_SET_COMPONENTS = Object.freeze({
 } as const);
 const EMPTY_SHA256 = createHash("sha256").digest("hex");
 const FINISH_MAXIMUM_BYTES = 32 * 1024;
+const REFLECT_APPLY = Reflect.apply;
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
 
 export type AgentBackupRestoreV3CandidateFileSetComponentName = Extract<
   AgentBackupRestoreV3StreamComponentName,
@@ -115,6 +122,115 @@ function fileSetError(code: string, message: string, cause?: unknown): never {
   throw new AgentBackupRestoreV3CandidateFileSetError(code, message, cause);
 }
 
+function snapshotPlainDataRecord(
+  value: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+  code = "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
+): Readonly<Record<string, unknown>> {
+  try {
+    return snapshotOwnDataRecord(
+      value,
+      allowedKeys,
+      requiredKeys,
+      code,
+      `${label} must be one exact plain data object`,
+    );
+  } catch (cause) {
+    if (cause instanceof AgentBackupRestoreV3CandidateFileSetError) {
+      throw cause;
+    }
+    fileSetError(code, `${label} must be one exact plain data object`, cause);
+  }
+}
+
+function requireCandidateFs(value: unknown): AgentBackupRestoreV3CandidateFs {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    isProxy(value) ||
+    !isAgentBackupRestoreV3CandidateFs(value)
+  ) {
+    fileSetError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
+      "Candidate file-set filesystem authority must be one non-proxy capability",
+    );
+  }
+  return value as AgentBackupRestoreV3CandidateFs;
+}
+
+function snapshotFileSetControl(
+  value: unknown,
+): Readonly<AgentBackupRestoreV3OperationControl> {
+  try {
+    return snapshotOperationControl(
+      value as Readonly<AgentBackupRestoreV3OperationControl>,
+    );
+  } catch (cause) {
+    fileSetError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_CONTROL_INVALID",
+      "Candidate file-set requires one exact active operation control",
+      cause,
+    );
+  }
+}
+
+function snapshotTestOnlyLifecycle(
+  value: unknown,
+): Readonly<AgentBackupRestoreV3CandidateFileSetLifecycle> | undefined {
+  if (value === undefined) return undefined;
+  if (process.env.NODE_ENV !== "test") {
+    fileSetError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_TEST_HOOK_FORBIDDEN",
+      "Candidate file-set lifecycle hooks are test-only",
+    );
+  }
+  const record = snapshotPlainDataRecord(
+    value,
+    ["afterRecordConsumed", "afterFilePublished", "afterDurableFinish"],
+    [],
+    "Candidate file-set test lifecycle",
+  );
+  if (
+    (record.afterRecordConsumed !== undefined &&
+      typeof record.afterRecordConsumed !== "function") ||
+    (record.afterFilePublished !== undefined &&
+      typeof record.afterFilePublished !== "function") ||
+    (record.afterDurableFinish !== undefined &&
+      typeof record.afterDurableFinish !== "function")
+  ) {
+    fileSetError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
+      "Candidate file-set test lifecycle hooks must be synchronous functions",
+    );
+  }
+  return Object.freeze({
+    ...(record.afterRecordConsumed === undefined
+      ? {}
+      : {
+          afterRecordConsumed:
+            record.afterRecordConsumed as AgentBackupRestoreV3CandidateFileSetLifecycle["afterRecordConsumed"],
+        }),
+    ...(record.afterFilePublished === undefined
+      ? {}
+      : {
+          afterFilePublished:
+            record.afterFilePublished as AgentBackupRestoreV3CandidateFileSetLifecycle["afterFilePublished"],
+        }),
+    ...(record.afterDurableFinish === undefined
+      ? {}
+      : {
+          afterDurableFinish:
+            record.afterDurableFinish as AgentBackupRestoreV3CandidateFileSetLifecycle["afterDurableFinish"],
+        }),
+  });
+}
+
+function zeroizePlaintext(value: Uint8Array): void {
+  REFLECT_APPLY(INTRINSIC_UINT8_ARRAY_FILL, value, [0]);
+}
+
 function invokeTestOnlyHook<T>(
   hook: ((value: T) => void) | undefined,
   value: T,
@@ -141,87 +257,44 @@ function exactPlainObject(
   value: unknown,
   keys: readonly string[],
   label: string,
-): Record<string, unknown> {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    isProxy(value) ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== keys.length ||
-    Object.keys(value).sort().join("\0") !== [...keys].sort().join("\0")
-  ) {
-    fileSetError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
-      `${label} must be one exact plain data object`,
-    );
-  }
-  const record = value as Record<string, unknown>;
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(record, key);
-    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-      fileSetError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
-        `${label} cannot contain accessors or hidden fields`,
-      );
-    }
-  }
-  return record;
+): Readonly<Record<string, unknown>> {
+  return snapshotPlainDataRecord(value, keys, keys, label);
 }
 
 function snapshotLimits(
   value: Partial<AgentBackupRestoreV3CandidateFileTreeLimits> | undefined,
 ): Readonly<AgentBackupRestoreV3CandidateFileTreeLimits> {
-  if (value !== undefined) {
-    if (
-      !value ||
-      typeof value !== "object" ||
-      isProxy(value) ||
-      Object.getPrototypeOf(value) !== Object.prototype
-    ) {
-      fileSetError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_LIMIT_INVALID",
-        "Candidate file-set limits must be one exact plain data object",
-      );
-    }
-    const allowed = new Set([
-      "maximumBytes",
-      "maximumFiles",
-      "maximumDirectories",
-      "maximumDepth",
-      "maximumPathBytes",
-    ]);
-    for (const key of Reflect.ownKeys(value)) {
-      if (typeof key !== "string" || !allowed.has(key)) {
-        fileSetError(
+  const record: Readonly<Record<string, unknown>> =
+    value === undefined
+      ? Object.freeze({})
+      : snapshotPlainDataRecord(
+          value,
+          [
+            "maximumBytes",
+            "maximumFiles",
+            "maximumDirectories",
+            "maximumDepth",
+            "maximumPathBytes",
+          ],
+          [],
+          "Candidate file-set limits",
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_LIMIT_INVALID",
-          "Candidate file-set limits contain an unknown field",
         );
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-        fileSetError(
-          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_LIMIT_INVALID",
-          "Candidate file-set limits contain an accessor or hidden field",
-        );
-      }
-    }
-  }
   const resolved = Object.freeze({
     maximumBytes:
-      value?.maximumBytes ??
+      (record.maximumBytes as number | undefined) ??
       AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumBytes,
     maximumFiles:
-      value?.maximumFiles ??
+      (record.maximumFiles as number | undefined) ??
       AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumFiles,
     maximumDirectories:
-      value?.maximumDirectories ??
+      (record.maximumDirectories as number | undefined) ??
       AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumDirectories,
     maximumDepth:
-      value?.maximumDepth ??
+      (record.maximumDepth as number | undefined) ??
       AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumDepth,
     maximumPathBytes:
-      value?.maximumPathBytes ??
+      (record.maximumPathBytes as number | undefined) ??
       AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumPathBytes,
   });
   for (const key of Object.keys(resolved) as Array<keyof typeof resolved>) {
@@ -406,7 +479,7 @@ async function requireNoAdditionalRecord(
       control: input.control,
       heldLock: lock,
     });
-    unexpected.payload.fill(0);
+    zeroizePlaintext(unexpected.payload);
     fileSetError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_RECORD_COUNT_MISMATCH",
       "Candidate file-set inbox contains a record beyond its authenticated finish",
@@ -713,7 +786,7 @@ async function materializeCopiedFileSet(
           "afterRecordConsumed",
         );
       } finally {
-        inbox.payload.fill(0);
+        zeroizePlaintext(inbox.payload);
       }
     }
     await finalizeFile();
@@ -797,27 +870,43 @@ async function materializeCopiedFileSet(
 export function materializeAgentBackupRestoreV3CandidateFileSet(
   input: Readonly<MaterializeAgentBackupRestoreV3CandidateFileSetInput>,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateFileSetReceipt>> {
-  if (!input || typeof input !== "object" || isProxy(input)) {
-    fileSetError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_INPUT_INVALID",
-      "Candidate file-set materialization input must be one non-proxy object",
-    );
-  }
-  const receipt = snapshotReceipt(input.receipt);
-  const session = snapshotAgentBackupRestoreV3CandidateSession(input.session);
-  const limits = snapshotLimits(input.limits);
-  const control = Object.freeze({
-    signal: input.control.signal,
-    deadlineEpochMs: input.control.deadlineEpochMs,
-  });
+  const exactInput = snapshotPlainDataRecord(
+    input,
+    [
+      "candidateFs",
+      "session",
+      "receipt",
+      "control",
+      "limits",
+      "testOnlyLifecycle",
+    ],
+    ["candidateFs", "session", "receipt", "control"],
+    "Candidate file-set materialization input",
+  );
+  const testOnlyLifecycle = snapshotTestOnlyLifecycle(
+    exactInput.testOnlyLifecycle,
+  );
+  const candidateFs = requireCandidateFs(exactInput.candidateFs);
+  const control = snapshotFileSetControl(exactInput.control);
+  const session = snapshotAgentBackupRestoreV3CandidateSession(
+    exactInput.session as Readonly<AgentBackupRestoreV3StagingSession>,
+  );
+  const receipt = snapshotReceipt(
+    exactInput.receipt as Readonly<AgentBackupRestoreV3ComponentReceipt>,
+  );
+  const limits = snapshotLimits(
+    exactInput.limits as
+      | Partial<AgentBackupRestoreV3CandidateFileTreeLimits>
+      | undefined,
+  );
   return materializeCopiedFileSet(
     Object.freeze({
-      candidateFs: input.candidateFs,
+      candidateFs,
       session,
       receipt,
       control,
       limits,
-      testOnlyLifecycle: input.testOnlyLifecycle,
+      testOnlyLifecycle,
     }),
     receipt,
   );

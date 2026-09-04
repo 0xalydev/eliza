@@ -62,8 +62,11 @@ mock.module("../../utils/phone-normalization", () => ({
 mock.module("../api-keys", () => ({ apiKeysService: { create: createApiKey } }));
 mock.module("../credits", () => ({
   creditsService: { addCredits },
+  COST_BUFFER: 1.5,
   InsufficientCreditsError: class InsufficientCreditsError extends Error {},
+  MIN_RESERVATION: 0.000001,
   ReservationNotFoundError: class ReservationNotFoundError extends Error {},
+  RESERVATION_SWEEP_GRACE_MS: 7_200_000,
 }));
 mock.module("../signup-code", () => ({ redeemSignupCode: mock() }));
 
@@ -81,17 +84,17 @@ describe("ElizaAppUserService account opening balance", () => {
     addCredits.mockReset();
   });
 
-  test("creates a phone-first personal account at zero without an automatic credit transaction", async () => {
+  test("creates a phone-first personal account with the fixed opening credit", async () => {
     findOrCreatePhonePersonalAccount.mockResolvedValue({
       user: { id: "user-new", phone_number: "+15551234567" },
-      organization: { id: "org-new", credit_balance: "0.00" },
+      organization: { id: "org-new", credit_balance: "5.00" },
       isNew: true,
     });
 
     const result = await elizaAppUserService.findOrCreateByPhone("+15551234567");
 
     expect(result.isNew).toBe(true);
-    expect(result.organization.credit_balance).toBe("0.00");
+    expect(result.organization.credit_balance).toBe("5.00");
     expect(findOrCreatePhonePersonalAccount).toHaveBeenCalledWith(
       expect.objectContaining({ phoneNumber: "+15551234567" }),
     );

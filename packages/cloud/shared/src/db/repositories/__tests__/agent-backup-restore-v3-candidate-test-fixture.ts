@@ -286,9 +286,8 @@ async function applyMigration(
 }
 
 export async function applyCandidateMigrations(client: CandidateFixtureQueryClient): Promise<void> {
-  await applyMigration(client, "0370_agent_backup_restore_v3_candidates");
-  await applyMigration(client, "0371_agent_backup_restore_v3_candidate_guards");
-  await applyMigration(client, "0372_agent_backup_restore_v3_candidate_post_lock_clock");
+  await applyMigration(client, "0376_agent_backup_restore_v3_candidates");
+  await applyMigration(client, "0377_agent_backup_restore_v3_candidate_guards");
 }
 
 export async function seedCandidateAuthority(
@@ -486,6 +485,16 @@ export async function stageAndFinishCandidateComponent(
 ): Promise<AgentBackupRestoreV3ComponentReceipt> {
   const expected = candidateComponentReceipt(index);
   const payload = new TextEncoder().encode(`seal-component-${index}`);
+  const entry =
+    expected.descriptor.contentKind === "file-set"
+      ? {
+          path: `${expected.componentName}.bin`,
+          fileOffsetBytes: 0,
+          fileSizeBytes: payload.byteLength,
+          mode: 0o600,
+          mtimeMs: 1_700_000_000_000,
+        }
+      : null;
   const staged = await execution.stageRecord(
     session,
     {
@@ -493,7 +502,7 @@ export async function stageAndFinishCandidateComponent(
       componentName: expected.componentName,
       dataIndex: 0,
       offsetBytes: 0,
-      entry: null,
+      entry,
       payload,
     },
     control,

@@ -12,7 +12,7 @@ import {
   type Hmac,
   timingSafeEqual,
 } from "node:crypto";
-import { isProxy } from "node:util/types";
+import { isProxy, isUint8Array } from "node:util/types";
 import { ElizaError } from "@elizaos/core";
 import {
   AGENT_BACKUP_RESTORE_V3_STREAM_COMPONENTS,
@@ -24,12 +24,14 @@ import {
   type AgentBackupRestoreV3StreamComponentName,
   parseAgentBackupRestoreV3StagingSession,
 } from "@elizaos/shared";
-import type {
-  AgentBackupRestoreV3CandidateFs,
-  AgentBackupRestoreV3CandidateFsLock,
-  AgentBackupRestoreV3CandidatePayloadReceipt,
-  AgentBackupRestoreV3CandidatePayloadWriter,
+import {
+  type AgentBackupRestoreV3CandidateFs,
+  type AgentBackupRestoreV3CandidateFsLock,
+  type AgentBackupRestoreV3CandidatePayloadReceipt,
+  type AgentBackupRestoreV3CandidatePayloadWriter,
+  isAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
+import { snapshotOwnDataRecord } from "./agent-backup-restore-v3-candidate-fs-control";
 import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
 
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
@@ -50,7 +52,27 @@ const TYPED_ARRAY_BUFFER_GETTER = Object.getOwnPropertyDescriptor(
   TYPED_ARRAY_PROTOTYPE,
   "buffer",
 )?.get;
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = Object.getOwnPropertyDescriptor(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+)?.get;
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+const INTRINSIC_UINT8_ARRAY = Uint8Array;
 const INTRINSIC_UINT8_ARRAY_SET = Uint8Array.prototype.set;
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const INTRINSIC_BUFFER_FROM = Buffer.from;
+const INTRINSIC_BUFFER_OF = Buffer.of;
+const ABORT_SIGNAL_ABORTED_GETTER = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype,
+  "aborted",
+)?.get;
+const ABORT_SIGNAL_REASON_GETTER = Object.getOwnPropertyDescriptor(
+  AbortSignal.prototype,
+  "reason",
+)?.get;
 
 export const AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_FORMAT =
   "elizaos.agent-backup.restore-v3-candidate-record.v1" as const;
@@ -154,6 +176,77 @@ function recordError(code: string, message: string, cause?: unknown): never {
   });
 }
 
+function requireCandidateFs(value: unknown): AgentBackupRestoreV3CandidateFs {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    isProxy(value) ||
+    !isAgentBackupRestoreV3CandidateFs(value)
+  ) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      "Candidate record filesystem authority must be one non-proxy capability",
+    );
+  }
+  return value as AgentBackupRestoreV3CandidateFs;
+}
+
+function snapshotHeldLock(
+  value: unknown,
+): AgentBackupRestoreV3CandidateFsLock | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || isProxy(value)) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      "Candidate record held lock must be one non-proxy capability",
+    );
+  }
+  return value as AgentBackupRestoreV3CandidateFsLock;
+}
+
+function snapshotTestOnlyLifecycle(
+  value: unknown,
+): Readonly<AgentBackupRestoreV3CandidateRecordLifecycle> | undefined {
+  if (value === undefined) return undefined;
+  if (process.env.NODE_ENV !== "test") {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_TEST_HOOK_FORBIDDEN",
+      "Candidate record lifecycle hooks are forbidden outside tests",
+    );
+  }
+  const record = snapshotPlainDataRecord(
+    value,
+    ["afterPayloadFinalized", "afterDurableReceipt"],
+    [],
+    "Candidate record test lifecycle",
+  );
+  if (
+    (record.afterPayloadFinalized !== undefined &&
+      typeof record.afterPayloadFinalized !== "function") ||
+    (record.afterDurableReceipt !== undefined &&
+      typeof record.afterDurableReceipt !== "function")
+  ) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      "Candidate record test lifecycle hooks must be synchronous functions",
+    );
+  }
+  return Object.freeze({
+    ...(record.afterPayloadFinalized === undefined
+      ? {}
+      : {
+          afterPayloadFinalized:
+            record.afterPayloadFinalized as AgentBackupRestoreV3CandidateRecordLifecycle["afterPayloadFinalized"],
+        }),
+    ...(record.afterDurableReceipt === undefined
+      ? {}
+      : {
+          afterDurableReceipt:
+            record.afterDurableReceipt as AgentBackupRestoreV3CandidateRecordLifecycle["afterDurableReceipt"],
+        }),
+  });
+}
+
 function invokeTestOnlyLifecycleHook<T>(
   hook: ((value: T) => void) | undefined,
   value: T,
@@ -187,45 +280,98 @@ function sha256Bytes(value: Uint8Array): string {
 }
 
 function exactDigestMatches(left: string, right: string): boolean {
-  if (!SHA256_PATTERN.test(left) || !SHA256_PATTERN.test(right)) return false;
-  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"));
+  if (
+    typeof left !== "string" ||
+    typeof right !== "string" ||
+    !SHA256_PATTERN.test(left) ||
+    !SHA256_PATTERN.test(right)
+  ) {
+    return false;
+  }
+  return timingSafeEqual(
+    Reflect.apply(INTRINSIC_BUFFER_FROM, Buffer, [left, "hex"]) as Buffer,
+    Reflect.apply(INTRINSIC_BUFFER_FROM, Buffer, [right, "hex"]) as Buffer,
+  );
+}
+
+function exactByteLength(value: Uint8Array): number {
+  if (!TYPED_ARRAY_BYTE_LENGTH_GETTER) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
+      "Candidate record byte-array contract is unavailable",
+    );
+  }
+  try {
+    return Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []) as number;
+  } catch (cause) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
+      "Candidate record byte array lacks exact TypedArray internal slots",
+      cause,
+    );
+  }
+}
+
+function exactSubarray(value: Uint8Array, start: number): Uint8Array {
+  if (!TYPED_ARRAY_BUFFER_GETTER || !TYPED_ARRAY_BYTE_OFFSET_GETTER) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
+      "Candidate record byte-array contract is unavailable",
+    );
+  }
+  try {
+    const buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, value, []);
+    const byteOffset = Reflect.apply(
+      TYPED_ARRAY_BYTE_OFFSET_GETTER,
+      value,
+      [],
+    ) as number;
+    return new INTRINSIC_UINT8_ARRAY(
+      buffer as ArrayBuffer,
+      byteOffset + start,
+      exactByteLength(value) - start,
+    );
+  } catch (cause) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
+      "Candidate record byte array could not produce its exact suffix",
+      cause,
+    );
+  }
+}
+
+function zeroize(value: Uint8Array | null | undefined): void {
+  if (!value) return;
+  Reflect.apply(INTRINSIC_UINT8_ARRAY_FILL, value, [0]);
+}
+
+function snapshotPlainDataRecord(
+  value: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+  code = "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+): Readonly<Record<string, unknown>> {
+  try {
+    return snapshotOwnDataRecord(
+      value,
+      allowedKeys,
+      requiredKeys,
+      code,
+      `${label} must be one exact plain data object`,
+    );
+  } catch (cause) {
+    if (cause instanceof AgentBackupRestoreV3CandidateRecordError) throw cause;
+    recordError(code, `${label} must be one exact plain data object`, cause);
+  }
 }
 
 function requirePlainRecord(
   value: unknown,
   keys: readonly string[],
   label: string,
-): Record<string, unknown> {
-  if (
-    !value ||
-    typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== keys.length ||
-    Reflect.ownKeys(value).some((key) => typeof key !== "string")
-  ) {
-    recordError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
-      `${label} must be one exact plain data object`,
-    );
-  }
-  const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join("\0") !== [...keys].sort().join("\0")) {
-    recordError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
-      `${label} fields differ from the exact record contract`,
-    );
-  }
-  for (const key of keys) {
-    const descriptor = Object.getOwnPropertyDescriptor(record, key);
-    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-      recordError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
-        `${label} cannot contain accessors or hidden fields`,
-      );
-    }
-  }
-  return record;
+): Readonly<Record<string, unknown>> {
+  return snapshotPlainDataRecord(value, keys, keys, label);
 }
 
 function snapshotSession(
@@ -291,17 +437,43 @@ interface CopiedRecord {
 function assertSnapshotControl(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
 ): void {
-  if (!(control?.signal instanceof AbortSignal)) {
+  if (
+    !ABORT_SIGNAL_ABORTED_GETTER ||
+    !ABORT_SIGNAL_REASON_GETTER ||
+    isProxy(control.signal)
+  ) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CONTROL_INVALID",
       "Candidate record snapshot requires one exact AbortSignal",
     );
   }
-  if (control.signal.aborted) {
+  let aborted: boolean;
+  try {
+    aborted = Boolean(
+      Reflect.apply(ABORT_SIGNAL_ABORTED_GETTER, control.signal, []),
+    );
+  } catch (cause) {
+    recordError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CONTROL_INVALID",
+      "Candidate record snapshot requires one exact AbortSignal",
+      cause,
+    );
+  }
+  if (aborted) {
+    let reason: unknown;
+    try {
+      reason = Reflect.apply(ABORT_SIGNAL_REASON_GETTER, control.signal, []);
+    } catch (cause) {
+      recordError(
+        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CONTROL_INVALID",
+        "Candidate record snapshot requires one exact AbortSignal",
+        cause,
+      );
+    }
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_ABORTED",
       "Candidate record snapshot was cancelled",
-      control.signal.reason,
+      reason,
     );
   }
   if (
@@ -313,6 +485,24 @@ function assertSnapshotControl(
       "Candidate record snapshot exceeded its exact deadline",
     );
   }
+}
+
+function snapshotRecordControl(
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+): Readonly<AgentBackupRestoreV3OperationControl> {
+  const record = snapshotPlainDataRecord(
+    control,
+    ["signal", "deadlineEpochMs"],
+    ["signal", "deadlineEpochMs"],
+    "Candidate record operation control",
+    "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CONTROL_INVALID",
+  );
+  const snapshot = Object.freeze({
+    signal: record.signal as AbortSignal,
+    deadlineEpochMs: record.deadlineEpochMs as number,
+  });
+  assertSnapshotControl(snapshot);
+  return snapshot;
 }
 
 function snapshotRecord(
@@ -337,12 +527,13 @@ function snapshotRecord(
     !payloadValue ||
     typeof payloadValue !== "object" ||
     isProxy(payloadValue) ||
-    !(payloadValue instanceof Uint8Array) ||
-    Object.getPrototypeOf(payloadValue) !== Uint8Array.prototype ||
+    !isUint8Array(payloadValue) ||
+    Object.getPrototypeOf(payloadValue) !== INTRINSIC_UINT8_ARRAY.prototype ||
     Object.getOwnPropertyDescriptor(payloadValue, Symbol.iterator) !==
       undefined ||
     !TYPED_ARRAY_BYTE_LENGTH_GETTER ||
-    !TYPED_ARRAY_BUFFER_GETTER
+    !TYPED_ARRAY_BUFFER_GETTER ||
+    !ARRAY_BUFFER_BYTE_LENGTH_GETTER
   ) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
@@ -352,8 +543,13 @@ function snapshotRecord(
   let payloadBytes: number;
   let payloadBuffer: unknown;
   try {
-    payloadBytes = TYPED_ARRAY_BYTE_LENGTH_GETTER.call(payloadValue) as number;
-    payloadBuffer = TYPED_ARRAY_BUFFER_GETTER.call(payloadValue);
+    payloadBytes = Reflect.apply(
+      TYPED_ARRAY_BYTE_LENGTH_GETTER,
+      payloadValue,
+      [],
+    ) as number;
+    payloadBuffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, payloadValue, []);
+    Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, payloadBuffer, []);
   } catch (cause) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
@@ -361,16 +557,13 @@ function snapshotRecord(
       cause,
     );
   }
-  if (
-    payloadBytes > AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_MAXIMUM_BYTES ||
-    !(payloadBuffer instanceof ArrayBuffer)
-  ) {
+  if (payloadBytes > AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_MAXIMUM_BYTES) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_INVALID",
       "Candidate record payload exceeds 256 KiB or uses shared storage",
     );
   }
-  const payload = new Uint8Array(payloadBytes);
+  const payload = new INTRINSIC_UINT8_ARRAY(payloadBytes);
   try {
     INTRINSIC_UINT8_ARRAY_SET.call(payload, payloadValue, 0);
     assertSnapshotControl(control);
@@ -380,7 +573,7 @@ function snapshotRecord(
       dataIndex: record.dataIndex,
       offsetBytes: record.offsetBytes,
       entry: snapshotEntry(record.entry),
-      payloadBytes: payload.byteLength,
+      payloadBytes: exactByteLength(payload),
       payloadSha256: sha256Bytes(payload),
     });
     if (
@@ -397,7 +590,7 @@ function snapshotRecord(
       payload,
     });
   } catch (cause) {
-    payload.fill(0);
+    zeroize(payload);
     if (cause instanceof AgentBackupRestoreV3CandidateRecordError) throw cause;
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
@@ -505,25 +698,55 @@ function commandBody(
   });
 }
 
-export function computeAgentBackupRestoreV3CandidateRecordCommandSha256(
-  sessionInput: Readonly<AgentBackupRestoreV3StagingSession>,
-  receiptInput: Readonly<AgentBackupRestoreV3StageRecordReceipt>,
-  previousReceiptSha256: string,
-): string {
-  const session = snapshotSession(sessionInput);
-  let receipt: AgentBackupRestoreV3StageRecordReceipt;
+function snapshotStageReceipt(
+  value: Readonly<AgentBackupRestoreV3StageRecordReceipt>,
+): Readonly<AgentBackupRestoreV3StageRecordReceipt> {
+  const record = requirePlainRecord(
+    value,
+    [
+      "componentIndex",
+      "componentName",
+      "dataIndex",
+      "offsetBytes",
+      "entry",
+      "payloadBytes",
+      "payloadSha256",
+    ],
+    "Candidate command receipt",
+  );
   try {
-    receipt = AgentBackupRestoreV3StageRecordReceiptSchema.parse(receiptInput);
+    return freezeStageReceipt(
+      AgentBackupRestoreV3StageRecordReceiptSchema.parse({
+        componentIndex: record.componentIndex,
+        componentName: record.componentName,
+        dataIndex: record.dataIndex,
+        offsetBytes: record.offsetBytes,
+        entry: snapshotEntry(record.entry),
+        payloadBytes: record.payloadBytes,
+        payloadSha256: record.payloadSha256,
+      }),
+    );
   } catch (cause) {
+    if (cause instanceof AgentBackupRestoreV3CandidateRecordError) throw cause;
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
       "Candidate command receipt is not exact and canonical",
       cause,
     );
   }
+}
+
+export function computeAgentBackupRestoreV3CandidateRecordCommandSha256(
+  sessionInput: Readonly<AgentBackupRestoreV3StagingSession>,
+  receiptInput: Readonly<AgentBackupRestoreV3StageRecordReceipt>,
+  previousReceiptSha256: string,
+): string {
+  const session = snapshotSession(sessionInput);
+  const receipt = snapshotStageReceipt(receiptInput);
   if (
     AGENT_BACKUP_RESTORE_V3_STREAM_COMPONENTS[receipt.componentIndex] !==
       receipt.componentName ||
+    typeof previousReceiptSha256 !== "string" ||
     !SHA256_PATTERN.test(previousReceiptSha256)
   ) {
     recordError(
@@ -551,26 +774,32 @@ function deriveOwnerCapability(
   executionToken: string,
   commandSha256: string,
 ): DerivedOwnerCapability {
-  const key = Buffer.from(executionToken, "utf8");
-  const commandDigest = Buffer.from(commandSha256, "hex");
+  const key = Reflect.apply(INTRINSIC_BUFFER_FROM, Buffer, [
+    executionToken,
+    "utf8",
+  ]) as Buffer;
+  const commandDigest = Reflect.apply(INTRINSIC_BUFFER_FROM, Buffer, [
+    commandSha256,
+    "hex",
+  ]) as Buffer;
   let hmac: Hmac | null = null;
   let digest: Buffer | null = null;
   try {
     hmac = createHmac("sha256", key);
     hmac.update(AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_OWNER_CONTEXT, "utf8");
-    hmac.update(Buffer.of(0));
+    hmac.update(Reflect.apply(INTRINSIC_BUFFER_OF, Buffer, [0]) as Buffer);
     hmac.update(commandDigest);
     digest = hmac.digest();
-    const capability = new Uint8Array(digest.byteLength);
+    const capability = new INTRINSIC_UINT8_ARRAY(exactByteLength(digest));
     INTRINSIC_UINT8_ARRAY_SET.call(capability, digest, 0);
     return Object.freeze({
       capability,
       sha256: sha256Bytes(capability),
     });
   } finally {
-    digest?.fill(0);
-    commandDigest.fill(0);
-    key.fill(0);
+    zeroize(digest);
+    zeroize(commandDigest);
+    zeroize(key);
     hmac?.destroy();
   }
 }
@@ -760,7 +989,7 @@ function parseRecordReceipt(
       receiptSha256: persisted.receiptSha256,
     });
   } finally {
-    owner.capability.fill(0);
+    zeroize(owner.capability);
   }
 }
 
@@ -942,7 +1171,7 @@ async function readPayloadForReceipt(
     );
     return read.payload;
   } finally {
-    owner.capability.fill(0);
+    zeroize(owner.capability);
   }
 }
 
@@ -969,7 +1198,7 @@ async function revalidateOwnedPayload(
   );
   try {
     if (
-      read.payload.byteLength !== expectedPayload.byteLength ||
+      exactByteLength(read.payload) !== exactByteLength(expectedPayload) ||
       !timingSafeEqual(read.payload, expectedPayload)
     ) {
       recordError(
@@ -978,7 +1207,7 @@ async function revalidateOwnedPayload(
       );
     }
   } finally {
-    read.payload.fill(0);
+    zeroize(read.payload);
   }
   await candidateFs.assertAuthority(control);
   await candidateFs.assertLockHeld(lock, control);
@@ -1030,7 +1259,7 @@ async function revalidateFinalRecord(
   );
   try {
     if (
-      payload.byteLength !== expectedPayload.byteLength ||
+      exactByteLength(payload) !== exactByteLength(expectedPayload) ||
       !timingSafeEqual(payload, expectedPayload)
     ) {
       recordError(
@@ -1039,7 +1268,7 @@ async function revalidateFinalRecord(
       );
     }
   } finally {
-    payload.fill(0);
+    zeroize(payload);
   }
   await candidateFs.assertAuthority(control);
   await candidateFs.assertLockHeld(lock, control);
@@ -1138,15 +1367,16 @@ async function stageCopiedRecord(
         input.control,
         lock,
       );
-      if (writer.acknowledgedBytes > input.payload.byteLength) {
+      const payloadBytes = exactByteLength(input.payload);
+      if (writer.acknowledgedBytes > payloadBytes) {
         recordError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_PAYLOAD_CONFLICT",
           "Candidate record partial payload exceeds the exact command",
         );
       }
-      if (writer.acknowledgedBytes < input.payload.byteLength) {
+      if (writer.acknowledgedBytes < payloadBytes) {
         await writer.write(
-          input.payload.subarray(writer.acknowledgedBytes),
+          exactSubarray(input.payload, writer.acknowledgedBytes),
           input.control,
         );
       }
@@ -1248,8 +1478,8 @@ async function stageCopiedRecord(
       cleanupFailures.push(cause);
     }
   }
-  input.payload.fill(0);
-  ownerCapability?.fill(0);
+  zeroize(input.payload);
+  zeroize(ownerCapability);
   ownerCapability = null;
   if (cleanupFailures.length === 1) cleanupFailure = cleanupFailures[0];
   if (cleanupFailures.length > 1) {
@@ -1277,15 +1507,33 @@ async function stageCopiedRecord(
 export function stageAgentBackupRestoreV3CandidateRecord(
   input: Readonly<StageAgentBackupRestoreV3CandidateRecordInput>,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateRecordReceipt>> {
-  const session = snapshotSession(input.session);
-  const copied = snapshotRecord(input.record, input.control);
+  const exactInput = snapshotPlainDataRecord(
+    input,
+    ["candidateFs", "session", "record", "control", "testOnlyLifecycle"],
+    ["candidateFs", "session", "record", "control"],
+    "Candidate record stage input",
+  );
+  const testOnlyLifecycle = snapshotTestOnlyLifecycle(
+    exactInput.testOnlyLifecycle,
+  );
+  const candidateFs = requireCandidateFs(exactInput.candidateFs);
+  const control = snapshotRecordControl(
+    exactInput.control as Readonly<AgentBackupRestoreV3OperationControl>,
+  );
+  const session = snapshotSession(
+    exactInput.session as Readonly<AgentBackupRestoreV3StagingSession>,
+  );
+  const copied = snapshotRecord(
+    exactInput.record as Readonly<AgentBackupRestoreV3StagedRecord>,
+    control,
+  );
   return stageCopiedRecord({
-    candidateFs: input.candidateFs,
+    candidateFs,
     session,
     record: copied.receipt,
     payload: copied.payload,
-    control: input.control,
-    testOnlyLifecycle: input.testOnlyLifecycle,
+    control,
+    testOnlyLifecycle,
   });
 }
 
@@ -1293,20 +1541,34 @@ export function stageAgentBackupRestoreV3CandidateRecord(
 export async function bindAgentBackupRestoreV3CandidateRecordSession(
   input: Readonly<BindAgentBackupRestoreV3CandidateRecordSessionInput>,
 ): Promise<string> {
-  const session = snapshotSession(input.session);
-  const ownsLock = input.heldLock === undefined;
+  const exactInput = snapshotPlainDataRecord(
+    input,
+    ["candidateFs", "session", "control", "heldLock"],
+    ["candidateFs", "session", "control"],
+    "Candidate record session binding input",
+  );
+  const candidateFs = requireCandidateFs(exactInput.candidateFs);
+  const control = snapshotRecordControl(
+    exactInput.control as Readonly<AgentBackupRestoreV3OperationControl>,
+  );
+  const session = snapshotSession(
+    exactInput.session as Readonly<AgentBackupRestoreV3StagingSession>,
+  );
+  const heldLock = snapshotHeldLock(exactInput.heldLock);
+  const ownsLock = heldLock === undefined;
   let lock: AgentBackupRestoreV3CandidateFsLock | null = null;
   let result: string | null = null;
   let primaryFailure: unknown;
   try {
     lock =
-      input.heldLock ??
-      (await input.candidateFs.acquireLock(RECORD_LOCK_NAME, input.control));
-    await input.candidateFs.assertLockHeld(lock, input.control);
+      heldLock === undefined
+        ? await candidateFs.acquireLock(RECORD_LOCK_NAME, control)
+        : heldLock;
+    await candidateFs.assertLockHeld(lock, control);
     const journal = await createOrReplaySessionJournal(
-      input.candidateFs,
+      candidateFs,
       session,
-      input.control,
+      control,
       lock,
     );
     result = journal.sessionSha256;
@@ -1316,7 +1578,7 @@ export async function bindAgentBackupRestoreV3CandidateRecordSession(
   let cleanupFailure: unknown;
   if (lock && ownsLock) {
     try {
-      await lock.release(input.control);
+      await lock.release(control);
     } catch (cause) {
       cleanupFailure = cause;
     }
@@ -1343,13 +1605,35 @@ export async function bindAgentBackupRestoreV3CandidateRecordSession(
 export async function readAgentBackupRestoreV3CandidateRecord(
   input: Readonly<ReadAgentBackupRestoreV3CandidateRecordInput>,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateRecordRead>> {
-  const session = snapshotSession(input.session);
+  const exactInput = snapshotPlainDataRecord(
+    input,
+    [
+      "candidateFs",
+      "session",
+      "componentIndex",
+      "dataIndex",
+      "control",
+      "heldLock",
+    ],
+    ["candidateFs", "session", "componentIndex", "dataIndex", "control"],
+    "Candidate record read input",
+  );
+  const candidateFs = requireCandidateFs(exactInput.candidateFs);
+  const control = snapshotRecordControl(
+    exactInput.control as Readonly<AgentBackupRestoreV3OperationControl>,
+  );
+  const session = snapshotSession(
+    exactInput.session as Readonly<AgentBackupRestoreV3StagingSession>,
+  );
+  const componentIndex = exactInput.componentIndex as number;
+  const dataIndex = exactInput.dataIndex as number;
+  const heldLock = snapshotHeldLock(exactInput.heldLock);
   if (
-    !Number.isSafeInteger(input.componentIndex) ||
-    input.componentIndex < 0 ||
-    !AGENT_BACKUP_RESTORE_V3_STREAM_COMPONENTS[input.componentIndex] ||
-    !Number.isSafeInteger(input.dataIndex) ||
-    input.dataIndex < 0
+    !Number.isSafeInteger(componentIndex) ||
+    componentIndex < 0 ||
+    !AGENT_BACKUP_RESTORE_V3_STREAM_COMPONENTS[componentIndex] ||
+    !Number.isSafeInteger(dataIndex) ||
+    dataIndex < 0
   ) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
@@ -1357,29 +1641,30 @@ export async function readAgentBackupRestoreV3CandidateRecord(
     );
   }
   let lock: AgentBackupRestoreV3CandidateFsLock | null = null;
-  const ownsLock = input.heldLock === undefined;
+  const ownsLock = heldLock === undefined;
   let payload: Uint8Array | null = null;
   let receipt: Readonly<AgentBackupRestoreV3CandidateRecordReceipt> | null =
     null;
   let primaryFailure: unknown;
   try {
     lock =
-      input.heldLock ??
-      (await input.candidateFs.acquireLock(RECORD_LOCK_NAME, input.control));
-    await input.candidateFs.assertLockHeld(lock, input.control);
+      heldLock === undefined
+        ? await candidateFs.acquireLock(RECORD_LOCK_NAME, control)
+        : heldLock;
+    await candidateFs.assertLockHeld(lock, control);
     const sessionJournal = await requireExistingSessionJournal(
-      input.candidateFs,
+      candidateFs,
       session,
-      input.control,
+      control,
       lock,
     );
     receipt = await readReceiptSlot(
-      input.candidateFs,
+      candidateFs,
       session,
       sessionJournal,
-      input.componentIndex,
-      input.dataIndex,
-      input.control,
+      componentIndex,
+      dataIndex,
+      control,
       lock,
     );
     if (!receipt) {
@@ -1389,18 +1674,18 @@ export async function readAgentBackupRestoreV3CandidateRecord(
       );
     }
     await validateReceiptChain(
-      input.candidateFs,
+      candidateFs,
       session,
       sessionJournal,
       receipt,
-      input.control,
+      control,
       lock,
     );
     payload = await readPayloadForReceipt(
-      input.candidateFs,
+      candidateFs,
       session,
       receipt,
-      input.control,
+      control,
       lock,
     );
   } catch (cause) {
@@ -1410,7 +1695,7 @@ export async function readAgentBackupRestoreV3CandidateRecord(
   let cleanupFailure: unknown;
   try {
     if (lock && ownsLock) {
-      await lock.release(input.control);
+      await lock.release(control);
       lock = null;
     }
   } catch (cause) {
@@ -1422,7 +1707,7 @@ export async function readAgentBackupRestoreV3CandidateRecord(
     !payload ||
     !receipt
   ) {
-    payload?.fill(0);
+    zeroize(payload);
     if (primaryFailure !== undefined && cleanupFailure !== undefined) {
       recordError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_CLEANUP_FAILED",

@@ -21,7 +21,7 @@ import {
 const dbHelpersActual = await import("../../helpers");
 const dbHelpersSnapshot = { ...dbHelpersActual };
 interface CommitAcknowledgmentLoss {
-  readonly sqlState: "08006" | "57P01";
+  readonly sqlState: "08006" | "40003" | "57P01" | "57P02";
   readonly afterCommit?: () => Promise<void>;
   intercepted: boolean;
 }
@@ -85,6 +85,18 @@ const ATTEMPT_F = {
   leaseId: "50000000-0000-4000-8000-000000000042",
   leaseGeneration: "50000000-0000-4000-8000-000000000043",
   restoreOperationId: "50000000-0000-4000-8000-000000000044",
+} as const;
+const ATTEMPT_G = {
+  restoreAttemptId: "50000000-0000-4000-8000-000000000051",
+  leaseId: "50000000-0000-4000-8000-000000000052",
+  leaseGeneration: "50000000-0000-4000-8000-000000000053",
+  restoreOperationId: "50000000-0000-4000-8000-000000000054",
+} as const;
+const ATTEMPT_H = {
+  restoreAttemptId: "50000000-0000-4000-8000-000000000061",
+  leaseId: "50000000-0000-4000-8000-000000000062",
+  leaseGeneration: "50000000-0000-4000-8000-000000000063",
+  restoreOperationId: "50000000-0000-4000-8000-000000000064",
 } as const;
 
 const ORIGINAL_ENV = {
@@ -316,7 +328,7 @@ function errorChainText(cause: unknown): string {
 }
 
 async function withLostNextCommitAcknowledgment<T>(input: {
-  readonly sqlState: "08006" | "57P01";
+  readonly sqlState: "08006" | "40003" | "57P01" | "57P02";
   readonly afterCommit?: () => Promise<void>;
   readonly run: () => Promise<T>;
 }): Promise<T> {
@@ -449,7 +461,9 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       });
       expect(expiredAuthorize.status).toBe("rejected");
       if (expiredAuthorize.status === "rejected") {
-        expect(errorChainText(expiredAuthorize.reason)).toMatch(/expired after authority locks/);
+        expect(errorChainText(expiredAuthorize.reason)).toMatch(
+          /seal authorization lacks current candidate authority/,
+        );
       }
       await Bun.sleep(50);
       const noLateAuthorize = await control.query<{
@@ -500,7 +514,9 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       });
       expect(expiredSeal.status).toBe("rejected");
       if (expiredSeal.status === "rejected") {
-        expect(errorChainText(expiredSeal.reason)).toMatch(/expired after terminal locks/);
+        expect(errorChainText(expiredSeal.reason)).toMatch(
+          /seal command proof is stale, consumed, or divergent/,
+        );
       }
       await Bun.sleep(50);
       const noLateSeal = await control.query<{
@@ -522,6 +538,83 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
         { authorization_state: "active", candidate_state: "active", terminal_count: 0 },
       ]);
       await executionF.abort(candidateF.session, "staging-failed", operationControl);
+
+      const fixtureG = withAdditionalAttempt(fixture, ATTEMPT_G);
+      await seedAdditionalCandidateAttempt(queryClient, fixtureG, ATTEMPT_G);
+      const executionG = executionRepository.createAgentBackupRestoreV3CandidateExecution(
+        fixtureG.sourceAuthority,
+      );
+      const candidateG = await completeCandidate(executionG, fixtureG, operationControl);
+      const authorityG = sealRepository.createAgentBackupRestoreV3CandidateSealAuthority();
+      const lostAuthorizationController = new AbortController();
+      const lostAuthorizationControl = Object.freeze({
+        signal: lostAuthorizationController.signal,
+        deadlineEpochMs: Date.now() + 30_000,
+      });
+      const authorizationG = await withLostNextCommitAcknowledgment({
+        sqlState: "40003",
+        afterCommit: async () => lostAuthorizationController.abort(),
+        run: () => authorityG.authorize(candidateG.authorizationRequest, lostAuthorizationControl),
+      });
+      expect(await authorityG.authorize(candidateG.authorizationRequest, operationControl)).toEqual(
+        authorizationG,
+      );
+      await executionG.abort(candidateG.session, "staging-failed", operationControl);
+
+      const fixtureH = withAdditionalAttempt(fixture, ATTEMPT_H);
+      await seedAdditionalCandidateAttempt(queryClient, fixtureH, ATTEMPT_H);
+      const executionH = executionRepository.createAgentBackupRestoreV3CandidateExecution(
+        fixtureH.sourceAuthority,
+      );
+      const candidateH = await completeCandidate(executionH, fixtureH, operationControl);
+      const authorizationH = await sealRepository
+        .createAgentBackupRestoreV3CandidateSealAuthority()
+        .authorize(candidateH.authorizationRequest, operationControl);
+      const inFlightLocker = new Client({
+        connectionString: isolatedDsn,
+        application_name: `${APPLICATION_NAME}-in-flight-seal-locker`,
+      });
+      await inFlightLocker.connect();
+      let firstInFlightSeal: Promise<unknown> | undefined;
+      try {
+        await inFlightLocker.query("BEGIN");
+        await inFlightLocker.query(
+          "SELECT id FROM agent_sandbox_backups WHERE id = $1 FOR UPDATE",
+          [fixture.authority.backupId],
+        );
+        firstInFlightSeal = sealRepository.sealAgentBackupRestoreV3Candidate(
+          candidateH.session,
+          candidateH.receipt,
+          authorizationH,
+          operationControl,
+        );
+        expect(
+          await waitForCandidateInsertLockWaiter(
+            "agent_backup_restore_v3_candidate_terminal_commands",
+          ),
+        ).not.toBeNull();
+        const inFlightReplay = sealRepository.sealAgentBackupRestoreV3Candidate(
+          candidateH.session,
+          candidateH.receipt,
+          authorizationH,
+          {
+            signal: new AbortController().signal,
+            deadlineEpochMs: Date.now() - 1,
+          },
+        );
+        await Bun.sleep(100);
+        await inFlightLocker.query("COMMIT");
+        const [firstReceipt, replayedReceipt] = await Promise.all([
+          firstInFlightSeal,
+          inFlightReplay,
+        ]);
+        expect(firstReceipt).toEqual(candidateH.receipt);
+        expect(replayedReceipt).toEqual(candidateH.receipt);
+      } finally {
+        await inFlightLocker.query("ROLLBACK").catch(() => {});
+        await inFlightLocker.end();
+        if (firstInFlightSeal) await Promise.allSettled([firstInFlightSeal]);
+      }
 
       const concurrentSeals = await Promise.all([
         sealRepository.sealAgentBackupRestoreV3Candidate(

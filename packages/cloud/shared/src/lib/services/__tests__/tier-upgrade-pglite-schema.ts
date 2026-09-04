@@ -36,6 +36,16 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "updated_at" timestamp NOT NULL DEFAULT now(),
   PRIMARY KEY ("id")
 )`,
+  `CREATE TABLE IF NOT EXISTS "provider_admissions" (
+  "id" uuid NOT NULL DEFAULT gen_random_uuid(),
+  "organization_id" uuid NOT NULL,
+  "operation_kind" text NOT NULL,
+  "operation_id" uuid NOT NULL,
+  "admitted_at" timestamptz NOT NULL,
+  "released_at" timestamptz,
+  PRIMARY KEY ("id"),
+  UNIQUE ("operation_kind", "operation_id")
+)`,
   `CREATE TABLE IF NOT EXISTS "users" (
   "id" uuid NOT NULL DEFAULT gen_random_uuid(),
   "email" text,
@@ -204,6 +214,7 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "last_backup_at" timestamptz,
   "last_backup_attempt_at" timestamptz,
   "backup_unsupported_reason" text,
+  "backup_admission_xid" xid8 NOT NULL DEFAULT '0'::xid8,
   "last_heartbeat_at" timestamptz,
   "error_message" text,
   "error_count" integer NOT NULL DEFAULT 0,
@@ -387,6 +398,7 @@ export const PROVISIONING_JOB_TEST_TABLES: readonly string[] = [
   "source_node_record_id" uuid,
   "source_node_id" text,
   "source_node_incarnation" uuid,
+  "source_node_history_id" uuid,
   "source_provider_server_id" text,
   "source_provider_handle" text,
   "source_container_id" text,

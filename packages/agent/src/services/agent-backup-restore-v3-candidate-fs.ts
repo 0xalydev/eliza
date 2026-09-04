@@ -20,6 +20,7 @@ import {
   type AgentBackupRestoreV3CandidateFsIdentity,
   type AgentBackupRestoreV3CandidateFsLock,
   type OpenAgentBackupRestoreV3CandidateFsInput,
+  snapshotOperationControl,
 } from "./agent-backup-restore-v3-candidate-fs-control";
 import {
   type AgentBackupRestoreV3CandidateDurableJsonReceipt,
@@ -47,6 +48,15 @@ import {
   cleanupCandidateFsVolatile,
   proveCandidateFsTree,
 } from "./agent-backup-restore-v3-candidate-fs-tree";
+
+const CANDIDATE_FS_CONSTRUCTION_AUTHORITY = Symbol(
+  "candidate-fs-construction-authority",
+);
+const CANDIDATE_FS_INSTANCES = new WeakSet<object>();
+const OBJECT_FREEZE = Object.freeze;
+const REFLECT_APPLY = Reflect.apply;
+const WEAK_SET_ADD = WeakSet.prototype.add;
+const WEAK_SET_HAS = WeakSet.prototype.has;
 
 export type {
   AgentBackupRestoreV3CandidateFileTreeFileProof,
@@ -97,12 +107,20 @@ export class AgentBackupRestoreV3CandidateFs {
   readonly attemptRootIdentity: AgentBackupRestoreV3CandidateFsIdentity;
   readonly #control: AgentBackupRestoreV3CandidateFsControl;
 
-  private constructor(control: AgentBackupRestoreV3CandidateFsControl) {
+  private constructor(
+    control: AgentBackupRestoreV3CandidateFsControl,
+    constructionAuthority: symbol,
+  ) {
+    if (constructionAuthority !== CANDIDATE_FS_CONSTRUCTION_AUTHORITY) {
+      throw new TypeError("Candidate filesystem construction is private");
+    }
     this.#control = control;
     this.trustedRoot = control.trustedRoot;
     this.attemptRoot = control.attemptRoot;
     this.trustedRootIdentity = control.trustedRootIdentity;
     this.attemptRootIdentity = control.attemptRootIdentity;
+    REFLECT_APPLY(WEAK_SET_ADD, CANDIDATE_FS_INSTANCES, [this]);
+    OBJECT_FREEZE(this);
   }
 
   static async open(
@@ -110,44 +128,44 @@ export class AgentBackupRestoreV3CandidateFs {
   ): Promise<AgentBackupRestoreV3CandidateFs> {
     return new AgentBackupRestoreV3CandidateFs(
       await AgentBackupRestoreV3CandidateFsControl.open(input),
+      CANDIDATE_FS_CONSTRUCTION_AUTHORITY,
     );
   }
 
-  assertAuthority(
+  async assertAuthority(
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<void> {
-    return this.#control.assertAuthority(control);
+    return this.#control.assertAuthority(snapshotOperationControl(control));
   }
 
-  syncAttemptRoot(
+  async syncAttemptRoot(
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<void> {
-    return this.#control.syncAttemptRoot(control);
+    return this.#control.syncAttemptRoot(snapshotOperationControl(control));
   }
 
   close(): Promise<void> {
     return this.#control.close();
   }
 
-  detachLock(lock: AgentBackupRestoreV3CandidateFsLock): void {
-    this.#control.detachLock(lock);
-  }
-
-  assertLockHeld(
+  async assertLockHeld(
     lock: AgentBackupRestoreV3CandidateFsLock,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<void> {
-    return this.#control.assertLockHeld(lock, control);
+    return this.#control.assertLockHeld(
+      lock,
+      snapshotOperationControl(control),
+    );
   }
 
-  acquireLock(
+  async acquireLock(
     name: string,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<AgentBackupRestoreV3CandidateFsLock> {
-    return this.#control.acquireLock(name, control);
+    return this.#control.acquireLock(name, snapshotOperationControl(control));
   }
 
-  createPayload(
+  async createPayload(
     name: string,
     options: Readonly<CreateAgentBackupRestoreV3CandidatePayloadOptions>,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
@@ -157,12 +175,12 @@ export class AgentBackupRestoreV3CandidateFs {
       this.#control,
       name,
       options,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  provePayload(
+  async provePayload(
     name: string,
     expectedValue: Readonly<AgentBackupRestoreV3CandidatePayloadReceipt>,
     options: Readonly<ProveAgentBackupRestoreV3CandidatePayloadOptions>,
@@ -174,12 +192,12 @@ export class AgentBackupRestoreV3CandidateFs {
       name,
       expectedValue,
       options,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  readPayload(
+  async readPayload(
     name: string,
     expectedValue: Readonly<AgentBackupRestoreV3CandidatePayloadReceipt>,
     options: Readonly<ReadAgentBackupRestoreV3CandidatePayloadOptions>,
@@ -191,12 +209,12 @@ export class AgentBackupRestoreV3CandidateFs {
       name,
       expectedValue,
       options,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  readDurableJson(
+  async readDurableJson(
     name: string,
     options: Readonly<ReadAgentBackupRestoreV3CandidateDurableJsonOptions>,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
@@ -206,12 +224,12 @@ export class AgentBackupRestoreV3CandidateFs {
       this.#control,
       name,
       options,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  publishDurableJson(
+  async publishDurableJson(
     name: string,
     value: unknown,
     options: Readonly<PublishAgentBackupRestoreV3CandidateDurableJsonOptions>,
@@ -223,12 +241,12 @@ export class AgentBackupRestoreV3CandidateFs {
       name,
       value,
       options,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  proveTree(
+  async proveTree(
     relativeDirectory: string,
     limitsValue: Partial<AgentBackupRestoreV3CandidateTreeLimits> | undefined,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
@@ -238,12 +256,12 @@ export class AgentBackupRestoreV3CandidateFs {
       this.#control,
       relativeDirectory,
       limitsValue,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  ensureFileTreeDirectory(
+  async ensureFileTreeDirectory(
     relativeDirectory: string,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
     heldLock?: AgentBackupRestoreV3CandidateFsLock,
@@ -251,12 +269,12 @@ export class AgentBackupRestoreV3CandidateFs {
     return ensureCandidateFsFileTreeDirectory(
       this.#control,
       relativeDirectory,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  createFileTreeFile(
+  async createFileTreeFile(
     relativeDirectory: string,
     spec: Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec>,
     limitsValue:
@@ -270,12 +288,12 @@ export class AgentBackupRestoreV3CandidateFs {
       relativeDirectory,
       spec,
       limitsValue,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  proveFileTree(
+  async proveFileTree(
     relativeDirectory: string,
     expected: readonly Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>[],
     limitsValue:
@@ -289,12 +307,12 @@ export class AgentBackupRestoreV3CandidateFs {
       relativeDirectory,
       expected,
       limitsValue,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
 
-  cleanupVolatile(
+  async cleanupVolatile(
     names: readonly string[],
     limitsValue:
       | Partial<AgentBackupRestoreV3CandidateCleanupLimits>
@@ -306,10 +324,23 @@ export class AgentBackupRestoreV3CandidateFs {
       this.#control,
       names,
       limitsValue,
-      control,
+      snapshotOperationControl(control),
       heldLock,
     );
   }
+}
+
+OBJECT_FREEZE(AgentBackupRestoreV3CandidateFs.prototype);
+
+/** Runtime-only brand check for the unforgeable candidate-FS authority. */
+export function isAgentBackupRestoreV3CandidateFs(
+  value: unknown,
+): value is AgentBackupRestoreV3CandidateFs {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    REFLECT_APPLY(WEAK_SET_HAS, CANDIDATE_FS_INSTANCES, [value])
+  );
 }
 
 export async function openAgentBackupRestoreV3CandidateFs(

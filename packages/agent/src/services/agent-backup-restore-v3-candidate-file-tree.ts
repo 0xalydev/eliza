@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
-import { isProxy } from "node:util/types";
+import { types as utilTypes } from "node:util";
 import {
   AGENT_BACKUP_CAPTURE_V2_LIMITS,
   type AgentBackupRestoreV3OperationControl,
@@ -27,8 +27,10 @@ import {
   boundedInternalCleanup,
   CANDIDATE_FS_IO_CHUNK_BYTES,
   type CandidateFsExactStats,
+  candidateFsByteView,
   candidateFsError,
   candidateFsIdentity,
+  candidateFsNativeIoView,
   controlled,
   controlledAcquire,
   fileStatExact,
@@ -39,8 +41,11 @@ import {
   requirePositiveSafeInteger,
   requirePrivateDirectory,
   requireRelativePath,
+  runAllBoundedInternalCleanup,
   sameIdentity,
   sameStableFile,
+  snapshotOperationControl,
+  snapshotOwnDataRecord,
   writeAll,
 } from "./agent-backup-restore-v3-candidate-fs-control";
 import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
@@ -49,11 +54,113 @@ const FILE_TREE_DERIVATION =
   "elizaos.agent-backup.restore-v3-candidate-file-tree.v1";
 const RESERVED_PREFIX = ".restore-v3-";
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
-const INTRINSIC_UINT8_ARRAY_SET = Uint8Array.prototype.set;
+const BUFFER_DIRECTORY_ENCODING = "buffer" as BufferEncoding;
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const ARRAY_BUFFER_BYTE_LENGTH_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
+const TYPED_ARRAY_BYTE_LENGTH_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteLength",
+)?.get;
+const TYPED_ARRAY_BUFFER_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "buffer",
+)?.get;
+const TYPED_ARRAY_BYTE_OFFSET_GETTER = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+  TYPED_ARRAY_PROTOTYPE,
+  "byteOffset",
+)?.get;
+const REFLECT_APPLY = Reflect.apply;
+const INTRINSIC_UINT8_ARRAY = Uint8Array;
+const UINT8_ARRAY_SET = Uint8Array.prototype.set;
+const UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const ARRAY_SORT = Array.prototype.sort;
+const BUFFER_FROM = Buffer.from;
+const BUFFER_COMPARE = Buffer.compare;
+const BUFFER_TO_STRING = Buffer.prototype.toString;
+const IS_PROXY = utilTypes.isProxy;
+const IS_UINT8_ARRAY = utilTypes.isUint8Array;
 const MAXIMUM_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const CANDIDATE_FILE_STAGING_MODE = 0o600;
 // Linux uapi O_PATH. Node/Bun do not expose it consistently in fs.constants.
 const LINUX_O_PATH = 0o10000000;
+
+function typedArrayByteLength(value: Uint8Array): number {
+  return REFLECT_APPLY(
+    TYPED_ARRAY_BYTE_LENGTH_GETTER as () => number,
+    value,
+    [],
+  );
+}
+
+function typedArrayBuffer(value: Uint8Array): ArrayBufferLike {
+  return REFLECT_APPLY(
+    TYPED_ARRAY_BUFFER_GETTER as () => ArrayBufferLike,
+    value,
+    [],
+  );
+}
+
+function typedArrayByteOffset(value: Uint8Array): number {
+  return REFLECT_APPLY(
+    TYPED_ARRAY_BYTE_OFFSET_GETTER as () => number,
+    value,
+    [],
+  );
+}
+
+function zeroBytes(value: Uint8Array, start?: number, end?: number): void {
+  REFLECT_APPLY(
+    UINT8_ARRAY_FILL,
+    value,
+    end === undefined
+      ? start === undefined
+        ? [0]
+        : [0, start]
+      : [0, start, end],
+  );
+}
+
+function bufferFromString(value: string, encoding: BufferEncoding): Buffer {
+  return REFLECT_APPLY(BUFFER_FROM, Buffer, [value, encoding]);
+}
+
+function bufferFromArrayBuffer(
+  value: ArrayBufferLike,
+  byteOffset: number,
+  byteLength: number,
+): Buffer {
+  return REFLECT_APPLY(BUFFER_FROM, Buffer, [value, byteOffset, byteLength]);
+}
+
+function bufferCompare(left: Uint8Array, right: Uint8Array): number {
+  return REFLECT_APPLY(BUFFER_COMPARE, Buffer, [left, right]);
+}
+
+function bufferToUtf8(value: Buffer): string {
+  return REFLECT_APPLY(BUFFER_TO_STRING, value, ["utf8"]);
+}
+
+function compareNames(left: string, right: string): number {
+  const encodedLeft = bufferFromString(left, "utf8");
+  const encodedRight = bufferFromString(right, "utf8");
+  try {
+    return bufferCompare(encodedLeft, encodedRight);
+  } finally {
+    zeroBytes(encodedLeft);
+    zeroBytes(encodedRight);
+  }
+}
+
+function sortNames(value: string[]): string[] {
+  REFLECT_APPLY(ARRAY_SORT, value, [compareNames]);
+  return value;
+}
 
 export const AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS = Object.freeze(
   {
@@ -103,29 +210,45 @@ function fileTreeError(code: string, message: string, cause?: unknown): never {
 function resolveLimits(
   value: Partial<AgentBackupRestoreV3CandidateFileTreeLimits> | undefined,
 ): Readonly<AgentBackupRestoreV3CandidateFileTreeLimits> {
-  const limits = Object.freeze({
+  const snapshot: Readonly<Record<string, unknown>> =
+    value === undefined
+      ? OBJECT_FREEZE({})
+      : snapshotOwnDataRecord(
+          value,
+          [
+            "maximumBytes",
+            "maximumFiles",
+            "maximumDirectories",
+            "maximumDepth",
+            "maximumPathBytes",
+          ],
+          [],
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT_INVALID",
+          "Candidate file-tree limits must be exact data properties",
+        );
+  const limits = OBJECT_FREEZE({
     maximumBytes: requirePositiveSafeInteger(
-      value?.maximumBytes ??
+      (snapshot.maximumBytes as number | undefined) ??
         AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumBytes,
       "maximumBytes",
     ),
     maximumFiles: requirePositiveSafeInteger(
-      value?.maximumFiles ??
+      (snapshot.maximumFiles as number | undefined) ??
         AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumFiles,
       "maximumFiles",
     ),
     maximumDirectories: requirePositiveSafeInteger(
-      value?.maximumDirectories ??
+      (snapshot.maximumDirectories as number | undefined) ??
         AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumDirectories,
       "maximumDirectories",
     ),
     maximumDepth: requirePositiveSafeInteger(
-      value?.maximumDepth ??
+      (snapshot.maximumDepth as number | undefined) ??
         AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumDepth,
       "maximumDepth",
     ),
     maximumPathBytes: requirePositiveSafeInteger(
-      value?.maximumPathBytes ??
+      (snapshot.maximumPathBytes as number | undefined) ??
         AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMITS.maximumPathBytes,
       "maximumPathBytes",
     ),
@@ -258,42 +381,40 @@ function parseFileSpec(
   value: Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec>,
   limits: Readonly<AgentBackupRestoreV3CandidateFileTreeLimits>,
 ): Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec> {
+  const snapshot = snapshotOwnDataRecord(
+    value,
+    ["path", "sizeBytes", "mode", "mtimeMs"],
+    ["path", "sizeBytes", "mode", "mtimeMs"],
+    "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_SPEC_INVALID",
+    "Candidate file specification must contain exact enumerable data properties",
+  );
+  const filePath = snapshot.path;
+  const sizeBytes = snapshot.sizeBytes;
+  const mode = snapshot.mode;
+  const mtimeMs = snapshot.mtimeMs;
   if (
-    !value ||
-    typeof value !== "object" ||
-    isProxy(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== 4 ||
-    !Number.isSafeInteger(value.sizeBytes) ||
-    value.sizeBytes < 0 ||
-    value.sizeBytes > limits.maximumBytes ||
-    !Number.isSafeInteger(value.mode) ||
-    value.mode < 0 ||
-    value.mode > 0o777 ||
-    !Number.isSafeInteger(value.mtimeMs) ||
-    value.mtimeMs < 0 ||
-    value.mtimeMs > MAXIMUM_DATE_EPOCH_MS
+    typeof filePath !== "string" ||
+    !Number.isSafeInteger(sizeBytes) ||
+    (sizeBytes as number) < 0 ||
+    (sizeBytes as number) > limits.maximumBytes ||
+    !Number.isSafeInteger(mode) ||
+    (mode as number) < 0 ||
+    (mode as number) > 0o777 ||
+    !Number.isSafeInteger(mtimeMs) ||
+    (mtimeMs as number) < 0 ||
+    (mtimeMs as number) > MAXIMUM_DATE_EPOCH_MS
   ) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_SPEC_INVALID",
       "Candidate file specification is not exact and canonical",
     );
   }
-  for (const key of ["path", "sizeBytes", "mode", "mtimeMs"] as const) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-      fileTreeError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_SPEC_INVALID",
-        "Candidate file specification contains an accessor or hidden field",
-      );
-    }
-  }
-  requireCanonicalFilePath(value.path, limits);
-  return Object.freeze({
-    path: value.path,
-    sizeBytes: value.sizeBytes,
-    mode: value.mode,
-    mtimeMs: value.mtimeMs,
+  requireCanonicalFilePath(filePath, limits);
+  return OBJECT_FREEZE({
+    path: filePath,
+    sizeBytes: sizeBytes as number,
+    mode: mode as number,
+    mtimeMs: mtimeMs as number,
   });
 }
 
@@ -301,63 +422,166 @@ function parseExpectedProof(
   value: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>,
   limits: Readonly<AgentBackupRestoreV3CandidateFileTreeLimits>,
 ): Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof> {
+  const snapshot = snapshotOwnDataRecord(
+    value,
+    ["path", "sizeBytes", "mode", "mtimeMs", "sha256", "device", "inode"],
+    ["path", "sizeBytes", "mode", "mtimeMs", "sha256", "device", "inode"],
+    "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_PROOF_INVALID",
+    "Candidate file proof must contain exact enumerable data properties",
+  );
   if (
-    !value ||
-    typeof value !== "object" ||
-    isProxy(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype ||
-    Reflect.ownKeys(value).length !== 7 ||
-    Object.keys(value).sort().join("\0") !==
-      [
-        "device",
-        "inode",
-        "mode",
-        "mtimeMs",
-        "path",
-        "sha256",
-        "sizeBytes",
-      ].join("\0") ||
-    !SHA256_PATTERN.test(value.sha256) ||
-    !/^(?:0|[1-9][0-9]*)$/.test(value.device) ||
-    !/^(?:0|[1-9][0-9]*)$/.test(value.inode)
+    typeof snapshot.sha256 !== "string" ||
+    !SHA256_PATTERN.test(snapshot.sha256) ||
+    typeof snapshot.device !== "string" ||
+    !/^(?:0|[1-9][0-9]*)$/.test(snapshot.device) ||
+    typeof snapshot.inode !== "string" ||
+    !/^(?:0|[1-9][0-9]*)$/.test(snapshot.inode)
   ) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_PROOF_INVALID",
       "Candidate file proof is not exact and canonical",
     );
   }
-  for (const key of [
-    "path",
-    "sizeBytes",
-    "mode",
-    "mtimeMs",
-    "sha256",
-    "device",
-    "inode",
-  ] as const) {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
-      fileTreeError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_PROOF_INVALID",
-        "Candidate file proof contains an accessor or hidden field",
-      );
-    }
-  }
   const spec = parseFileSpec(
     {
-      path: value.path,
-      sizeBytes: value.sizeBytes,
-      mode: value.mode,
-      mtimeMs: value.mtimeMs,
+      path: snapshot.path as string,
+      sizeBytes: snapshot.sizeBytes as number,
+      mode: snapshot.mode as number,
+      mtimeMs: snapshot.mtimeMs as number,
     },
     limits,
   );
-  return Object.freeze({
+  return OBJECT_FREEZE({
     ...spec,
-    sha256: value.sha256,
-    device: value.device,
-    inode: value.inode,
+    sha256: snapshot.sha256,
+    device: snapshot.device,
+    inode: snapshot.inode,
   });
+}
+
+function fileTreeFragmentByteLength(fragment: Uint8Array): number {
+  if (
+    IS_PROXY(fragment) ||
+    !IS_UINT8_ARRAY(fragment) ||
+    OBJECT_GET_PROTOTYPE_OF(fragment) !== INTRINSIC_UINT8_ARRAY.prototype ||
+    OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(fragment, Symbol.iterator) !==
+      undefined ||
+    !TYPED_ARRAY_BYTE_LENGTH_GETTER ||
+    !TYPED_ARRAY_BUFFER_GETTER ||
+    !ARRAY_BUFFER_BYTE_LENGTH_GETTER
+  ) {
+    fileTreeError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_FRAGMENT_INVALID",
+      "Candidate file-tree write requires one intrinsic bounded fragment",
+    );
+  }
+  try {
+    const buffer = REFLECT_APPLY(TYPED_ARRAY_BUFFER_GETTER, fragment, []);
+    // Reject SharedArrayBuffer so the synchronous owned copy cannot be torn by
+    // another agent while its size and bytes are observed.
+    REFLECT_APPLY(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
+    return typedArrayByteLength(fragment);
+  } catch (cause) {
+    fileTreeError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_FRAGMENT_INVALID",
+      "Candidate file-tree fragment requires private non-shared storage",
+      cause,
+    );
+  }
+}
+
+function copyFileTreeFragment(
+  fragment: Uint8Array,
+  byteLength: number,
+): Uint8Array {
+  const owned = new INTRINSIC_UINT8_ARRAY(byteLength);
+  try {
+    REFLECT_APPLY(UINT8_ARRAY_SET, owned, [fragment]);
+  } catch (cause) {
+    zeroBytes(owned);
+    fileTreeError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_FRAGMENT_INVALID",
+      "Candidate file-tree fragment could not be copied exactly",
+      cause,
+    );
+  }
+  return owned;
+}
+
+async function readExactDirectoryNames(
+  anchor: string,
+  control: Readonly<AgentBackupRestoreV3OperationControl>,
+  maximumNames: number,
+  limitCode: string,
+  limitMessage: string,
+): Promise<string[]> {
+  const directory = await controlledAcquire(
+    () => fs.opendir(anchor, { encoding: BUFFER_DIRECTORY_ENCODING }),
+    (lateDirectory) => lateDirectory.close(),
+    control,
+  );
+  const names: string[] = [];
+  try {
+    while (true) {
+      const entry = await controlled(() => directory.read(), control);
+      if (entry === null) break;
+      if (names.length >= maximumNames) {
+        fileTreeError(limitCode, limitMessage);
+      }
+      const rawName = IS_UINT8_ARRAY(entry) ? entry : entry.name;
+      if (!IS_UINT8_ARRAY(rawName)) {
+        fileTreeError(
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_UNSAFE",
+          "Candidate file-tree contains a non-UTF-8 or unsafe entry name",
+        );
+      }
+      const encodedName = bufferFromArrayBuffer(
+        typedArrayBuffer(rawName),
+        typedArrayByteOffset(rawName),
+        typedArrayByteLength(rawName),
+      );
+      let name: string;
+      try {
+        name = bufferToUtf8(encodedName);
+        const roundTrip = bufferFromString(name, "utf8");
+        try {
+          if (bufferCompare(roundTrip, encodedName) !== 0) {
+            fileTreeError(
+              "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_UNSAFE",
+              "Candidate file-tree contains a non-UTF-8 or unsafe entry name",
+            );
+          }
+        } finally {
+          zeroBytes(roundTrip);
+        }
+      } finally {
+        zeroBytes(encodedName);
+      }
+      requirePathSegment(name, "candidate tree entry");
+      names[names.length] = name;
+    }
+  } finally {
+    await boundedInternalCleanup(() => directory.close());
+  }
+  return sortNames(names);
+}
+
+function sameStableDirectory(
+  left: CandidateFsExactStats,
+  right: CandidateFsExactStats,
+): boolean {
+  return (
+    left.directory &&
+    right.directory &&
+    !left.symbolicLink &&
+    !right.symbolicLink &&
+    sameIdentity(left, right) &&
+    left.mode === right.mode &&
+    left.linkCount === right.linkCount &&
+    left.size === right.size &&
+    left.modifiedNanoseconds === right.modifiedNanoseconds &&
+    left.changedNanoseconds === right.changedNanoseconds
+  );
 }
 
 async function ensureDirectories(
@@ -430,15 +654,17 @@ async function hashOpenedFile(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
 ): Promise<string> {
   const hash = createHash("sha256");
-  const chunk = new Uint8Array(
+  const chunk = new INTRINSIC_UINT8_ARRAY(
     Math.min(CANDIDATE_FS_IO_CHUNK_BYTES, Math.max(1, opened.size)),
   );
+  const chunkByteLength = typedArrayByteLength(chunk);
+  const ioChunk = candidateFsNativeIoView(chunk);
   let position = 0;
   try {
     while (position < opened.size) {
-      const requested = Math.min(chunk.byteLength, opened.size - position);
+      const requested = Math.min(chunkByteLength, opened.size - position);
       const read = await controlled(
-        () => handle.read(chunk, 0, requested, position),
+        () => handle.read(ioChunk, 0, requested, position),
         control,
       );
       if (read.bytesRead <= 0) {
@@ -447,14 +673,21 @@ async function hashOpenedFile(
           "Candidate file ended during exact proof",
         );
       }
-      hash.update(chunk.subarray(0, read.bytesRead));
-      chunk.fill(0, 0, read.bytesRead);
+      hash.update(
+        candidateFsNativeIoView(candidateFsByteView(chunk, 0, read.bytesRead)),
+      );
+      zeroBytes(chunk, 0, read.bytesRead);
       position += read.bytesRead;
     }
     return hash.digest("hex");
   } finally {
-    chunk.fill(0);
+    zeroBytes(chunk);
   }
+}
+
+interface ProvenFileTreeFile {
+  readonly proof: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>;
+  readonly stats: CandidateFsExactStats;
 }
 
 async function proveOpenedFile(
@@ -464,7 +697,7 @@ async function proveOpenedFile(
   spec: Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec>,
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   allowStagingMode = false,
-): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>> {
+): Promise<Readonly<ProvenFileTreeFile>> {
   const [visible, before] = await controlled(
     () => Promise.all([lstatExact(targetPath), fileStatExact(handle)]),
     control,
@@ -480,10 +713,16 @@ async function proveOpenedFile(
   if (
     !sameIdentity(visible, expectedIdentity) ||
     !sameIdentity(before, expectedIdentity) ||
+    !sameIdentity(visible, before) ||
+    visible.size !== spec.sizeBytes ||
     before.size !== spec.sizeBytes ||
+    ((visible.mode & 0o777) !== spec.mode &&
+      (!allowStagingMode ||
+        (visible.mode & 0o777) !== CANDIDATE_FILE_STAGING_MODE)) ||
     ((before.mode & 0o777) !== spec.mode &&
       (!allowStagingMode ||
         (before.mode & 0o777) !== CANDIDATE_FILE_STAGING_MODE)) ||
+    exactMtimeMs(visible) !== spec.mtimeMs ||
     exactMtimeMs(before) !== spec.mtimeMs
   ) {
     fileTreeError(
@@ -491,53 +730,67 @@ async function proveOpenedFile(
       "Candidate output differs from its exact path, size, mode, or mtime",
     );
   }
-  const sha256 = await hashOpenedFile(handle, before, control);
+  if ((before.mode & 0o777) !== spec.mode) {
+    await controlled(() => handle.chmod(spec.mode), control);
+    await controlled(() => handle.sync(), control);
+  }
+  // Take the hash baseline only after every intentional metadata mutation.
+  // ctime can then close the entire content-proof window instead of being
+  // invalidated by our own final chmod.
+  const [visibleBeforeHash, beforeHash] = await controlled(
+    () => Promise.all([lstatExact(targetPath), fileStatExact(handle)]),
+    control,
+  );
+  requireRegularSingleLink(
+    visibleBeforeHash,
+    "Candidate output path changed before its final hash",
+  );
+  requireRegularSingleLink(
+    beforeHash,
+    "Candidate output descriptor changed before its final hash",
+  );
+  if (
+    !sameIdentity(visibleBeforeHash, expectedIdentity) ||
+    !sameStableFile(visibleBeforeHash, beforeHash) ||
+    beforeHash.size !== spec.sizeBytes ||
+    (beforeHash.mode & 0o777) !== spec.mode ||
+    exactMtimeMs(beforeHash) !== spec.mtimeMs
+  ) {
+    fileTreeError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
+      "Candidate output differs before its final stable hash",
+    );
+  }
+  const sha256 = await hashOpenedFile(handle, beforeHash, control);
   const [visibleAfterHash, afterHash] = await controlled(
     () => Promise.all([lstatExact(targetPath), fileStatExact(handle)]),
     control,
   );
+  requireRegularSingleLink(
+    visibleAfterHash,
+    "Candidate output path changed during its final hash",
+  );
+  requireRegularSingleLink(
+    afterHash,
+    "Candidate output descriptor changed during its final hash",
+  );
   if (
-    !sameStableFile(before, afterHash) ||
-    !sameStableFile(visible, visibleAfterHash) ||
-    !sameIdentity(afterHash, visibleAfterHash)
+    !sameStableFile(beforeHash, afterHash) ||
+    !sameStableFile(visibleBeforeHash, visibleAfterHash) ||
+    !sameStableFile(visibleAfterHash, afterHash)
   ) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
-      "Candidate output changed during exact proof",
+      "Candidate output changed during its final exact proof",
     );
   }
-  if ((afterHash.mode & 0o777) !== spec.mode) {
-    await controlled(() => handle.chmod(spec.mode), control);
-    await controlled(() => handle.sync(), control);
-  }
-  const [visibleAfter, after] = await controlled(
-    () => Promise.all([lstatExact(targetPath), fileStatExact(handle)]),
-    control,
-  );
-  requireRegularSingleLink(
-    visibleAfter,
-    "Candidate output path changed while applying its final mode",
-  );
-  requireRegularSingleLink(
-    after,
-    "Candidate output descriptor changed while applying its final mode",
-  );
-  if (
-    !sameIdentity(afterHash, after) ||
-    !sameIdentity(visibleAfter, after) ||
-    after.size !== spec.sizeBytes ||
-    (after.mode & 0o777) !== spec.mode ||
-    exactMtimeMs(after) !== spec.mtimeMs
-  ) {
-    fileTreeError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
-      "Candidate output differs after applying its exact final mode",
-    );
-  }
-  return Object.freeze({
-    ...spec,
-    ...candidateFsIdentity(after),
-    sha256,
+  return OBJECT_FREEZE({
+    proof: OBJECT_FREEZE({
+      ...spec,
+      ...candidateFsIdentity(afterHash),
+      sha256,
+    }),
+    stats: afterHash,
   });
 }
 
@@ -545,7 +798,7 @@ async function proveFinalPath(
   targetPath: string,
   spec: Readonly<AgentBackupRestoreV3CandidateFileTreeFileSpec>,
   control: Readonly<AgentBackupRestoreV3OperationControl>,
-): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>> {
+): Promise<Readonly<ProvenFileTreeFile>> {
   const visible = await controlled(() => lstatExact(targetPath), control);
   requireRegularSingleLink(
     visible,
@@ -587,8 +840,8 @@ async function proveFinalPath(
   let authorityHandle: FileHandle | null = null;
   let readHandle: FileHandle | null = null;
   let restoreAnchor = targetPath;
-  let result: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof> | null =
-    null;
+  let restoreModeNeeded = false;
+  let result: Readonly<ProvenFileTreeFile> | null = null;
   let primaryFailure: unknown;
   try {
     if (process.platform === "linux") {
@@ -616,6 +869,7 @@ async function proveFinalPath(
 
     assertActive(control);
     await fs.chmod(restoreAnchor, CANDIDATE_FILE_STAGING_MODE);
+    restoreModeNeeded = true;
     assertActive(control);
     readHandle = await controlledAcquire(
       () =>
@@ -646,42 +900,42 @@ async function proveFinalPath(
       control,
       true,
     );
+    // proveOpenedFile restores and verifies the requested final mode before it
+    // takes the stable ctime/hash baseline. Avoid a second chmod afterwards.
+    restoreModeNeeded = false;
   } catch (cause) {
     primaryFailure = cause;
   }
 
-  const cleanupFailures: unknown[] = [];
-  try {
-    await boundedInternalCleanup(() => fs.chmod(restoreAnchor, spec.mode));
-  } catch (cause) {
-    cleanupFailures.push(cause);
+  const cleanupOperations: Array<() => Promise<void>> = [];
+  if (restoreModeNeeded) {
+    cleanupOperations.push(() => fs.chmod(restoreAnchor, spec.mode));
   }
   if (readHandle) {
-    try {
-      await boundedInternalCleanup(() => (readHandle as FileHandle).close());
-    } catch (cause) {
-      cleanupFailures.push(cause);
-    }
+    const handleToClose = readHandle;
+    readHandle = null;
+    cleanupOperations.push(() => handleToClose.close());
   }
   if (authorityHandle) {
-    try {
-      await boundedInternalCleanup(() =>
-        (authorityHandle as FileHandle).close(),
-      );
-    } catch (cause) {
-      cleanupFailures.push(cause);
-    }
+    const handleToClose = authorityHandle;
+    authorityHandle = null;
+    cleanupOperations.push(() => handleToClose.close());
   }
-  if (primaryFailure !== undefined && cleanupFailures.length > 0) {
+  let cleanupFailure: unknown;
+  try {
+    await runAllBoundedInternalCleanup(cleanupOperations);
+  } catch (cause) {
+    cleanupFailure = cause;
+  }
+  if (primaryFailure !== undefined && cleanupFailure !== undefined) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
       "Candidate final proof and permission restoration both failed",
-      new AggregateError([primaryFailure, ...cleanupFailures]),
+      new AggregateError([primaryFailure, cleanupFailure]),
     );
   }
   if (primaryFailure !== undefined) throw primaryFailure;
-  if (cleanupFailures.length === 1) throw cleanupFailures[0];
-  if (cleanupFailures.length > 1) throw new AggregateError(cleanupFailures);
+  if (cleanupFailure !== undefined) throw cleanupFailure;
   if (!result) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
@@ -689,18 +943,20 @@ async function proveFinalPath(
     );
   }
   const finalVisible = await controlled(() => lstatExact(targetPath), control);
+  requireRegularSingleLink(
+    finalVisible,
+    "Candidate final path changed after permission-safe proof",
+  );
   if (
-    !sameIdentity(finalVisible, visible) ||
-    finalVisible.size !== spec.sizeBytes ||
-    (finalVisible.mode & 0o777) !== spec.mode ||
-    exactMtimeMs(finalVisible) !== spec.mtimeMs
+    !sameStableFile(finalVisible, result.stats) ||
+    !sameIdentity(finalVisible, visible)
   ) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
       "Candidate final path changed after permission-safe proof",
     );
   }
-  return result;
+  return OBJECT_FREEZE({ proof: result.proof, stats: finalVisible });
 }
 
 export class AgentBackupRestoreV3CandidateFileTreeWriter {
@@ -718,6 +974,10 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
   #replayedProof: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof> | null;
   #writing = false;
   #closed = false;
+  #finalizePromise: Promise<
+    Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>
+  > | null = null;
+  #closePromise: Promise<void> | null = null;
 
   constructor(input: {
     owner: AgentBackupRestoreV3CandidateFsControl;
@@ -752,17 +1012,9 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
     fragment: Uint8Array,
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<void> {
-    if (
-      !fragment ||
-      typeof fragment !== "object" ||
-      isProxy(fragment) ||
-      !(fragment instanceof Uint8Array) ||
-      Object.getPrototypeOf(fragment) !== Uint8Array.prototype ||
-      Object.getOwnPropertyDescriptor(fragment, Symbol.iterator) !==
-        undefined ||
-      fragment.byteLength === 0 ||
-      fragment.byteLength > CANDIDATE_FS_IO_CHUNK_BYTES
-    ) {
+    const exactControl = snapshotOperationControl(control);
+    const byteLength = fileTreeFragmentByteLength(fragment);
+    if (byteLength === 0 || byteLength > CANDIDATE_FS_IO_CHUNK_BYTES) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_FRAGMENT_INVALID",
         "Candidate file-tree write requires one intrinsic bounded fragment",
@@ -774,22 +1026,28 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
       this.replayed ||
       !this.#handle ||
       !this.#identity ||
-      this.#position > this.spec.sizeBytes - fragment.byteLength
+      this.#position > this.spec.sizeBytes - byteLength
     ) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_WRITER_INVALID",
         "Candidate file-tree writer state or byte bound is invalid",
       );
     }
-    const owned = new Uint8Array(fragment.byteLength);
-    INTRINSIC_UINT8_ARRAY_SET.call(owned, fragment, 0);
+    const owned = copyFileTreeFragment(fragment, byteLength);
+    let releaseLockUse: () => void;
+    try {
+      releaseLockUse = this.#owner.beginLockUse(this.#lock);
+    } catch (cause) {
+      zeroBytes(owned);
+      throw cause;
+    }
     this.#writing = true;
     return (async () => {
       try {
-        await this.#owner.assertLockHeld(this.#lock, control);
+        await this.#owner.assertLockHeld(this.#lock, exactControl);
         const before = await controlled(
           () => fileStatExact(this.#handle as FileHandle),
-          control,
+          exactControl,
         );
         requireRegularSingleLink(
           before,
@@ -805,14 +1063,16 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
           this.#handle as FileHandle,
           owned,
           this.#position,
-          control,
+          exactControl,
         );
-        this.#position += owned.byteLength;
-        await this.#owner.assertLockHeld(this.#lock, control);
+        this.#position += byteLength;
+        await this.#owner.assertLockHeld(this.#lock, exactControl);
       } catch (cause) {
         this.#closed = true;
+        const disposal = this.#dispose(releaseLockUse);
+        this.#closePromise = disposal;
         try {
-          await this.#dispose();
+          await disposal;
         } catch (cleanupCause) {
           throw new AgentBackupRestoreV3CandidateFsError(
             "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
@@ -822,22 +1082,36 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
         }
         throw cause;
       } finally {
-        owned.fill(0);
+        // The release closure is idempotent. On failure #dispose already ran
+        // it after closing descriptors and before releasing an owned lease.
+        releaseLockUse();
+        zeroBytes(owned);
         this.#writing = false;
       }
     })();
   }
 
-  async finalize(
+  finalize(
     control: Readonly<AgentBackupRestoreV3OperationControl>,
   ): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>> {
+    if (this.#finalizePromise) return this.#finalizePromise;
     if (this.#closed || this.#writing) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_WRITER_INVALID",
         "Candidate file-tree writer cannot finalize in its current state",
       );
     }
+    const exactControl = snapshotOperationControl(control);
+    const releaseLockUse = this.#owner.beginLockUse(this.#lock);
     this.#closed = true;
+    this.#finalizePromise = this.#finalizeOnce(exactControl, releaseLockUse);
+    return this.#finalizePromise;
+  }
+
+  async #finalizeOnce(
+    control: Readonly<AgentBackupRestoreV3OperationControl>,
+    releaseLockUse: () => void,
+  ): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>> {
     let result: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof> | null =
       null;
     let primaryFailure: unknown;
@@ -910,7 +1184,7 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
           () => (this.#parentHandle as FileHandle).sync(),
           control,
         );
-        result = await proveOpenedFile(
+        const proven = await proveOpenedFile(
           this.#handle,
           this.#targetPath,
           this.#identity,
@@ -918,12 +1192,14 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
           control,
           true,
         );
+        result = proven.proof;
       }
     } catch (cause) {
       primaryFailure = cause;
     }
+    const disposal = this.#dispose(releaseLockUse);
     try {
-      await this.#dispose();
+      await disposal;
     } catch (cleanupCause) {
       if (primaryFailure !== undefined) {
         throw new AgentBackupRestoreV3CandidateFsError(
@@ -944,48 +1220,74 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
     return result;
   }
 
-  async close(): Promise<void> {
-    if (this.#closed) return;
+  close(): Promise<void> {
+    if (this.#closePromise) return this.#closePromise;
+    if (this.#finalizePromise) {
+      this.#closePromise = this.#finalizePromise.then(() => undefined);
+      return this.#closePromise;
+    }
     if (this.#writing) {
-      fileTreeError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_WRITER_INVALID",
-        "Candidate file-tree writer cannot close during a write",
-      );
+      try {
+        fileTreeError(
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_WRITER_INVALID",
+          "Candidate file-tree writer cannot close during a write",
+        );
+      } catch (cause) {
+        return Promise.reject(cause);
+      }
+    }
+    if (this.#closed) {
+      this.#closePromise = Promise.resolve();
+      return this.#closePromise;
+    }
+    let releaseLockUse: (() => void) | undefined;
+    let lockFailure: unknown;
+    try {
+      releaseLockUse = this.#owner.beginLockUse(this.#lock);
+    } catch (cause) {
+      lockFailure = cause;
     }
     this.#closed = true;
-    await this.#dispose();
+    const disposal = this.#dispose(releaseLockUse);
+    this.#closePromise =
+      lockFailure === undefined
+        ? disposal
+        : disposal.then(
+            () => Promise.reject(lockFailure),
+            (cleanupCause) =>
+              Promise.reject(
+                new AgentBackupRestoreV3CandidateFsError(
+                  "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
+                  "Candidate file close lost its lock and bounded cleanup also failed",
+                  { cause: new AggregateError([lockFailure, cleanupCause]) },
+                ),
+              ),
+          );
+    return this.#closePromise;
   }
 
-  async #dispose(): Promise<void> {
-    const failures: unknown[] = [];
+  async #dispose(releaseLockUse?: () => void): Promise<void> {
+    const cleanupOperations: Array<() => Promise<void>> = [];
     const handle = this.#handle;
     this.#handle = null;
     if (handle) {
-      try {
-        await boundedInternalCleanup(() => handle.close());
-      } catch (cause) {
-        failures.push(cause);
-      }
+      cleanupOperations.push(() => handle.close());
     }
     const parent = this.#parentHandle;
     this.#parentHandle = null;
     if (parent) {
-      try {
-        await boundedInternalCleanup(() => parent.close());
-      } catch (cause) {
-        failures.push(cause);
-      }
+      cleanupOperations.push(() => parent.close());
+    }
+    if (releaseLockUse) {
+      cleanupOperations.push(async () => releaseLockUse());
     }
     if (this.#ownsLock) {
       this.#ownsLock = false;
-      try {
-        await this.#lock.release(internalCleanupControl());
-      } catch (cause) {
-        failures.push(cause);
-      }
+      cleanupOperations.push(() =>
+        this.#lock.release(internalCleanupControl()),
+      );
     }
-    if (failures.length === 1) throw failures[0];
-    if (failures.length > 1) throw new AggregateError(failures);
+    await runAllBoundedInternalCleanup(cleanupOperations);
   }
 }
 
@@ -995,17 +1297,18 @@ export async function ensureCandidateFsFileTreeDirectory(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   heldLock?: AgentBackupRestoreV3CandidateFsLock,
 ): Promise<void> {
+  const exactControl = snapshotOperationControl(control);
   const segments = requireRelativePath(
     relativeDirectory,
     "candidate file-tree directory",
   ).split(path.sep);
-  await authority.assertAuthority(control);
+  await authority.assertAuthority(exactControl);
   const operationLock = await authority.operationLock(
     `.file-tree-${createHash("sha256")
       .update(relativeDirectory)
       .digest("hex")
       .slice(0, 16)}`,
-    control,
+    exactControl,
     heldLock,
   );
   const activeLock = operationLock ?? heldLock;
@@ -1015,13 +1318,24 @@ export async function ensureCandidateFsFileTreeDirectory(
       "Candidate file-tree directory did not obtain its exact inode lock",
     );
   }
+  let releaseLockUse: (() => void) | null = null;
   try {
-    await ensureDirectories(authority, segments, control);
-    await authority.assertLockHeld(activeLock, control);
+    releaseLockUse = authority.beginLockUse(activeLock);
+    await ensureDirectories(authority, segments, exactControl);
+    await authority.assertLockHeld(activeLock, exactControl);
   } finally {
-    if (operationLock) {
-      await operationLock.release(internalCleanupControl());
+    const cleanupOperations: Array<() => Promise<void>> = [];
+    if (releaseLockUse) {
+      const releaseUse = releaseLockUse;
+      releaseLockUse = null;
+      cleanupOperations.push(async () => releaseUse());
     }
+    if (operationLock) {
+      cleanupOperations.push(() =>
+        operationLock.release(internalCleanupControl()),
+      );
+    }
+    await runAllBoundedInternalCleanup(cleanupOperations);
   }
 }
 
@@ -1033,6 +1347,7 @@ export async function createCandidateFsFileTreeFile(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   heldLock?: AgentBackupRestoreV3CandidateFsLock,
 ): Promise<AgentBackupRestoreV3CandidateFileTreeWriter> {
+  const exactControl = snapshotOperationControl(control);
   const limits = resolveLimits(limitsValue);
   const spec = parseFileSpec(specValue, limits);
   const rootSegments = requireRelativePath(
@@ -1040,7 +1355,7 @@ export async function createCandidateFsFileTreeFile(
     "candidate file-tree directory",
   ).split(path.sep);
   const fileSegments = requireCanonicalFilePath(spec.path, limits);
-  await authority.assertAuthority(control);
+  await authority.assertAuthority(exactControl);
   const operationLock = await authority.operationLock(
     `.file-${createHash("sha256")
       .update(relativeDirectory)
@@ -1048,7 +1363,7 @@ export async function createCandidateFsFileTreeFile(
       .update(spec.path)
       .digest("hex")
       .slice(0, 16)}`,
-    control,
+    exactControl,
     heldLock,
   );
   const activeLock = operationLock ?? heldLock;
@@ -1060,12 +1375,14 @@ export async function createCandidateFsFileTreeFile(
   }
   let parentHandle: FileHandle | null = null;
   let handle: FileHandle | null = null;
+  let releaseLockUse: (() => void) | null = null;
   try {
+    releaseLockUse = authority.beginLockUse(activeLock);
     const parentSegments = [...rootSegments, ...fileSegments.slice(0, -1)];
-    await ensureDirectories(authority, parentSegments, control);
+    await ensureDirectories(authority, parentSegments, exactControl);
     const parent = await authority.openDirectorySegments(
       parentSegments,
-      control,
+      exactControl,
     );
     parentHandle = parent.handle;
     const fileName = fileSegments[fileSegments.length - 1] as string;
@@ -1074,14 +1391,20 @@ export async function createCandidateFsFileTreeFile(
 
     let targetStats: CandidateFsExactStats | null = null;
     try {
-      targetStats = await controlled(() => lstatExact(targetPath), control);
+      targetStats = await controlled(
+        () => lstatExact(targetPath),
+        exactControl,
+      );
     } catch (cause) {
       if (!isErrno(cause, "ENOENT")) throw cause;
     }
     if (targetStats) {
       let partialStats: CandidateFsExactStats | null = null;
       try {
-        partialStats = await controlled(() => lstatExact(partialPath), control);
+        partialStats = await controlled(
+          () => lstatExact(partialPath),
+          exactControl,
+        );
       } catch (cause) {
         if (!isErrno(cause, "ENOENT")) throw cause;
       }
@@ -1097,17 +1420,23 @@ export async function createCandidateFsFileTreeFile(
             "Candidate final and partial paths do not describe one crash state",
           );
         }
-        assertActive(control);
+        assertActive(exactControl);
         await fs.unlink(partialPath);
-        await controlled(() => (parentHandle as FileHandle).sync(), control);
-        targetStats = await controlled(() => lstatExact(targetPath), control);
+        await controlled(
+          () => (parentHandle as FileHandle).sync(),
+          exactControl,
+        );
+        targetStats = await controlled(
+          () => lstatExact(targetPath),
+          exactControl,
+        );
       }
       requireRegularSingleLink(
         targetStats,
         "Candidate final path is a symbolic link, hardlink, or non-regular file",
       );
-      const proof = await proveFinalPath(targetPath, spec, control);
-      await authority.assertLockHeld(activeLock, control);
+      const proven = await proveFinalPath(targetPath, spec, exactControl);
+      await authority.assertLockHeld(activeLock, exactControl);
       const writer = new AgentBackupRestoreV3CandidateFileTreeWriter({
         owner: authority,
         parentHandle,
@@ -1118,9 +1447,11 @@ export async function createCandidateFsFileTreeFile(
         spec,
         lock: activeLock,
         ownsLock: operationLock !== null,
-        replayedProof: proof,
+        replayedProof: proven.proof,
       });
       parentHandle = null;
+      releaseLockUse();
+      releaseLockUse = null;
       return writer;
     }
 
@@ -1128,15 +1459,15 @@ export async function createCandidateFsFileTreeFile(
       const opened = await openBoundRegularFile(
         partialPath,
         constants.O_RDWR | constants.O_NOFOLLOW,
-        control,
+        exactControl,
       );
       handle = opened.handle;
       requireRegularSingleLink(
         opened.stats,
         "Candidate recoverable partial is not one regular single-link file",
       );
-      await controlled(() => (handle as FileHandle).truncate(0), control);
-      await controlled(() => (handle as FileHandle).chmod(0o600), control);
+      await controlled(() => (handle as FileHandle).truncate(0), exactControl);
+      await controlled(() => (handle as FileHandle).chmod(0o600), exactControl);
     } catch (cause) {
       if (!isErrno(cause, "ENOENT")) throw cause;
       const opened = await openBoundRegularFile(
@@ -1145,7 +1476,7 @@ export async function createCandidateFsFileTreeFile(
           constants.O_EXCL |
           constants.O_RDWR |
           constants.O_NOFOLLOW,
-        control,
+        exactControl,
         0o600,
       );
       handle = opened.handle;
@@ -1156,7 +1487,7 @@ export async function createCandidateFsFileTreeFile(
     }
     const identity = await controlled(
       () => fileStatExact(handle as FileHandle),
-      control,
+      exactControl,
     );
     requireRegularSingleLink(
       identity,
@@ -1168,8 +1499,8 @@ export async function createCandidateFsFileTreeFile(
         "Candidate recoverable partial could not be reset exactly",
       );
     }
-    await controlled(() => (parentHandle as FileHandle).sync(), control);
-    await authority.assertLockHeld(activeLock, control);
+    await controlled(() => (parentHandle as FileHandle).sync(), exactControl);
+    await authority.assertLockHeld(activeLock, exactControl);
     const writer = new AgentBackupRestoreV3CandidateFileTreeWriter({
       owner: authority,
       parentHandle,
@@ -1183,38 +1514,41 @@ export async function createCandidateFsFileTreeFile(
     });
     parentHandle = null;
     handle = null;
+    releaseLockUse();
+    releaseLockUse = null;
     return writer;
   } catch (cause) {
-    const failures: unknown[] = [cause];
+    const cleanupOperations: Array<() => Promise<void>> = [];
     if (handle) {
-      try {
-        await boundedInternalCleanup(() => (handle as FileHandle).close());
-      } catch (cleanupCause) {
-        failures.push(cleanupCause);
-      }
+      const handleToClose = handle;
+      handle = null;
+      cleanupOperations.push(() => handleToClose.close());
     }
     if (parentHandle) {
-      try {
-        await boundedInternalCleanup(() =>
-          (parentHandle as FileHandle).close(),
-        );
-      } catch (cleanupCause) {
-        failures.push(cleanupCause);
-      }
+      const handleToClose = parentHandle;
+      parentHandle = null;
+      cleanupOperations.push(() => handleToClose.close());
+    }
+    if (releaseLockUse) {
+      const releaseUse = releaseLockUse;
+      releaseLockUse = null;
+      cleanupOperations.push(async () => releaseUse());
     }
     if (operationLock) {
-      try {
-        await operationLock.release(internalCleanupControl());
-      } catch (cleanupCause) {
-        failures.push(cleanupCause);
-      }
+      cleanupOperations.push(() =>
+        operationLock.release(internalCleanupControl()),
+      );
     }
-    if (failures.length === 1) throw cause;
-    throw new AgentBackupRestoreV3CandidateFsError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
-      "Candidate file writer setup and bounded cleanup both failed",
-      { cause: new AggregateError(failures) },
-    );
+    try {
+      await runAllBoundedInternalCleanup(cleanupOperations);
+    } catch (cleanupCause) {
+      throw new AgentBackupRestoreV3CandidateFsError(
+        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
+        "Candidate file writer setup and bounded cleanup both failed",
+        { cause: new AggregateError([cause, cleanupCause]) },
+      );
+    }
+    throw cause;
   }
 }
 
@@ -1248,17 +1582,30 @@ export async function proveCandidateFsFileTree(
   control: Readonly<AgentBackupRestoreV3OperationControl>,
   heldLock?: AgentBackupRestoreV3CandidateFsLock,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateFileTreeProof>> {
+  const exactControl = snapshotOperationControl(control);
   const limits = resolveLimits(limitsValue);
   if (
-    !expectedValue ||
-    typeof expectedValue !== "object" ||
-    isProxy(expectedValue) ||
+    IS_PROXY(expectedValue) ||
     !Array.isArray(expectedValue) ||
-    Object.getPrototypeOf(expectedValue) !== Array.prototype ||
-    Object.getOwnPropertyDescriptor(expectedValue, Symbol.iterator) !==
-      undefined ||
-    expectedValue.length > limits.maximumFiles ||
-    Reflect.ownKeys(expectedValue).length !== expectedValue.length + 1
+    OBJECT_GET_PROTOTYPE_OF(expectedValue) !== Array.prototype ||
+    OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(expectedValue, Symbol.iterator) !==
+      undefined
+  ) {
+    fileTreeError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT",
+      "Candidate expected file list exceeds its explicit bound",
+    );
+  }
+  const lengthDescriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
+    expectedValue,
+    "length",
+  );
+  const expectedLength = lengthDescriptor?.value;
+  if (
+    !Number.isSafeInteger(expectedLength) ||
+    (expectedLength as number) < 0 ||
+    (expectedLength as number) > limits.maximumFiles ||
+    Reflect.ownKeys(expectedValue).length !== (expectedLength as number) + 1
   ) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT",
@@ -1267,8 +1614,8 @@ export async function proveCandidateFsFileTree(
   }
   const expected: Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>[] =
     [];
-  for (let index = 0; index < expectedValue.length; index += 1) {
-    const descriptor = Object.getOwnPropertyDescriptor(
+  for (let index = 0; index < (expectedLength as number); index += 1) {
+    const descriptor = OBJECT_GET_OWN_PROPERTY_DESCRIPTOR(
       expectedValue,
       String(index),
     );
@@ -1304,13 +1651,13 @@ export async function proveCandidateFsFileTree(
     relativeDirectory,
     "candidate file-tree directory",
   ).split(path.sep);
-  await authority.assertAuthority(control);
+  await authority.assertAuthority(exactControl);
   const operationLock = await authority.operationLock(
     `.prove-files-${createHash("sha256")
       .update(relativeDirectory)
       .digest("hex")
       .slice(0, 16)}`,
-    control,
+    exactControl,
     heldLock,
   );
   const activeLock = operationLock ?? heldLock;
@@ -1321,10 +1668,19 @@ export async function proveCandidateFsFileTree(
     );
   }
   let rootHandle: FileHandle | null = null;
+  let releaseLockUse: (() => void) | null = null;
   try {
-    const root = await authority.openDirectorySegments(rootSegments, control);
+    releaseLockUse = authority.beginLockUse(activeLock);
+    const root = await authority.openDirectorySegments(
+      rootSegments,
+      exactControl,
+    );
     rootHandle = root.handle;
     const observed: AgentBackupRestoreV3CandidateFileTreeFileProof[] = [];
+    const stableFiles: Array<{
+      readonly targetPath: string;
+      readonly stats: CandidateFsExactStats;
+    }> = [];
     let directories = 0;
     let bytes = 0;
     const walk = async (
@@ -1341,11 +1697,19 @@ export async function proveCandidateFsFileTree(
           "Candidate file-tree exceeds its depth bound",
         );
       }
-      const beforeNames = (
-        await controlled(() => fs.readdir(anchor), control)
-      ).sort(compareAgentBackupCaptureV2FilePaths);
-      for (const rawName of beforeNames) {
-        const name = requirePathSegment(rawName, "candidate tree entry");
+      const beforeNames = await readExactDirectoryNames(
+        anchor,
+        exactControl,
+        Math.min(
+          Number.MAX_SAFE_INTEGER,
+          limits.maximumFiles -
+            observed.length +
+            (limits.maximumDirectories - directories),
+        ),
+        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT",
+        "Candidate file-tree exceeds its file or directory-count bound",
+      );
+      for (const name of beforeNames) {
         if (name.toLowerCase().startsWith(RESERVED_PREFIX)) {
           fileTreeError(
             "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CONTROL_RESIDUE",
@@ -1353,9 +1717,12 @@ export async function proveCandidateFsFileTree(
           );
         }
         const childRelative = relative ? `${relative}/${name}` : name;
-        requireCanonicalFilePath(childRelative, limits);
+        const childSegments = requireCanonicalFilePath(childRelative, limits);
         const childPath = path.join(anchor, name);
-        const visible = await controlled(() => lstatExact(childPath), control);
+        const visible = await controlled(
+          () => lstatExact(childPath),
+          exactControl,
+        );
         if (visible.symbolicLink) {
           fileTreeError(
             "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_UNSAFE",
@@ -1372,12 +1739,12 @@ export async function proveCandidateFsFileTree(
                   constants.O_NOFOLLOW,
               ),
             (lateHandle) => lateHandle.close(),
-            control,
+            exactControl,
           );
           try {
             const opened = await controlled(
               () => fileStatExact(child),
-              control,
+              exactControl,
             );
             requirePrivateDirectory(
               opened,
@@ -1423,7 +1790,12 @@ export async function proveCandidateFsFileTree(
             "Candidate file-tree contains an unexpected or unordered file",
           );
         }
-        const proof = await proveFinalPath(childPath, expectation, control);
+        const proven = await proveFinalPath(
+          childPath,
+          expectation,
+          exactControl,
+        );
+        const proof = proven.proof;
         if (
           proof.sha256 !== expectation.sha256 ||
           proof.device !== expectation.device ||
@@ -1435,6 +1807,12 @@ export async function proveCandidateFsFileTree(
           );
         }
         observed.push(proof);
+        stableFiles.push(
+          OBJECT_FREEZE({
+            targetPath: path.join(root.anchor, ...childSegments),
+            stats: proven.stats,
+          }),
+        );
         bytes += proof.sizeBytes;
         if (
           observed.length > limits.maximumFiles ||
@@ -1446,18 +1824,24 @@ export async function proveCandidateFsFileTree(
           );
         }
       }
-      const [afterNames, afterDirectory] = await controlled(
-        () => Promise.all([fs.readdir(anchor), fileStatExact(directoryHandle)]),
-        control,
+      const afterNames = await readExactDirectoryNames(
+        anchor,
+        exactControl,
+        beforeNames.length,
+        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+        "Candidate file-tree gained an entry during exact proof",
       );
-      afterNames.sort(compareAgentBackupCaptureV2FilePaths);
+      const afterDirectory = await controlled(
+        () => fileStatExact(directoryHandle),
+        exactControl,
+      );
+      let sameNames = beforeNames.length === afterNames.length;
+      for (let index = 0; sameNames && index < beforeNames.length; index += 1) {
+        sameNames = beforeNames[index] === afterNames[index];
+      }
       if (
-        beforeNames.length !== afterNames.length ||
-        beforeNames.some((name, index) => name !== afterNames[index]) ||
-        !sameIdentity(afterDirectory, expectedDirectory) ||
-        afterDirectory.mode !== expectedDirectory.mode ||
-        afterDirectory.modifiedNanoseconds !==
-          expectedDirectory.modifiedNanoseconds
+        !sameNames ||
+        !sameStableDirectory(afterDirectory, expectedDirectory)
       ) {
         fileTreeError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
@@ -1487,18 +1871,53 @@ export async function proveCandidateFsFileTree(
         );
       }
     }
-    await authority.assertLockHeld(activeLock, control);
+    // A file proved early in a large tree can otherwise be replaced or
+    // rewritten after its descriptor closes. Re-check every final pathname
+    // against the ctime-bearing post-hash snapshot before producing the tree
+    // digest.
+    for (const stableFile of stableFiles) {
+      const finalFile = await controlled(
+        () => lstatExact(stableFile.targetPath),
+        exactControl,
+      );
+      requireRegularSingleLink(
+        finalFile,
+        "Candidate file-tree file changed after its exact proof",
+      );
+      if (!sameStableFile(finalFile, stableFile.stats)) {
+        fileTreeError(
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+          "Candidate file-tree file changed after its exact proof",
+        );
+      }
+    }
+    await authority.assertLockHeld(activeLock, exactControl);
     const rootAfter = await controlled(
       () => fileStatExact(root.handle),
-      control,
+      exactControl,
     );
-    if (!sameIdentity(rootAfter, root.stats)) {
+    if (!sameStableDirectory(rootAfter, root.stats)) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
         "Candidate file-tree root identity changed",
       );
     }
-    return Object.freeze({
+    const reboundRoot = await authority.openDirectorySegments(
+      rootSegments,
+      exactControl,
+    );
+    try {
+      if (!sameStableDirectory(reboundRoot.stats, rootAfter)) {
+        fileTreeError(
+          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+          "Candidate file-tree root pathname changed during exact proof",
+        );
+      }
+    } finally {
+      await boundedInternalCleanup(() => reboundRoot.handle.close());
+    }
+    await authority.assertLockHeld(activeLock, exactControl);
+    return OBJECT_FREEZE({
       derivation: FILE_TREE_DERIVATION,
       ...candidateFsIdentity(rootAfter),
       sha256: treeDigest(observed),
@@ -1508,11 +1927,22 @@ export async function proveCandidateFsFileTree(
       entries: Object.freeze(observed.map((entry) => Object.freeze(entry))),
     });
   } finally {
+    const cleanupOperations: Array<() => Promise<void>> = [];
     if (rootHandle) {
-      await boundedInternalCleanup(() => (rootHandle as FileHandle).close());
+      const handleToClose = rootHandle;
+      rootHandle = null;
+      cleanupOperations.push(() => handleToClose.close());
+    }
+    if (releaseLockUse) {
+      const releaseUse = releaseLockUse;
+      releaseLockUse = null;
+      cleanupOperations.push(async () => releaseUse());
     }
     if (operationLock) {
-      await operationLock.release(internalCleanupControl());
+      cleanupOperations.push(() =>
+        operationLock.release(internalCleanupControl()),
+      );
     }
+    await runAllBoundedInternalCleanup(cleanupOperations);
   }
 }

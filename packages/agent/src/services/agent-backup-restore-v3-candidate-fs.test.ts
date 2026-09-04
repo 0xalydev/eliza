@@ -4,15 +4,21 @@
  * deterministic proofs, and bounded volatile cleanup.
  */
 
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type AgentBackupRestoreV3CandidateFs,
+  AgentBackupRestoreV3CandidateFsLock,
   openAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs.ts";
+import {
+  lstatExact,
+  sameStableFile,
+} from "./agent-backup-restore-v3-candidate-fs-control.ts";
 
 const roots = new Set<string>();
 const candidates = new Set<AgentBackupRestoreV3CandidateFs>();
@@ -22,6 +28,16 @@ const OWNER_TOKEN = new TextEncoder().encode(
 const OTHER_OWNER_TOKEN = new TextEncoder().encode(
   "other-owner-capability-for-fs-tests",
 );
+
+function setLinuxModeForTest(filePath: string, mode: string): void {
+  const result = spawnSync("chmod", [mode, filePath], { encoding: "utf8" });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(
+      `chmod ${mode} failed with status ${String(result.status)}: ${result.stderr.trim()}`,
+    );
+  }
+}
 
 function operationControl(signal = new AbortController().signal) {
   return {
@@ -64,6 +80,18 @@ async function fixture(): Promise<{
 
 async function writePrivateFile(filePath: string, bytes: Uint8Array | string) {
   await fs.writeFile(filePath, bytes, { flag: "wx", mode: 0o600 });
+}
+
+function payloadCheckpointPaths(
+  attemptRoot: string,
+  name: string,
+): readonly [string, string] {
+  const derivation = createHash("sha256").update(name, "utf8").digest("hex");
+  const prefix = `.payload-${derivation.slice(0, 32)}.checkpoint-`;
+  return [
+    path.join(attemptRoot, `${prefix}0.json`),
+    path.join(attemptRoot, `${prefix}1.json`),
+  ];
 }
 
 async function writeProofTree(
@@ -178,6 +206,7 @@ describe("restore-v3 candidate filesystem", () => {
   it("holds an inode-bound kernel lock across root rename and reacquisition", async () => {
     const { candidate, trustedRoot, attemptRoot } = await fixture();
     const control = operationControl();
+    expect("detachLock" in candidate).toBe(false);
     const lock = await candidate.acquireLock("candidate.lock", control);
     await expect(
       candidate.acquireLock("candidate.lock", control),
@@ -226,6 +255,69 @@ describe("restore-v3 candidate filesystem", () => {
     );
     await reacquired.release(control);
     await sameInode.close();
+  });
+
+  it("settles lock, writer, and authority teardown exactly once", async () => {
+    const { candidate } = await fixture();
+    const control = operationControl();
+    const lock = await candidate.acquireLock("shared-release.lock", control);
+    const firstRelease = lock.release(control);
+    const secondRelease = lock.release(control);
+    expect(secondRelease).toBe(firstRelease);
+    await firstRelease;
+
+    let leaseReleases = 0;
+    let detachments = 0;
+    const failedLock = new AgentBackupRestoreV3CandidateFsLock({
+      owner: {
+        detachLock: (_lock: AgentBackupRestoreV3CandidateFsLock) => {
+          detachments += 1;
+        },
+      },
+      name: "failed-release.lock",
+      lease: {
+        release: async () => {
+          leaseReleases += 1;
+          throw new Error("injected release failure");
+        },
+      },
+    } as never);
+    const firstFailure = failedLock.release(control);
+    const repeatedFailure = failedLock.release(control);
+    expect(repeatedFailure).toBe(firstFailure);
+    await expect(firstFailure).rejects.toThrow("injected release failure");
+    expect(leaseReleases).toBe(1);
+    expect(detachments).toBe(1);
+
+    const writer = await candidate.createPayload(
+      "settled.payload",
+      { maximumBytes: 32, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(Buffer.from("settled"), control);
+    const firstFinalize = writer.finalize(control);
+    const secondFinalize = writer.finalize(control);
+    expect(secondFinalize).toBe(firstFinalize);
+    await firstFinalize;
+
+    const closingWriter = await candidate.createPayload(
+      "closed-once.payload",
+      { maximumBytes: 32, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    const firstWriterClose = closingWriter.close();
+    const secondWriterClose = closingWriter.close();
+    expect(secondWriterClose).toBe(firstWriterClose);
+    await firstWriterClose;
+
+    const pendingLock = candidate.acquireLock("close-race.lock", control);
+    const firstClose = candidate.close();
+    const secondClose = candidate.close();
+    expect(secondClose).toBe(firstClose);
+    await expect(pendingLock).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CLOSED",
+    });
+    await firstClose;
   });
 
   it("never redirects a mutation into a replacement attempt root", async () => {
@@ -366,6 +458,727 @@ describe("restore-v3 candidate filesystem", () => {
     });
   });
 
+  it("keeps a caller-held inode lock alive until a blocked read settles", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    await candidate.publishDurableJson(
+      "held-read.json",
+      { exact: true },
+      { maximumBytes: 256 },
+      control,
+    );
+    const heldLock = await candidate.acquireLock("held-read.lock", control);
+    const probe = await fs.open(path.join(attemptRoot, "held-read.json"), "r");
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      read: typeof probe.read;
+    };
+    const originalRead = handlePrototype.read;
+    await probe.close();
+    let enterRead: () => void = () => undefined;
+    let unblockRead: () => void = () => undefined;
+    const readEntered = new Promise<void>((resolve) => {
+      enterRead = resolve;
+    });
+    const readGate = new Promise<void>((resolve) => {
+      unblockRead = resolve;
+    });
+    let intercepted = false;
+    const readSpy = vi
+      .spyOn(handlePrototype, "read")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.read>
+      ) {
+        if (!intercepted) {
+          intercepted = true;
+          enterRead();
+          await readGate;
+        }
+        return Reflect.apply(originalRead, this, args);
+      });
+    let releaseSettled = false;
+    let releasePromise: Promise<void> | null = null;
+    try {
+      const pendingRead = candidate.readDurableJson(
+        "held-read.json",
+        { maximumBytes: 256 },
+        control,
+        heldLock,
+      );
+      await readEntered;
+      releasePromise = heldLock.release(control).then(() => {
+        releaseSettled = true;
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(releaseSettled).toBe(false);
+      unblockRead();
+      await expect(pendingRead).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LOCK_INVALID",
+      });
+      await releasePromise;
+      expect(releaseSettled).toBe(true);
+    } finally {
+      unblockRead();
+      readSpy.mockRestore();
+      await releasePromise;
+      if (!releaseSettled) await heldLock.release(operationControl());
+    }
+  });
+
+  it("zeroizes a payload copy when descriptor cleanup fails", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const exactBytes = new Uint8Array(8_192).fill(0x5a);
+    const writer = await candidate.createPayload(
+      "cleanup-failure.payload",
+      { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(exactBytes, control);
+    const receipt = await writer.finalize(control);
+    const probe = await fs.open(
+      path.join(attemptRoot, "cleanup-failure.payload"),
+      "r",
+    );
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      read: typeof probe.read;
+      close: typeof probe.close;
+    };
+    const originalRead = handlePrototype.read;
+    const originalClose = handlePrototype.close;
+    await probe.close();
+    let payloadCopy: Uint8Array | null = null;
+    let payloadHandle: typeof probe | null = null;
+    const readSpy = vi
+      .spyOn(handlePrototype, "read")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.read>
+      ) {
+        const buffer = args[0];
+        if (buffer instanceof Uint8Array && buffer.byteLength === 8_192) {
+          payloadCopy = buffer;
+          payloadHandle = this;
+        }
+        return Reflect.apply(originalRead, this, args);
+      });
+    const closeSpy = vi
+      .spyOn(handlePrototype, "close")
+      .mockImplementation(async function (this: typeof probe) {
+        await Reflect.apply(originalClose, this, []);
+        if (this === payloadHandle) {
+          throw new Error("injected payload descriptor cleanup failure");
+        }
+      });
+    try {
+      await expect(
+        candidate.readPayload(
+          "cleanup-failure.payload",
+          receipt,
+          { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+          control,
+        ),
+      ).rejects.toThrow("injected payload descriptor cleanup failure");
+      const capturedPayload = payloadCopy as unknown as Uint8Array;
+      expect(capturedPayload).toBeInstanceOf(Uint8Array);
+      expect(Array.from(capturedPayload).every((byte) => byte === 0)).toBe(
+        true,
+      );
+    } finally {
+      closeSpy.mockRestore();
+      readSpy.mockRestore();
+      exactBytes.fill(0);
+    }
+  });
+
+  it("does not dispatch secrets through poisoned byte-array and Buffer intrinsics", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const intrinsicReflectApply = Reflect.apply;
+    const ownerToken = new TextEncoder().encode(
+      "owner-token-visible-only-to-candidate-fs",
+    );
+    const payloadPlaintext = "payload-plaintext-intrinsics";
+    const canonicalSecret = "canonical-json-plaintext-intrinsics";
+    const treePlaintext = "tree-plaintext-intrinsics";
+    const payloadInput = Buffer.from(payloadPlaintext);
+    const canonicalValue = { secret: canonicalSecret };
+    const publicationName = "intrinsic-publication.json";
+    const publicationPrefix = createHash("sha256")
+      .update(publicationName)
+      .digest("hex")
+      .slice(0, 16);
+    const treeName = "intrinsic-tree";
+    await fs.mkdir(path.join(attemptRoot, treeName), { mode: 0o700 });
+    await writePrivateFile(
+      path.join(attemptRoot, treeName, "secret.txt"),
+      treePlaintext,
+    );
+
+    const typedArrayPrototype = Object.getPrototypeOf(Uint8Array.prototype);
+    const uint8ArrayDescriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "Uint8Array",
+    ) as PropertyDescriptor & { value: Uint8ArrayConstructor };
+    const byteLengthDescriptor = Object.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      "byteLength",
+    ) as PropertyDescriptor & { get: () => number };
+    const bufferDescriptor = Object.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      "buffer",
+    ) as PropertyDescriptor & { get: () => ArrayBufferLike };
+    const byteOffsetDescriptor = Object.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      "byteOffset",
+    ) as PropertyDescriptor & { get: () => number };
+    const fillDescriptor = Object.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      "fill",
+    ) as PropertyDescriptor & { value: Uint8Array["fill"] };
+    const subarrayDescriptor = Object.getOwnPropertyDescriptor(
+      typedArrayPrototype,
+      "subarray",
+    ) as PropertyDescriptor & { value: Uint8Array["subarray"] };
+    const equalsDescriptor = Object.getOwnPropertyDescriptor(
+      Buffer.prototype,
+      "equals",
+    ) as PropertyDescriptor & { value: Buffer["equals"] };
+    const toStringDescriptor = Object.getOwnPropertyDescriptor(
+      Buffer.prototype,
+      "toString",
+    ) as PropertyDescriptor & { value: Buffer["toString"] };
+    const fromDescriptor = Object.getOwnPropertyDescriptor(
+      Buffer,
+      "from",
+    ) as PropertyDescriptor & { value: typeof Buffer.from };
+    const bufferByteLengthDescriptor = Object.getOwnPropertyDescriptor(
+      Buffer,
+      "byteLength",
+    ) as PropertyDescriptor & { value: typeof Buffer.byteLength };
+    const reflectApplyDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "apply",
+    ) as PropertyDescriptor & { value: typeof Reflect.apply };
+    const definePropertiesDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "defineProperties",
+    ) as PropertyDescriptor & { value: typeof Object.defineProperties };
+    const getOwnPropertyDescriptorDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "getOwnPropertyDescriptor",
+    ) as PropertyDescriptor & { value: typeof Object.getOwnPropertyDescriptor };
+    const getOwnPropertyDescriptorsDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "getOwnPropertyDescriptors",
+    ) as PropertyDescriptor & {
+      value: typeof Object.getOwnPropertyDescriptors;
+    };
+    const getPrototypeOfDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "getPrototypeOf",
+    ) as PropertyDescriptor & { value: typeof Object.getPrototypeOf };
+    const freezeDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "freeze",
+    ) as PropertyDescriptor & { value: typeof Object.freeze };
+    const reflectOwnKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    ) as PropertyDescriptor & { value: typeof Reflect.ownKeys };
+    const stringIncludesDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "includes",
+    ) as PropertyDescriptor & { value: typeof String.prototype.includes };
+    const stringStartsWithDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "startsWith",
+    ) as PropertyDescriptor & { value: typeof String.prototype.startsWith };
+    const stringSplitDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "split",
+    ) as PropertyDescriptor & { value: typeof String.prototype.split };
+    const stringTrimDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "trim",
+    ) as PropertyDescriptor & { value: typeof String.prototype.trim };
+    const arrayJoinDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "join",
+    ) as PropertyDescriptor & { value: typeof Array.prototype.join };
+    const arraySomeDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "some",
+    ) as PropertyDescriptor & { value: typeof Array.prototype.some };
+    const arraySortDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "sort",
+    ) as PropertyDescriptor & { value: typeof Array.prototype.sort };
+
+    const probe = await fs.open(
+      path.join(attemptRoot, "intrinsic-write-probe"),
+      "w+",
+      0o600,
+    );
+    const handlePrototype = Object.getPrototypeOf(probe) as object;
+    const writeDescriptor = Object.getOwnPropertyDescriptor(
+      handlePrototype,
+      "write",
+    ) as PropertyDescriptor & {
+      value: (
+        this: unknown,
+        buffer: Uint8Array,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<unknown>;
+    };
+    const readDescriptor = Object.getOwnPropertyDescriptor(
+      handlePrototype,
+      "read",
+    ) as PropertyDescriptor & {
+      value: (
+        this: unknown,
+        buffer: Uint8Array,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ) => Promise<unknown>;
+    };
+    const closeDescriptor = Object.getOwnPropertyDescriptor(
+      handlePrototype,
+      "close",
+    ) as PropertyDescriptor & {
+      value: (this: unknown) => Promise<unknown>;
+    };
+    await probe.close();
+    await fs.unlink(path.join(attemptRoot, "intrinsic-write-probe"));
+
+    const traps: string[] = [];
+    const payloadBuffers = new Set<Uint8Array>();
+    const canonicalBuffers = new Set<Uint8Array>();
+    const treeBuffers = new Set<Uint8Array>();
+    const failedCanonicalReadBuffers = new Set<Uint8Array>();
+    const failedCanonicalCloseBuffers = new Set<Uint8Array>();
+    let forceCanonicalReadFailure = false;
+    let forcedCanonicalReadFailureSeen = false;
+    let forceCanonicalCloseFailure = false;
+    let forcedCanonicalCloseFailureSeen = false;
+    let unsafeRelativePathRejected = false;
+    let canonicalCloseTarget: unknown = null;
+    const byteArrayIncludes = (
+      value: Uint8Array,
+      expected: string,
+    ): boolean => {
+      const length = intrinsicReflectApply(byteLengthDescriptor.get, value, []);
+      if (expected.length > length) return false;
+      outer: for (
+        let start = 0;
+        start <= length - expected.length;
+        start += 1
+      ) {
+        for (let index = 0; index < expected.length; index += 1) {
+          if (value[start + index] !== expected.charCodeAt(index))
+            continue outer;
+        }
+        return true;
+      }
+      return false;
+    };
+    const allZero = (value: Uint8Array): boolean => {
+      const length = intrinsicReflectApply(byteLengthDescriptor.get, value, []);
+      for (let index = 0; index < length; index += 1) {
+        if (value[index] !== 0) return false;
+      }
+      return true;
+    };
+
+    Object.defineProperty(handlePrototype, "write", {
+      ...writeDescriptor,
+      value: async function (
+        this: unknown,
+        buffer: Uint8Array,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ): Promise<unknown> {
+        if (byteArrayIncludes(buffer, payloadPlaintext)) {
+          payloadBuffers.add(buffer);
+        }
+        if (byteArrayIncludes(buffer, canonicalSecret)) {
+          canonicalBuffers.add(buffer);
+        }
+        return intrinsicReflectApply(writeDescriptor.value, this, [
+          buffer,
+          offset,
+          length,
+          position,
+        ]);
+      },
+    });
+    Object.defineProperty(handlePrototype, "read", {
+      ...readDescriptor,
+      value: async function (
+        this: unknown,
+        buffer: Uint8Array,
+        offset?: number,
+        length?: number,
+        position?: number | null,
+      ): Promise<unknown> {
+        const result = await intrinsicReflectApply(readDescriptor.value, this, [
+          buffer,
+          offset,
+          length,
+          position,
+        ]);
+        if (byteArrayIncludes(buffer, treePlaintext)) {
+          treeBuffers.add(buffer);
+        }
+        if (
+          forceCanonicalReadFailure &&
+          byteArrayIncludes(buffer, canonicalSecret)
+        ) {
+          forceCanonicalReadFailure = false;
+          failedCanonicalReadBuffers.add(buffer);
+          throw new Error("forced canonical read failure after fill");
+        }
+        if (
+          forceCanonicalCloseFailure &&
+          byteArrayIncludes(buffer, canonicalSecret)
+        ) {
+          canonicalCloseTarget = this;
+          failedCanonicalCloseBuffers.add(buffer);
+        }
+        return result;
+      },
+    });
+    Object.defineProperty(handlePrototype, "close", {
+      ...closeDescriptor,
+      value: async function (this: unknown): Promise<unknown> {
+        const result = await intrinsicReflectApply(
+          closeDescriptor.value,
+          this,
+          [],
+        );
+        if (this === canonicalCloseTarget) {
+          canonicalCloseTarget = null;
+          forceCanonicalCloseFailure = false;
+          throw new Error("forced canonical close failure after fill");
+        }
+        return result;
+      },
+    });
+
+    const restorations: Array<
+      readonly [object, PropertyKey, PropertyDescriptor]
+    > = [
+      [typedArrayPrototype, "byteLength", byteLengthDescriptor],
+      [typedArrayPrototype, "buffer", bufferDescriptor],
+      [typedArrayPrototype, "byteOffset", byteOffsetDescriptor],
+      [typedArrayPrototype, "fill", fillDescriptor],
+      [typedArrayPrototype, "subarray", subarrayDescriptor],
+      [Buffer.prototype, "equals", equalsDescriptor],
+      [Buffer.prototype, "toString", toStringDescriptor],
+      [Buffer, "from", fromDescriptor],
+      [Buffer, "byteLength", bufferByteLengthDescriptor],
+      [globalThis, "Uint8Array", uint8ArrayDescriptor],
+      [Reflect, "apply", reflectApplyDescriptor],
+      [Object, "defineProperties", definePropertiesDescriptor],
+      [Object, "getOwnPropertyDescriptor", getOwnPropertyDescriptorDescriptor],
+      [
+        Object,
+        "getOwnPropertyDescriptors",
+        getOwnPropertyDescriptorsDescriptor,
+      ],
+      [Object, "getPrototypeOf", getPrototypeOfDescriptor],
+      [Object, "freeze", freezeDescriptor],
+      [Reflect, "ownKeys", reflectOwnKeysDescriptor],
+      [String.prototype, "includes", stringIncludesDescriptor],
+      [String.prototype, "startsWith", stringStartsWithDescriptor],
+      [String.prototype, "split", stringSplitDescriptor],
+      [String.prototype, "trim", stringTrimDescriptor],
+      [Array.prototype, "join", arrayJoinDescriptor],
+      [Array.prototype, "some", arraySomeDescriptor],
+      [Array.prototype, "sort", arraySortDescriptor],
+    ];
+    const poisonGetter = (
+      target: object,
+      key: PropertyKey,
+      descriptor: PropertyDescriptor & { get: () => unknown },
+      trap: string,
+      shouldTrap: (receiver: unknown) => boolean = () => true,
+    ) => {
+      Object.defineProperty(target, key, {
+        ...descriptor,
+        get: function (this: unknown) {
+          if (shouldTrap(this)) traps.push(trap);
+          return intrinsicReflectApply(descriptor.get, this, []);
+        },
+      });
+    };
+    const poisonMethod = (
+      target: object,
+      key: PropertyKey,
+      descriptor: PropertyDescriptor & { value: (...args: never[]) => unknown },
+      trap: string,
+    ) => {
+      Object.defineProperty(target, key, {
+        ...descriptor,
+        value: function (this: unknown, ...args: never[]) {
+          traps.push(trap);
+          return intrinsicReflectApply(descriptor.value, this, args);
+        },
+      });
+    };
+    const containsSensitiveBytes = (value: unknown): boolean => {
+      try {
+        return (
+          byteArrayIncludes(value as Uint8Array, payloadPlaintext) ||
+          byteArrayIncludes(value as Uint8Array, canonicalSecret) ||
+          byteArrayIncludes(value as Uint8Array, treePlaintext)
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      Object.defineProperty(globalThis, "Uint8Array", {
+        ...uint8ArrayDescriptor,
+        value: new Proxy(uint8ArrayDescriptor.value, {
+          construct(target, argumentsList) {
+            traps.push("Uint8Array constructor");
+            return Reflect.construct(target, argumentsList, target);
+          },
+        }),
+      });
+      poisonGetter(
+        typedArrayPrototype,
+        "byteLength",
+        byteLengthDescriptor,
+        "TypedArray.byteLength",
+        containsSensitiveBytes,
+      );
+      poisonGetter(
+        typedArrayPrototype,
+        "buffer",
+        bufferDescriptor,
+        "TypedArray.buffer",
+        containsSensitiveBytes,
+      );
+      poisonGetter(
+        typedArrayPrototype,
+        "byteOffset",
+        byteOffsetDescriptor,
+        "TypedArray.byteOffset",
+        containsSensitiveBytes,
+      );
+      poisonMethod(
+        typedArrayPrototype,
+        "fill",
+        fillDescriptor,
+        "TypedArray.fill",
+      );
+      poisonMethod(
+        typedArrayPrototype,
+        "subarray",
+        subarrayDescriptor,
+        "TypedArray.subarray",
+      );
+      poisonMethod(
+        Buffer.prototype,
+        "equals",
+        equalsDescriptor,
+        "Buffer.equals",
+      );
+      poisonMethod(
+        Buffer.prototype,
+        "toString",
+        toStringDescriptor,
+        "Buffer.toString",
+      );
+      poisonMethod(Buffer, "from", fromDescriptor, "Buffer.from");
+      poisonMethod(
+        Buffer,
+        "byteLength",
+        bufferByteLengthDescriptor,
+        "Buffer.byteLength",
+      );
+      poisonMethod(Reflect, "apply", reflectApplyDescriptor, "Reflect.apply");
+      poisonMethod(
+        Object,
+        "defineProperties",
+        definePropertiesDescriptor,
+        "Object.defineProperties",
+      );
+      poisonMethod(
+        Object,
+        "getOwnPropertyDescriptor",
+        getOwnPropertyDescriptorDescriptor,
+        "Object.getOwnPropertyDescriptor",
+      );
+      poisonMethod(
+        Object,
+        "getOwnPropertyDescriptors",
+        getOwnPropertyDescriptorsDescriptor,
+        "Object.getOwnPropertyDescriptors",
+      );
+      poisonMethod(
+        Object,
+        "getPrototypeOf",
+        getPrototypeOfDescriptor,
+        "Object.getPrototypeOf",
+      );
+      poisonMethod(Object, "freeze", freezeDescriptor, "Object.freeze");
+      poisonMethod(
+        Reflect,
+        "ownKeys",
+        reflectOwnKeysDescriptor,
+        "Reflect.ownKeys",
+      );
+      poisonMethod(
+        String.prototype,
+        "includes",
+        stringIncludesDescriptor,
+        "String.includes",
+      );
+      poisonMethod(
+        String.prototype,
+        "startsWith",
+        stringStartsWithDescriptor,
+        "String.startsWith",
+      );
+      poisonMethod(
+        String.prototype,
+        "split",
+        stringSplitDescriptor,
+        "String.split",
+      );
+      poisonMethod(
+        String.prototype,
+        "trim",
+        stringTrimDescriptor,
+        "String.trim",
+      );
+      poisonMethod(Array.prototype, "join", arrayJoinDescriptor, "Array.join");
+      poisonMethod(Array.prototype, "some", arraySomeDescriptor, "Array.some");
+      poisonMethod(Array.prototype, "sort", arraySortDescriptor, "Array.sort");
+
+      try {
+        await candidate.createPayload(
+          "../../../../tmp/escape.payload",
+          { maximumBytes: 128, ownerToken },
+          control,
+        );
+      } catch (cause) {
+        unsafeRelativePathRejected =
+          cause instanceof Error &&
+          "code" in cause &&
+          cause.code === "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PATH_FORBIDDEN";
+      }
+
+      const writer = await candidate.createPayload(
+        "intrinsic.payload",
+        { maximumBytes: 128, ownerToken },
+        control,
+      );
+      await writer.write(payloadInput, control);
+      await writer.finalize(control);
+
+      await candidate.publishDurableJson(
+        publicationName,
+        canonicalValue,
+        { maximumBytes: 1_024 },
+        control,
+      );
+      forceCanonicalReadFailure = true;
+      try {
+        await candidate.publishDurableJson(
+          publicationName,
+          canonicalValue,
+          { maximumBytes: 1_024 },
+          control,
+        );
+      } catch (cause) {
+        forcedCanonicalReadFailureSeen =
+          cause instanceof Error &&
+          cause.message === "forced canonical read failure after fill";
+      } finally {
+        forceCanonicalReadFailure = false;
+      }
+      forceCanonicalCloseFailure = true;
+      try {
+        await candidate.publishDurableJson(
+          publicationName,
+          canonicalValue,
+          { maximumBytes: 1_024 },
+          control,
+        );
+      } catch (cause) {
+        forcedCanonicalCloseFailureSeen =
+          cause instanceof Error &&
+          cause.message === "forced canonical close failure after fill";
+      } finally {
+        forceCanonicalCloseFailure = false;
+        canonicalCloseTarget = null;
+      }
+      const publicationPath = path.join(attemptRoot, publicationName);
+      const interruptedTemp = path.join(
+        attemptRoot,
+        `.publish-${publicationPrefix}-intrinsic.tmp`,
+      );
+      await fs.link(publicationPath, interruptedTemp);
+      await candidate.publishDurableJson(
+        publicationName,
+        canonicalValue,
+        { maximumBytes: 1_024 },
+        control,
+      );
+      await candidate.proveTree(
+        treeName,
+        {
+          maximumBytes: 1_024,
+          maximumFiles: 4,
+          maximumDirectories: 2,
+          maximumDepth: 2,
+          maximumPathBytes: 128,
+        },
+        control,
+      );
+    } finally {
+      for (const [target, key, descriptor] of restorations.reverse()) {
+        Object.defineProperty(target, key, descriptor);
+      }
+      Object.defineProperty(handlePrototype, "write", writeDescriptor);
+      Object.defineProperty(handlePrototype, "read", readDescriptor);
+      Object.defineProperty(handlePrototype, "close", closeDescriptor);
+    }
+
+    expect(traps).toEqual([]);
+    expect(payloadInput.toString("utf8")).toBe(payloadPlaintext);
+    expect(payloadBuffers.size).toBeGreaterThan(0);
+    expect(canonicalBuffers.size).toBeGreaterThan(0);
+    expect(treeBuffers.size).toBeGreaterThan(0);
+    expect(forcedCanonicalReadFailureSeen).toBe(true);
+    expect(failedCanonicalReadBuffers.size).toBeGreaterThan(0);
+    expect(forcedCanonicalCloseFailureSeen).toBe(true);
+    expect(unsafeRelativePathRejected).toBe(true);
+    expect(failedCanonicalCloseBuffers.size).toBeGreaterThan(0);
+    expect([...payloadBuffers]).not.toContain(payloadInput);
+    expect([...payloadBuffers].every(allZero)).toBe(true);
+    expect([...canonicalBuffers].every(allZero)).toBe(true);
+    expect([...treeBuffers].every(allZero)).toBe(true);
+    expect([...failedCanonicalReadBuffers].every(allZero)).toBe(true);
+    expect([...failedCanonicalCloseBuffers].every(allZero)).toBe(true);
+    await expect(
+      fs.readFile(path.join(attemptRoot, "intrinsic.payload"), "utf8"),
+    ).resolves.toBe(payloadPlaintext);
+    await expect(
+      fs.readFile(path.join(attemptRoot, publicationName), "utf8"),
+    ).resolves.toBe(`{"secret":"${canonicalSecret}"}\n`);
+  });
+
   it("refuses payload symlinks, hardlinks, overflow, and pathname swaps", async () => {
     const { candidate, attemptRoot } = await fixture();
     const control = operationControl();
@@ -392,6 +1205,56 @@ describe("restore-v3 candidate filesystem", () => {
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
     });
 
+    let ownerTokenTrapCalled = false;
+    const proxiedOwnerToken = new Proxy(Uint8Array.from(OWNER_TOKEN), {
+      getPrototypeOf: () => {
+        ownerTokenTrapCalled = true;
+        return Uint8Array.prototype;
+      },
+    });
+    await expect(
+      candidate.createPayload(
+        "proxied-owner.payload",
+        { maximumBytes: 32, ownerToken: proxiedOwnerToken },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
+    });
+    expect(ownerTokenTrapCalled).toBe(false);
+
+    let ownerLengthAccessorCalled = false;
+    const shortOwnerToken = Uint8Array.of(0x61);
+    Object.defineProperty(shortOwnerToken, "byteLength", {
+      get: () => {
+        ownerLengthAccessorCalled = true;
+        return 32;
+      },
+    });
+    await expect(
+      candidate.createPayload(
+        "short-owner.payload",
+        { maximumBytes: 32, ownerToken: shortOwnerToken },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
+    });
+    expect(ownerLengthAccessorCalled).toBe(false);
+
+    if (typeof SharedArrayBuffer !== "undefined") {
+      const sharedOwnerToken = new Uint8Array(new SharedArrayBuffer(32));
+      await expect(
+        candidate.createPayload(
+          "shared-owner.payload",
+          { maximumBytes: 32, ownerToken: sharedOwnerToken },
+          control,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
+      });
+    }
+
     const overflow = await candidate.createPayload(
       "overflow.payload",
       { maximumBytes: 3, ownerToken: OWNER_TOKEN },
@@ -403,6 +1266,67 @@ describe("restore-v3 candidate filesystem", () => {
       }),
     );
     await overflow.close();
+
+    const iteratorOverride = await candidate.createPayload(
+      "iterator-override.payload",
+      { maximumBytes: 1, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    const oneByteFragment = Uint8Array.of(0x61);
+    Object.defineProperty(oneByteFragment, Symbol.iterator, {
+      value: function* () {
+        yield 0x61;
+        yield 0x62;
+        yield 0x63;
+      },
+    });
+    await iteratorOverride.write(oneByteFragment, control);
+    await expect(iteratorOverride.finalize(control)).resolves.toMatchObject({
+      sizeBytes: 1,
+      sha256: createHash("sha256").update("a").digest("hex"),
+    });
+
+    const proxyWriter = await candidate.createPayload(
+      "proxy-fragment.payload",
+      { maximumBytes: 1, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    let reentrantWrite: Promise<void> | null = null;
+    const proxyFragment = new Proxy(Uint8Array.of(0x61), {
+      getPrototypeOf: () => {
+        reentrantWrite = proxyWriter.write(Uint8Array.of(0x62), control);
+        return Uint8Array.prototype;
+      },
+    });
+    expect(() => proxyWriter.write(proxyFragment, control)).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FRAGMENT_INVALID",
+      }),
+    );
+    expect(reentrantWrite).toBeNull();
+    expect(() =>
+      proxyWriter.write(new Uint16Array([0x1234]) as never, control),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FRAGMENT_INVALID",
+      }),
+    );
+    await proxyWriter.close();
+
+    if (typeof SharedArrayBuffer !== "undefined") {
+      const sharedWriter = await candidate.createPayload(
+        "shared-memory.payload",
+        { maximumBytes: 1, ownerToken: OWNER_TOKEN },
+        control,
+      );
+      const shared = new Uint8Array(new SharedArrayBuffer(1));
+      expect(() => sharedWriter.write(shared, control)).toThrowError(
+        expect.objectContaining({
+          code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FRAGMENT_INVALID",
+        }),
+      );
+      await sharedWriter.close();
+    }
 
     const swapped = await candidate.createPayload(
       "swapped.payload",
@@ -429,14 +1353,60 @@ describe("restore-v3 candidate filesystem", () => {
     await first.write(Buffer.from("abc"), control);
     await first.close();
 
+    const checkpointPaths = payloadCheckpointPaths(
+      attemptRoot,
+      "recoverable.payload",
+    );
+    const initialCheckpoints = await Promise.all(
+      checkpointPaths.map(async (checkpointPath) =>
+        JSON.parse(await fs.readFile(checkpointPath, "utf8")),
+      ),
+    );
+    expect(
+      initialCheckpoints
+        .map((checkpoint) => checkpoint.generation as number)
+        .sort((left, right) => left - right),
+    ).toEqual([0, 1]);
+
+    // Crash after deleting the stale target slot and extending the payload,
+    // but before publishing the next durable checkpoint.
+    await fs.unlink(checkpointPaths[0]);
+    await fs.appendFile(
+      path.join(attemptRoot, "recoverable.payload"),
+      "uncheckpointed",
+    );
+
     const resumed = await candidate.createPayload(
       "recoverable.payload",
       { maximumBytes: 64, ownerToken: OWNER_TOKEN },
       control,
     );
     expect(resumed.acknowledgedBytes).toBe(3);
+    await expect(
+      fs.readFile(path.join(attemptRoot, "recoverable.payload"), "utf8"),
+    ).resolves.toBe("abc");
     await resumed.write(Buffer.from("def"), control);
-    const receipt = await resumed.finalize(control);
+    await resumed.close();
+
+    const committedCheckpoints = await Promise.all(
+      checkpointPaths.map(async (checkpointPath) =>
+        JSON.parse(await fs.readFile(checkpointPath, "utf8")),
+      ),
+    );
+    expect(
+      committedCheckpoints
+        .map((checkpoint) => checkpoint.generation as number)
+        .sort((left, right) => left - right),
+    ).toEqual([1, 2]);
+
+    // Lost response after the checkpoint commit must recover the new offset.
+    const afterLostWrite = await candidate.createPayload(
+      "recoverable.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(afterLostWrite.acknowledgedBytes).toBe(6);
+    const receipt = await afterLostWrite.finalize(control);
 
     const replay = await candidate.createPayload(
       "recoverable.payload",
@@ -479,6 +1449,259 @@ describe("restore-v3 candidate filesystem", () => {
     });
   });
 
+  it("fails closed when a durable payload checkpoint is ahead or has the wrong prefix hash", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+
+    const shorter = await candidate.createPayload(
+      "shorter-than-checkpoint.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await shorter.write(Buffer.from("abc"), control);
+    await shorter.close();
+    await fs.truncate(
+      path.join(attemptRoot, "shorter-than-checkpoint.payload"),
+      2,
+    );
+    await expect(
+      candidate.createPayload(
+        "shorter-than-checkpoint.payload",
+        { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
+    });
+
+    const corrupted = await candidate.createPayload(
+      "corrupt-checkpoint-prefix.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await corrupted.write(Buffer.from("abc"), control);
+    await corrupted.close();
+    await fs.writeFile(
+      path.join(attemptRoot, "corrupt-checkpoint-prefix.payload"),
+      "xbc",
+    );
+    await expect(
+      candidate.createPayload(
+        "corrupt-checkpoint-prefix.payload",
+        { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
+    });
+  });
+
+  it("keeps the inode lock until uncheckpointed suffix rollback settles", async () => {
+    const { candidate, trustedRoot, attemptRoot } = await fixture();
+    const control = operationControl();
+    const writer = await candidate.createPayload(
+      "checkpoint-lock.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(Buffer.from("abc"), control);
+    await writer.close();
+    const payloadPath = path.join(attemptRoot, "checkpoint-lock.payload");
+    await fs.appendFile(payloadPath, "uncheckpointed");
+
+    const peer = await openAgentBackupRestoreV3CandidateFs({
+      trustedRoot,
+      attemptRoot,
+      control,
+      ...platformTestOption(),
+    });
+    candidates.add(peer);
+
+    const probe = await fs.open(payloadPath, "r+");
+    type TruncatableHandle = {
+      truncate(length?: number): Promise<void>;
+    };
+    const handlePrototype = Object.getPrototypeOf(probe) as TruncatableHandle;
+    const originalTruncate = handlePrototype.truncate;
+    await probe.close();
+    let releaseTruncate: () => void = () => undefined;
+    let enteredTruncate: () => void = () => undefined;
+    const truncateEntered = new Promise<void>((resolve) => {
+      enteredTruncate = resolve;
+    });
+    const truncateGate = new Promise<void>((resolve) => {
+      releaseTruncate = resolve;
+    });
+    let intercepted = false;
+    const truncate = vi
+      .spyOn(handlePrototype, "truncate")
+      .mockImplementation(async function (
+        this: TruncatableHandle,
+        length?: number,
+      ) {
+        if (!intercepted && length === 3) {
+          intercepted = true;
+          enteredTruncate();
+          await truncateGate;
+        }
+        return Reflect.apply(originalTruncate, this, [length]);
+      });
+    let recovered:
+      | Awaited<ReturnType<AgentBackupRestoreV3CandidateFs["createPayload"]>>
+      | undefined;
+    try {
+      const pendingRecovery = candidate.createPayload(
+        "checkpoint-lock.payload",
+        { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+        control,
+      );
+      await truncateEntered;
+      await expect(
+        peer.acquireLock("rollback-race.lock", control),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LOCK_BUSY",
+      });
+      releaseTruncate();
+      recovered = await pendingRecovery;
+      expect(recovered.acknowledgedBytes).toBe(3);
+    } finally {
+      releaseTruncate();
+      truncate.mockRestore();
+      await recovered?.close();
+    }
+  });
+
+  it("revalidates the acknowledged prefix after crash-suffix truncation", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const writer = await candidate.createPayload(
+      "checkpoint-truncate-race.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(Buffer.from("abc"), control);
+    await writer.close();
+    const payloadPath = path.join(
+      attemptRoot,
+      "checkpoint-truncate-race.payload",
+    );
+    await fs.appendFile(payloadPath, "uncheckpointed");
+
+    const probe = await fs.open(payloadPath, "r+");
+    type TruncatableHandle = {
+      truncate(length?: number): Promise<void>;
+    };
+    const handlePrototype = Object.getPrototypeOf(probe) as TruncatableHandle;
+    const originalTruncate = handlePrototype.truncate;
+    await probe.close();
+    let intercepted = false;
+    const truncate = vi
+      .spyOn(handlePrototype, "truncate")
+      .mockImplementation(async function (
+        this: TruncatableHandle,
+        length?: number,
+      ) {
+        if (!intercepted && length === 3) {
+          intercepted = true;
+          // Simulate a same-inode attacker rewriting already acknowledged
+          // bytes after the pre-truncate hash but before ftruncate settles.
+          await fs.writeFile(payloadPath, "xbcuncheckpointed");
+        }
+        return Reflect.apply(originalTruncate, this, [length]);
+      });
+    try {
+      await expect(
+        candidate.createPayload(
+          "checkpoint-truncate-race.payload",
+          { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+          control,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
+      });
+      expect(intercepted).toBe(true);
+      await expect(fs.readFile(payloadPath, "utf8")).resolves.toBe("xbc");
+    } finally {
+      truncate.mockRestore();
+    }
+  });
+
+  it("reconciles checkpoint publication before deciding whether to roll back", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+
+    const committedWriter = await candidate.createPayload(
+      "checkpoint-linked.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    const committedController = new AbortController();
+    const originalLink = fs.link.bind(fs);
+    const linkedCheckpoint = vi
+      .spyOn(fs, "link")
+      .mockImplementation(async (source, destination) => {
+        await originalLink(source, destination);
+        if (String(destination).endsWith(".checkpoint-1.json")) {
+          committedController.abort(
+            new Error("lost response after checkpoint link"),
+          );
+        }
+      });
+    try {
+      await expect(
+        committedWriter.write(
+          Buffer.from("abc"),
+          operationControl(committedController.signal),
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_ABORTED",
+      });
+    } finally {
+      linkedCheckpoint.mockRestore();
+    }
+    const recoveredCommit = await candidate.createPayload(
+      "checkpoint-linked.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(recoveredCommit.acknowledgedBytes).toBe(3);
+    await expect(
+      fs.readFile(path.join(attemptRoot, "checkpoint-linked.payload"), "utf8"),
+    ).resolves.toBe("abc");
+    await recoveredCommit.close();
+
+    const uncommittedWriter = await candidate.createPayload(
+      "checkpoint-not-linked.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    const failedCheckpoint = vi
+      .spyOn(fs, "link")
+      .mockImplementation(async (_source, destination) => {
+        if (String(destination).endsWith(".checkpoint-1.json")) {
+          throw new Error("injected checkpoint link failure");
+        }
+        throw new Error("unexpected link target");
+      });
+    try {
+      await expect(
+        uncommittedWriter.write(Buffer.from("abc"), control),
+      ).rejects.toThrow("injected checkpoint link failure");
+    } finally {
+      failedCheckpoint.mockRestore();
+    }
+    const recoveredRollback = await candidate.createPayload(
+      "checkpoint-not-linked.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(recoveredRollback.acknowledgedBytes).toBe(0);
+    await expect(
+      fs.stat(path.join(attemptRoot, "checkpoint-not-linked.payload")),
+    ).resolves.toMatchObject({ size: 0 });
+    await recoveredRollback.close();
+  });
+
   it("disposes the payload descriptor and inode lock after a late abort", async () => {
     const { candidate, trustedRoot, attemptRoot } = await fixture();
     const writer = await candidate.createPayload(
@@ -507,7 +1730,7 @@ describe("restore-v3 candidate filesystem", () => {
       { maximumBytes: 256 * 1024, ownerToken: OWNER_TOKEN },
       operationControl(),
     );
-    expect(recovered.acknowledgedBytes).toBeGreaterThanOrEqual(0);
+    expect(recovered.acknowledgedBytes).toBe(0);
     await recovered.close();
     await secondAuthority.close();
   });
@@ -628,6 +1851,24 @@ describe("restore-v3 candidate filesystem", () => {
     await peer.close();
   });
 
+  it("does not scan the attempt directory for a new durable publication", async () => {
+    const { candidate } = await fixture();
+    const openDirectory = vi.spyOn(fs, "opendir");
+    try {
+      await expect(
+        candidate.publishDurableJson(
+          "fresh-publication.json",
+          { exact: true },
+          { maximumBytes: 1_024 },
+          operationControl(),
+        ),
+      ).resolves.toMatchObject({ replayed: false });
+      expect(openDirectory).not.toHaveBeenCalled();
+    } finally {
+      openDirectory.mockRestore();
+    }
+  });
+
   it("repairs the exact link-before-unlink crash state before replay", async () => {
     const { candidate, attemptRoot } = await fixture();
     const name = "linked-commit.json";
@@ -691,6 +1932,277 @@ describe("restore-v3 candidate filesystem", () => {
     }
   });
 
+  it("snapshots caller-owned contracts and rejects accessors and proxies", async () => {
+    const trustedRoot = await privateTemporaryRoot(
+      "restore-v3-candidate-input-snapshot-",
+    );
+    const attemptRoot = path.join(trustedRoot, "attempt");
+    const replacementRoot = path.join(trustedRoot, "replacement");
+    await fs.mkdir(attemptRoot, { mode: 0o700 });
+    await fs.mkdir(replacementRoot, { mode: 0o700 });
+    const openInput = {
+      trustedRoot,
+      attemptRoot,
+      control: operationControl(),
+      ...platformTestOption(),
+    };
+    const pendingOpen = openAgentBackupRestoreV3CandidateFs(openInput);
+    openInput.attemptRoot = replacementRoot;
+    const candidate = await pendingOpen;
+    candidates.add(candidate);
+    expect(candidate.attemptRoot).toBe(attemptRoot);
+
+    let accessorRead = false;
+    const accessorInput = {
+      trustedRoot,
+      control: operationControl(),
+      ...platformTestOption(),
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorInput, "attemptRoot", {
+      enumerable: true,
+      get: () => {
+        accessorRead = true;
+        return replacementRoot;
+      },
+    });
+    await expect(
+      openAgentBackupRestoreV3CandidateFs(accessorInput as never),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_ROOT_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    const accessorControl = {
+      signal: new AbortController().signal,
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorControl, "deadlineEpochMs", {
+      enumerable: true,
+      get: () => {
+        accessorRead = true;
+        return Date.now() + 30_000;
+      },
+    });
+    await expect(
+      candidate.publishDurableJson(
+        "accessor-control.json",
+        { exact: true },
+        { maximumBytes: 256 },
+        accessorControl as never,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CONTROL_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    const unreadReceipt = Object.freeze({
+      sizeBytes: 0,
+      sha256: createHash("sha256").digest("hex"),
+      device: "1",
+      inode: "1",
+    });
+    await expect(
+      candidate.readDurableJson(
+        "accessor-control.json",
+        { maximumBytes: 256 },
+        accessorControl as never,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CONTROL_INVALID",
+    });
+    await expect(
+      candidate.readPayload(
+        "accessor-control.payload",
+        unreadReceipt,
+        { maximumBytes: 32, ownerToken: OWNER_TOKEN },
+        accessorControl as never,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CONTROL_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    const accessorReadOptions = {
+      ownerToken: OWNER_TOKEN,
+    } as Record<string, unknown>;
+    Object.defineProperty(accessorReadOptions, "maximumBytes", {
+      enumerable: true,
+      get: () => {
+        accessorRead = true;
+        return 32;
+      },
+    });
+    await expect(
+      candidate.readDurableJson(
+        "accessor-options.json",
+        accessorReadOptions as never,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    });
+    await expect(
+      candidate.readPayload(
+        "accessor-options.payload",
+        unreadReceipt,
+        accessorReadOptions as never,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    const accessorOptions = { ownerToken: OWNER_TOKEN } as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(accessorOptions, "maximumBytes", {
+      enumerable: true,
+      get: () => {
+        accessorRead = true;
+        return 32;
+      },
+    });
+    await expect(
+      candidate.createPayload(
+        "accessor-options.payload",
+        accessorOptions as never,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    const receiptWithAccessor = {
+      sha256: "0".repeat(64),
+      device: "1",
+      inode: "1",
+    } as Record<string, unknown>;
+    Object.defineProperty(receiptWithAccessor, "sizeBytes", {
+      enumerable: true,
+      get: () => {
+        accessorRead = true;
+        return 0;
+      },
+    });
+    await expect(
+      candidate.provePayload(
+        "accessor-receipt.payload",
+        receiptWithAccessor as never,
+        { maximumBytes: 32 },
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
+    });
+    expect(accessorRead).toBe(false);
+
+    let proxyTrapCalled = false;
+    const nestedProxy = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          proxyTrapCalled = true;
+          return Object.prototype;
+        },
+      },
+    );
+    await expect(
+      candidate.publishDurableJson(
+        "proxy-value.json",
+        { nested: nestedProxy },
+        { maximumBytes: 256 },
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
+    });
+    expect(proxyTrapCalled).toBe(false);
+
+    const cleanupProxy = new Proxy(["survivor"], {
+      getOwnPropertyDescriptor: () => {
+        proxyTrapCalled = true;
+        return undefined;
+      },
+    });
+    await expect(
+      candidate.cleanupVolatile(
+        cleanupProxy,
+        { maximumBytes: 32, maximumEntries: 2, maximumDepth: 1 },
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CLEANUP_LIMIT",
+    });
+    expect(proxyTrapCalled).toBe(false);
+
+    const revokedOptions = Proxy.revocable(
+      { maximumBytes: 32, ownerToken: OWNER_TOKEN },
+      {},
+    );
+    revokedOptions.revoke();
+    await expect(
+      candidate.createPayload(
+        "revoked-options.payload",
+        revokedOptions.proxy,
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_LIMIT_INVALID",
+    });
+
+    const revokedNames = Proxy.revocable(["survivor"], {});
+    revokedNames.revoke();
+    await expect(
+      candidate.cleanupVolatile(
+        revokedNames.proxy,
+        { maximumBytes: 32, maximumEntries: 2, maximumDepth: 1 },
+        operationControl(),
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CLEANUP_LIMIT",
+    });
+
+    const mutableOptions = {
+      maximumBytes: 1,
+      ownerToken: OWNER_TOKEN,
+    };
+    const pendingWriter = candidate.createPayload(
+      "snapshotted-options.payload",
+      mutableOptions,
+      operationControl(),
+    );
+    mutableOptions.maximumBytes = 64;
+    const boundedWriter = await pendingWriter;
+    expect(() =>
+      boundedWriter.write(Buffer.from("too large"), operationControl()),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_LIMIT",
+      }),
+    );
+    await boundedWriter.close();
+
+    const mutableOwnerToken = Uint8Array.from(OWNER_TOKEN);
+    const stableOwnerToken = Uint8Array.from(OWNER_TOKEN);
+    const pendingOwnerWriter = candidate.createPayload(
+      "snapshotted-owner.payload",
+      { maximumBytes: 32, ownerToken: mutableOwnerToken },
+      operationControl(),
+    );
+    mutableOwnerToken.fill(0);
+    const ownerWriter = await pendingOwnerWriter;
+    await ownerWriter.close();
+    const replayedOwnerWriter = await candidate.createPayload(
+      "snapshotted-owner.payload",
+      { maximumBytes: 32, ownerToken: stableOwnerToken },
+      operationControl(),
+    );
+    await replayedOwnerWriter.close();
+    stableOwnerToken.fill(0);
+  });
+
   it("makes the tree proof creation-order independent and never accepts links", async () => {
     const { candidate, attemptRoot } = await fixture();
     const control = operationControl();
@@ -712,6 +2224,30 @@ describe("restore-v3 candidate filesystem", () => {
       directories: 1,
     });
     expect(first.inode).not.toBe(second.inode);
+    if (process.platform === "linux") {
+      const privilegedFile = path.join(attemptRoot, "tree-a", "a.txt");
+      // Bun 1.3.14 masks special bits in fs.chmod on Linux, so exercise the
+      // kernel modes through the system utility and assert the precondition.
+      try {
+        for (const [mode, specialBits] of [
+          ["4600", 0o4000],
+          ["2600", 0o2000],
+          ["1600", 0o1000],
+        ] as const) {
+          setLinuxModeForTest(privilegedFile, mode);
+          expect((await lstatExact(privilegedFile)).mode & 0o7000).toBe(
+            specialBits,
+          );
+          await expect(
+            candidate.proveTree("tree-a", limits, control),
+          ).rejects.toMatchObject({
+            code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_TREE_UNSAFE",
+          });
+        }
+      } finally {
+        setLinuxModeForTest(privilegedFile, "600");
+      }
+    }
     await expect(
       candidate.proveTree("../outside", limits, control),
     ).rejects.toMatchObject({
@@ -730,6 +2266,53 @@ describe("restore-v3 candidate filesystem", () => {
     await fs.link(original, path.join(attemptRoot, "tree-a", "a.alias"));
     await expect(
       candidate.proveTree("tree-a", limits, control),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_TREE_UNSAFE",
+    });
+  });
+
+  it("detects same-inode rewrites even when size, mode, and mtime match", async () => {
+    const { attemptRoot } = await fixture();
+    const file = path.join(attemptRoot, "ctime-bound.bin");
+    await writePrivateFile(file, "first");
+    const fixedTime = new Date(Math.floor(Date.now() / 1_000 - 10) * 1_000);
+    await fs.utimes(file, fixedTime, fixedTime);
+    const before = await lstatExact(file);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await fs.writeFile(file, "other");
+    await fs.utimes(file, fixedTime, fixedTime);
+    const after = await lstatExact(file);
+    expect(after.inode).toBe(before.inode);
+    expect(after.size).toBe(before.size);
+    expect(after.mode).toBe(before.mode);
+    expect(after.modifiedNanoseconds).toBe(before.modifiedNanoseconds);
+    expect(after.changedNanoseconds).not.toBe(before.changedNanoseconds);
+    expect(sameStableFile(before, after)).toBe(false);
+  });
+
+  it("rejects raw invalid UTF-8 directory entries on Linux", async () => {
+    if (process.platform !== "linux") return;
+    const { candidate, attemptRoot } = await fixture();
+    const treeRoot = path.join(attemptRoot, "raw-name-tree");
+    await fs.mkdir(treeRoot, { mode: 0o700 });
+    const invalidName = Buffer.concat([
+      Buffer.from(`${treeRoot}${path.sep}`),
+      Buffer.from([0xff]),
+    ]);
+    await fs.writeFile(invalidName, "invalid", { flag: "wx", mode: 0o600 });
+    await writePrivateFile(path.join(treeRoot, "�"), "valid");
+    await expect(
+      candidate.proveTree(
+        "raw-name-tree",
+        {
+          maximumBytes: 64,
+          maximumFiles: 4,
+          maximumDirectories: 2,
+          maximumDepth: 2,
+          maximumPathBytes: 64,
+        },
+        operationControl(),
+      ),
     ).rejects.toMatchObject({
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_TREE_UNSAFE",
     });
@@ -773,6 +2356,34 @@ describe("restore-v3 candidate filesystem", () => {
     });
     await expect(fs.readFile(outside, "utf8")).resolves.toBe("survivor");
     await fs.unlink(unsafe);
+
+    const lateName: string[] = [];
+    const lateCleanup = candidate.cleanupVolatile(
+      lateName,
+      { maximumBytes: 32, maximumEntries: 4, maximumDepth: 2 },
+      control,
+    );
+    lateName.push("outside-cleanup");
+    await expect(lateCleanup).resolves.toEqual({
+      removedBytes: 0,
+      removedEntries: 0,
+    });
+    await expect(fs.readFile(outside, "utf8")).resolves.toBe("survivor");
+
+    const iteratorNames: string[] = [];
+    Object.defineProperty(iteratorNames, Symbol.iterator, {
+      value: function* () {
+        yield "outside-cleanup";
+      },
+    });
+    await expect(
+      candidate.cleanupVolatile(
+        iteratorNames,
+        { maximumBytes: 32, maximumEntries: 4, maximumDepth: 2 },
+        control,
+      ),
+    ).resolves.toEqual({ removedBytes: 0, removedEntries: 0 });
+    await expect(fs.readFile(outside, "utf8")).resolves.toBe("survivor");
 
     await expect(
       candidate.cleanupVolatile(

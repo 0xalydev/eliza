@@ -10,12 +10,17 @@ import {
   type AgentBackupRestoreV3OperationControl,
   type AgentBackupRestoreV3StagingSession,
 } from "@elizaos/shared";
-import type {
-  AgentBackupRestoreV3CandidateFileTreeFileProof,
-  AgentBackupRestoreV3CandidateFileTreeProof,
-  AgentBackupRestoreV3CandidateFs,
-  AgentBackupRestoreV3CandidateFsLock,
+import {
+  type AgentBackupRestoreV3CandidateFileTreeFileProof,
+  type AgentBackupRestoreV3CandidateFileTreeProof,
+  type AgentBackupRestoreV3CandidateFs,
+  type AgentBackupRestoreV3CandidateFsLock,
+  isAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
+import {
+  snapshotOperationControl,
+  snapshotOwnDataRecord,
+} from "./agent-backup-restore-v3-candidate-fs-control";
 import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
 import {
   AgentBackupRestoreV3CandidateRecordError,
@@ -31,6 +36,11 @@ const CHARACTER_DIRECTORY = "components/character";
 const CHARACTER_PATH = "character.json";
 const FINISH_MARKER = ".restore-v3-component-c0.character.finish.json";
 const FINISH_MAXIMUM_BYTES = 64 * 1024;
+const REFLECT_APPLY = Reflect.apply;
+const INTRINSIC_UINT8_ARRAY = Uint8Array;
+const INTRINSIC_UINT8_ARRAY_SET = Uint8Array.prototype.set;
+const INTRINSIC_UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const INTRINSIC_UINT8_ARRAY_SUBARRAY = Uint8Array.prototype.subarray;
 
 export const AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_MAXIMUM_BYTES =
   16 * 1024 * 1024;
@@ -81,6 +91,134 @@ export class AgentBackupRestoreV3CandidateCharacterError extends ElizaError {
 
 function characterError(code: string, message: string, cause?: unknown): never {
   throw new AgentBackupRestoreV3CandidateCharacterError(code, message, cause);
+}
+
+function snapshotPlainDataRecord(
+  value: unknown,
+  allowedKeys: readonly string[],
+  requiredKeys: readonly string[],
+  label: string,
+  code = "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_INPUT_INVALID",
+): Readonly<Record<string, unknown>> {
+  try {
+    return snapshotOwnDataRecord(
+      value,
+      allowedKeys,
+      requiredKeys,
+      code,
+      `${label} must be one exact plain data object`,
+    );
+  } catch (cause) {
+    if (cause instanceof AgentBackupRestoreV3CandidateCharacterError) {
+      throw cause;
+    }
+    characterError(code, `${label} must be one exact plain data object`, cause);
+  }
+}
+
+function requireCandidateFs(value: unknown): AgentBackupRestoreV3CandidateFs {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    isProxy(value) ||
+    !isAgentBackupRestoreV3CandidateFs(value)
+  ) {
+    characterError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_INPUT_INVALID",
+      "Candidate character filesystem authority must be one non-proxy capability",
+    );
+  }
+  return value as AgentBackupRestoreV3CandidateFs;
+}
+
+function snapshotCharacterControl(
+  value: unknown,
+): Readonly<AgentBackupRestoreV3OperationControl> {
+  try {
+    return snapshotOperationControl(
+      value as Readonly<AgentBackupRestoreV3OperationControl>,
+    );
+  } catch (cause) {
+    characterError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_CONTROL_INVALID",
+      "Candidate character requires one exact active operation control",
+      cause,
+    );
+  }
+}
+
+function snapshotTestOnlyLifecycle(
+  value: unknown,
+): Readonly<AgentBackupRestoreV3CandidateCharacterLifecycle> | undefined {
+  if (value === undefined) return undefined;
+  if (process.env.NODE_ENV !== "test") {
+    characterError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_TEST_HOOK_FORBIDDEN",
+      "Candidate character lifecycle hooks are test-only",
+    );
+  }
+  const record = snapshotPlainDataRecord(
+    value,
+    ["afterInboxValidated", "afterFilePublished", "afterDurableFinish"],
+    [],
+    "Candidate character test lifecycle",
+  );
+  if (
+    (record.afterInboxValidated !== undefined &&
+      typeof record.afterInboxValidated !== "function") ||
+    (record.afterFilePublished !== undefined &&
+      typeof record.afterFilePublished !== "function") ||
+    (record.afterDurableFinish !== undefined &&
+      typeof record.afterDurableFinish !== "function")
+  ) {
+    characterError(
+      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_INPUT_INVALID",
+      "Candidate character test lifecycle hooks must be synchronous functions",
+    );
+  }
+  return Object.freeze({
+    ...(record.afterInboxValidated === undefined
+      ? {}
+      : {
+          afterInboxValidated:
+            record.afterInboxValidated as AgentBackupRestoreV3CandidateCharacterLifecycle["afterInboxValidated"],
+        }),
+    ...(record.afterFilePublished === undefined
+      ? {}
+      : {
+          afterFilePublished:
+            record.afterFilePublished as AgentBackupRestoreV3CandidateCharacterLifecycle["afterFilePublished"],
+        }),
+    ...(record.afterDurableFinish === undefined
+      ? {}
+      : {
+          afterDurableFinish:
+            record.afterDurableFinish as AgentBackupRestoreV3CandidateCharacterLifecycle["afterDurableFinish"],
+        }),
+  });
+}
+
+function copyPlaintext(
+  target: Uint8Array,
+  source: Uint8Array,
+  offset: number,
+): void {
+  REFLECT_APPLY(INTRINSIC_UINT8_ARRAY_SET, target, [source, offset]);
+}
+
+function plaintextSubarray(
+  value: Uint8Array,
+  start: number,
+  end: number,
+): Uint8Array {
+  return REFLECT_APPLY(INTRINSIC_UINT8_ARRAY_SUBARRAY, value, [
+    start,
+    end,
+  ]) as Uint8Array;
+}
+
+function zeroizePlaintext(value: Uint8Array): void {
+  REFLECT_APPLY(INTRINSIC_UINT8_ARRAY_FILL, value, [0]);
 }
 
 function invokeTestOnlyHook<T>(
@@ -255,7 +393,7 @@ async function requireNoAdditionalRecord(
       control: input.control,
       heldLock: lock,
     });
-    unexpected.payload.fill(0);
+    zeroizePlaintext(unexpected.payload);
     characterError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_RECORD_COUNT_MISMATCH",
       "Candidate character inbox contains a record beyond its authenticated finish",
@@ -349,7 +487,7 @@ async function materializeCopiedCharacter(
       "Candidate character must have one bounded non-empty authenticated payload",
     );
   }
-  const bytes = new Uint8Array(component.payloadBytes);
+  const bytes = new INTRINSIC_UINT8_ARRAY(component.payloadBytes);
   const hash = createHash("sha256");
   let position = 0;
   let lastRecordReceiptSha256 = "";
@@ -398,12 +536,12 @@ async function materializeCopiedCharacter(
             "Candidate character record is not exact, opaque, and contiguous",
           );
         }
-        bytes.set(inbox.payload, position);
+        copyPlaintext(bytes, inbox.payload, position);
         hash.update(inbox.payload);
         position += inbox.payload.byteLength;
         lastRecordReceiptSha256 = inbox.receipt.receiptSha256;
       } finally {
-        inbox.payload.fill(0);
+        zeroizePlaintext(inbox.payload);
       }
     }
     await requireNoAdditionalRecord(input, component, lock);
@@ -460,7 +598,8 @@ async function materializeCopiedCharacter(
       if (!writer.replayed) {
         for (let offset = 0; offset < bytes.byteLength; offset += 256 * 1024) {
           await writer.write(
-            bytes.subarray(
+            plaintextSubarray(
+              bytes,
               offset,
               Math.min(bytes.byteLength, offset + 256 * 1024),
             ),
@@ -522,7 +661,7 @@ async function materializeCopiedCharacter(
       cleanupFailure = cause;
     }
   }
-  bytes.fill(0);
+  zeroizePlaintext(bytes);
   if (primaryFailure !== undefined && cleanupFailure !== undefined) {
     characterError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_CLEANUP_FAILED",
@@ -545,27 +684,41 @@ async function materializeCopiedCharacter(
 export function materializeAgentBackupRestoreV3CandidateCharacter(
   input: Readonly<MaterializeAgentBackupRestoreV3CandidateCharacterInput>,
 ): Promise<Readonly<AgentBackupRestoreV3CandidateCharacterReceipt>> {
-  if (!input || typeof input !== "object" || isProxy(input)) {
-    characterError(
-      "AGENT_BACKUP_RESTORE_V3_CANDIDATE_CHARACTER_INPUT_INVALID",
-      "Candidate character materialization input must be one non-proxy object",
-    );
-  }
-  const receipt = snapshotReceipt(input.receipt);
-  const maximumBytes = resolveMaximumBytes(input.maximumBytes);
-  const session = snapshotAgentBackupRestoreV3CandidateSession(input.session);
-  const control = Object.freeze({
-    signal: input.control.signal,
-    deadlineEpochMs: input.control.deadlineEpochMs,
-  });
+  const exactInput = snapshotPlainDataRecord(
+    input,
+    [
+      "candidateFs",
+      "session",
+      "receipt",
+      "control",
+      "maximumBytes",
+      "testOnlyLifecycle",
+    ],
+    ["candidateFs", "session", "receipt", "control"],
+    "Candidate character materialization input",
+  );
+  const testOnlyLifecycle = snapshotTestOnlyLifecycle(
+    exactInput.testOnlyLifecycle,
+  );
+  const candidateFs = requireCandidateFs(exactInput.candidateFs);
+  const control = snapshotCharacterControl(exactInput.control);
+  const session = snapshotAgentBackupRestoreV3CandidateSession(
+    exactInput.session as Readonly<AgentBackupRestoreV3StagingSession>,
+  );
+  const receipt = snapshotReceipt(
+    exactInput.receipt as Readonly<AgentBackupRestoreV3ComponentReceipt>,
+  );
+  const maximumBytes = resolveMaximumBytes(
+    exactInput.maximumBytes as number | undefined,
+  );
   return materializeCopiedCharacter(
     Object.freeze({
-      candidateFs: input.candidateFs,
+      candidateFs,
       session,
       receipt,
       control,
       maximumBytes,
-      testOnlyLifecycle: input.testOnlyLifecycle,
+      testOnlyLifecycle,
     }),
     receipt,
     maximumBytes,
