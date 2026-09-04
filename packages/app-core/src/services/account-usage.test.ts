@@ -345,6 +345,54 @@ describe("pollAnthropicUsage", () => {
     expect(typeof snap.refreshedAt).toBe("number");
   });
 
+  it.each([
+    ["null root", null],
+    ["array root", []],
+    ["null five_hour window", { five_hour: null }],
+    ["numeric five_hour window", { five_hour: 7 }],
+    ["null seven_day window", { seven_day: null }],
+    ["array seven_day window", { seven_day: [] }],
+    ["null limits collection", { limits: null }],
+    ["object limits collection", { limits: { kind: "weekly_all" } }],
+    ["non-object limits entry", { limits: [null] }],
+    [
+      "non-object limit scope",
+      { limits: [{ kind: "weekly_scoped", scope: "all-models" }] },
+    ],
+    [
+      "non-object scoped model",
+      {
+        limits: [
+          {
+            kind: "weekly_scoped",
+            scope: { model: "Fable" },
+          },
+        ],
+      },
+    ],
+    [
+      "null scoped model",
+      { limits: [{ kind: "weekly_scoped", scope: { model: null } }] },
+    ],
+  ])("rejects a malformed Anthropic usage %s", async (_name, payload) => {
+    stubFetch(jsonResponse(payload));
+
+    await expect(pollAnthropicUsage("malformed-token")).rejects.toMatchObject({
+      code: "anthropic_usage.invalid_shape",
+    });
+  });
+
+  it("rejects malformed Anthropic usage JSON with a typed decoding error", async () => {
+    stubFetch(new Response("{", { status: 200 }));
+
+    await expect(
+      pollAnthropicUsage("malformed-json-token"),
+    ).rejects.toMatchObject({
+      code: "anthropic_usage.invalid_json",
+      cause: expect.any(SyntaxError),
+    });
+  });
+
   it("passes through an epoch-MILLISECONDS reset timestamp unchanged", async () => {
     const ms = 1_700_000_000_000; // already > 1e12
     stubFetch(jsonResponse({ seven_day: { resets_at: ms } }));
