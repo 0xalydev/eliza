@@ -454,8 +454,8 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       const expiredAuthorize = await settleAcrossBackupLockPastExpiry({
         relation: "agent_backup_restore_v3_candidate_seal_authorizations",
         expiresAtEpochMs: authorizeExpiry,
-        run: () =>
-          sealRepository!
+        run: async () =>
+          await sealRepository!
             .createAgentBackupRestoreV3CandidateSealAuthority()
             .authorize(candidateE.authorizationRequest, operationControl),
       });
@@ -554,7 +554,8 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       const authorizationG = await withLostNextCommitAcknowledgment({
         sqlState: "40003",
         afterCommit: async () => lostAuthorizationController.abort(),
-        run: () => authorityG.authorize(candidateG.authorizationRequest, lostAuthorizationControl),
+        run: async () =>
+          await authorityG.authorize(candidateG.authorizationRequest, lostAuthorizationControl),
       });
       expect(await authorityG.authorize(candidateG.authorizationRequest, operationControl)).toEqual(
         authorizationG,
