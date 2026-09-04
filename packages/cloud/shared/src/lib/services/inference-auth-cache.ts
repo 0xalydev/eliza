@@ -29,10 +29,12 @@ import { CacheKeys, CacheTTL } from "../cache/keys";
 import { logger } from "../utils/logger";
 
 /** Current IAC schema version. Bump the key suffix in CacheKeys on a breaking change. */
-export const INFERENCE_AUTH_CONTEXT_VERSION = 2 as const;
+export const INFERENCE_AUTH_CONTEXT_VERSION = 3 as const;
 
 /** Admission state co-located with identity so a warm Worker performs one KV read. */
 export interface InferenceAdmissionSnapshot {
+  /** Paid-plan funding authority captured with the combined admission decision. */
+  subscriptionFunded: boolean;
   balance: {
     balanceUsd: number;
     balanceAt: number;
@@ -126,6 +128,7 @@ function isInferenceAdmissionSnapshot(value: unknown): value is InferenceAdmissi
   const balance = candidate.balance;
   const rateLimits = candidate.rateLimits;
   return (
+    typeof candidate.subscriptionFunded === "boolean" &&
     Boolean(balance) &&
     typeof balance?.balanceUsd === "number" &&
     Number.isFinite(balance.balanceUsd) &&
@@ -159,6 +162,31 @@ export type InferenceAuthCacheReadOutcome =
       kind: "miss" | "invalid" | "unavailable" | "error";
       backend: CacheBackendKind;
     };
+
+export interface InferenceCacheCleanupExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+}
+
+function deferMalformedEntryCleanup(
+  key: string,
+  executionCtx?: InferenceCacheCleanupExecutionContext,
+): void {
+  const cleanup = cache.del(key, { keyClass: "inference_auth" }).then(
+    () => undefined,
+    (error) => {
+      // error-policy:J7 malformed state already failed closed; cleanup remains
+      // observable without adding another remote write to authorization latency.
+      logger.warn("[InferenceAuthCache] Malformed entry cleanup failed", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    },
+  );
+  if (executionCtx) {
+    executionCtx.waitUntil(cleanup);
+  } else {
+    void cleanup;
+  }
+}
 
 /** Org credit-balance snapshot used ONLY as the optimistic-billing fast-path gate hint. */
 export interface OrgBalanceHint {
@@ -308,6 +336,7 @@ export async function readInferenceAuthContext(
 export async function readInferenceAuthContextWithOutcome(
   keyHash: string,
   probeDiscriminator?: string,
+  executionCtx?: InferenceCacheCleanupExecutionContext,
 ): Promise<InferenceAuthCacheReadOutcome> {
   const canonicalKey = CacheKeys.inference.authContext(keyHash);
   // Authenticated latency probes read a unique, never-written variant so each
@@ -329,7 +358,7 @@ export async function readInferenceAuthContextWithOutcome(
   }
   if (!isInferenceAuthContext(outcome.value) || outcome.value.keyHash !== keyHash) {
     logger.warn("[InferenceAuthCache] Dropping malformed IAC entry");
-    await cache.del(key, { keyClass: "inference_auth" });
+    deferMalformedEntryCleanup(key, executionCtx);
     return { kind: "invalid", backend: outcome.backend };
   }
   return { kind: "hit", ctx: outcome.value, backend: outcome.backend };
@@ -380,6 +409,7 @@ export async function readInferenceSessionAuthContext(
 /** Read the cached positive or fail-closed session decision. */
 export async function readInferenceSessionAuthDecision(
   stewardUserId: string,
+  executionCtx?: InferenceCacheCleanupExecutionContext,
 ): Promise<InferenceSessionAuthDecision | null> {
   const key = CacheKeys.inference.sessionAuthContext(hashStewardUserId(stewardUserId));
   const outcome = await cache.getWithOutcome<unknown>(key, { keyClass: "inference_auth" });
@@ -390,7 +420,7 @@ export async function readInferenceSessionAuthDecision(
     cached.stewardUserId !== stewardUserId
   ) {
     logger.warn("[InferenceAuthCache] Dropping malformed session IAC entry");
-    await cache.del(key, { keyClass: "inference_auth" });
+    deferMalformedEntryCleanup(key, executionCtx);
     return null;
   }
   return cached;

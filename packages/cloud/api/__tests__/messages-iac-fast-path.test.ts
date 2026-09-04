@@ -303,7 +303,10 @@ function postMessages(
   });
 }
 
-function postMessagesInWorker(extraHeaders: Record<string, string> = {}) {
+function postMessagesInWorker(
+  extraHeaders: Record<string, string> = {},
+  bodyOverrides: Record<string, unknown> = {},
+) {
   return messagesRoute.request(
     "/",
     {
@@ -317,6 +320,7 @@ function postMessagesInWorker(extraHeaders: Record<string, string> = {}) {
         model: "claude-3-5-sonnet-20241022",
         max_tokens: 16,
         messages: [{ role: "user", content: "hello" }],
+        ...bodyOverrides,
       }),
     },
     {},
@@ -329,6 +333,18 @@ function postMessagesInWorker(extraHeaders: Record<string, string> = {}) {
 }
 
 describe("/v1/messages IAC fast path", () => {
+  test("malformed request resolves auth once without deferral or provider admission", async () => {
+    const response = await postMessagesInWorker({}, { messages: [] });
+
+    expect(response.status).toBe(400);
+    expect(resolveInferenceAuthContext).toHaveBeenCalledTimes(1);
+    expect(resolveInferenceAuthContext.mock.calls[0]?.[1]).toMatchObject({
+      deferStrongCredentialCheck: false,
+    });
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+  });
+
   test("enabled Worker admission rejects a missing execution context without authoritative fallback", async () => {
     const response = await messagesRoute.request(
       "/",
@@ -504,6 +520,88 @@ describe("/v1/messages IAC fast path", () => {
     expect(shouldBlockUser).not.toHaveBeenCalled();
     expect(reserveCredits).not.toHaveBeenCalled();
     expect(generateText).not.toHaveBeenCalled();
+  });
+
+  test("preserves a cached standing 503 before billing or provider work", async () => {
+    resolveInferenceAuthContext.mockResolvedValueOnce({
+      kind: "rejected",
+      status: 503,
+    });
+
+    const response = await postMessagesInWorker();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("1");
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: {
+        type: "service_unavailable",
+        message: "Authorization service is unavailable. Retry shortly.",
+      },
+    });
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
+  test("returns a typed cached standing reason before provider work", async () => {
+    resolveInferenceAuthContext.mockResolvedValueOnce({
+      kind: "rejected",
+      status: 403,
+      reason: "account_inactive",
+    });
+
+    const response = await postMessagesInWorker();
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: {
+        type: "permission_error",
+        message: "Account is inactive",
+      },
+    });
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
+  test("preserves a thrown auth-unavailable 503 instead of collapsing it to 401", async () => {
+    const unavailable = new Error("revocation authority unavailable");
+    unavailable.name = "InferenceCredentialRevocationUnavailableError";
+    resolveInferenceAuthContext.mockRejectedValueOnce(unavailable);
+
+    const response = await postMessagesInWorker();
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("1");
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: { type: "service_unavailable" },
+    });
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
+  });
+
+  test("maps an unexpected resolver failure to 500 instead of an auth rejection", async () => {
+    resolveInferenceAuthContext.mockRejectedValueOnce(
+      new Error("database connection reset"),
+    );
+
+    const response = await postMessagesInWorker();
+
+    expect(response.status).toBe(500);
+    await expect(response.json()).resolves.toMatchObject({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "Authorization could not be completed.",
+      },
+    });
+    expect(reserveCredits).not.toHaveBeenCalled();
+    expect(generateText).not.toHaveBeenCalled();
+    expect(streamText).not.toHaveBeenCalled();
   });
 
   test("monetized X-App-Id messages use app-credit reservation with creator markup", async () => {

@@ -107,7 +107,10 @@ function makeExecutionCtx() {
   };
 }
 
-function post(ctx: ExecutionContext) {
+function post(
+  ctx: ExecutionContext,
+  bodyOverrides: Record<string, unknown> = {},
+) {
   return embeddingsRoute.request(
     "/",
     {
@@ -119,6 +122,7 @@ function post(ctx: ExecutionContext) {
       body: JSON.stringify({
         model: "text-embedding-3-small",
         input: "cache-only hot path",
+        ...bodyOverrides,
       }),
     },
     {},
@@ -177,6 +181,19 @@ beforeEach(() => {
 });
 
 describe("POST /api/v1/embeddings Worker cache hot path", () => {
+  test("malformed request resolves auth once without deferral or provider admission", async () => {
+    const { ctx } = makeExecutionCtx();
+    const response = await post(ctx, { input: undefined });
+
+    expect(response.status).toBe(400);
+    expect(resolveInferenceAuthContext).toHaveBeenCalledTimes(1);
+    expect(resolveInferenceAuthContext.mock.calls[0]?.[1]).toMatchObject({
+      deferStrongCredentialCheck: false,
+    });
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+  });
+
   test("enabled Worker admission rejects a missing execution context without authoritative fallback", async () => {
     const response = await embeddingsRoute.request(
       "/",
@@ -327,6 +344,55 @@ describe("POST /api/v1/embeddings Worker cache hot path", () => {
 
     authHydration.resolve();
     await scheduled[0];
+  });
+
+  test("preserves a cached standing 503 before admission or provider dispatch", async () => {
+    resolveInferenceAuthContext.mockResolvedValueOnce({
+      kind: "rejected",
+      status: 503,
+    });
+    const { ctx, scheduled } = makeExecutionCtx();
+
+    const response = await post(ctx);
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("1");
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        type: "service_unavailable",
+        code: "service_unavailable",
+        details: { reason: "authorization_unavailable" },
+      },
+    });
+    expect(enforceOrgRateLimit).not.toHaveBeenCalled();
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(embedMany).not.toHaveBeenCalled();
+    await Promise.all(scheduled);
+  });
+
+  test("returns a typed cached standing reason before provider dispatch", async () => {
+    resolveInferenceAuthContext.mockResolvedValueOnce({
+      kind: "rejected",
+      status: 403,
+      reason: "membership_missing",
+    });
+    const { ctx, scheduled } = makeExecutionCtx();
+
+    const response = await post(ctx);
+
+    expect(response.status).toBe(403);
+    await expect(response.json()).resolves.toMatchObject({
+      error: {
+        message: "Account is not associated with an active organization",
+        code: "access_denied",
+        details: { reason: "membership_missing" },
+      },
+    });
+    expect(admitOrganizationInference).not.toHaveBeenCalled();
+    expect(embed).not.toHaveBeenCalled();
+    expect(embedMany).not.toHaveBeenCalled();
+    await Promise.all(scheduled);
   });
 
   test("cold org-rate policy is an explicit retryable 503 before admission", async () => {

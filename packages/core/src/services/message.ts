@@ -227,6 +227,10 @@ import {
 	reportOutboundEnvelopeBlock,
 } from "../security/outbound-envelope-guard";
 import {
+	composeToolDiagnosticRedactor,
+	projectToolDiagnosticArgs,
+} from "../security/tool-diagnostics";
+import {
 	attestDeliveryAudienceFromCanonicalRoom,
 	getTrustedDeliveryAudience,
 	OWNER_PRIVATE_DESTINATION_DISCLOSURE_BASIS,
@@ -236,6 +240,7 @@ import {
 	trustedDeliveryAudienceIsBoundToRuntime,
 } from "../security/trusted-delivery-audience";
 import {
+	emitStreamingHook,
 	getModelStreamChunkDeliveryDepth,
 	getStreamingContext,
 	runWithStreamingContext,
@@ -7636,6 +7641,12 @@ interface ExecuteV5PlannedToolCallParams {
 	 * must retain the turn's original contexts for the canonical gate.
 	 */
 	activateActionContexts?: boolean;
+	/**
+	 * Deterministic response-handler calls announce only after this dispatcher
+	 * has selected direct execution. Parent actions handled by a sub-planner or
+	 * rejected by the dispatcher must not create an orphan pending stream row.
+	 */
+	announceDirectExecution?: boolean;
 }
 
 interface BuildV5ExecutorContextParams {
@@ -7822,12 +7833,23 @@ async function executeV5PlannedToolCall(
 		return subPlannerResultToPlannerToolResult(subResult);
 	}
 
-	const rawActionResult = await executePlannedToolCall(
-		args.runtime,
-		executorCtx,
-		toolCall,
-		{ ...(args.executorOptions ?? {}), actions: executionActions },
-	);
+	if (args.announceDirectExecution) {
+		await announceDirectToolCallToStream(args.runtime, toolCall);
+	}
+	let rawActionResult: ActionResult;
+	try {
+		rawActionResult = await executePlannedToolCall(
+			args.runtime,
+			executorCtx,
+			toolCall,
+			{ ...(args.executorOptions ?? {}), actions: executionActions },
+		);
+	} catch (error) {
+		if (args.announceDirectExecution) {
+			await settleFailedDirectToolCallOnStream(args.runtime, toolCall, error);
+		}
+		throw error;
+	}
 	invalidateEvidenceSensitiveProviderCache(
 		args.runtime,
 		args.executorCtx.message,
@@ -8250,6 +8272,74 @@ function collectPreviousActionResults(
 }
 
 /**
+ * Streaming status parity for tool executions that bypass the planner loop —
+ * the pre-LLM shortcut gate and response-handler deterministic tool calls.
+ * The planner loop announces every tool through the streaming `onToolCall`
+ * hook, which the chat SSE surface projects onto its existing
+ * `{type:"status",kind:"running_tool"}` frame and inline tool row; without
+ * this, exactly the fastest turns render no activity between "thinking" and
+ * the final reply. Same wire payload as planner-loop's executeQueuedToolCall;
+ * the executor's own emitToolResult settles the row.
+ */
+async function announceDirectToolCallToStream(
+	runtime: IAgentRuntime,
+	toolCall: PlannerToolCall,
+): Promise<void> {
+	const streamingContext = getStreamingContext();
+	if (!streamingContext?.onToolCall) return;
+	const redactDiagnosticText = composeToolDiagnosticRedactor(runtime);
+	await emitStreamingHook(streamingContext, "onToolCall", {
+		toolCall: {
+			id: toolCall.id ?? toolCall.name,
+			name: toolCall.name,
+			arguments: (projectToolDiagnosticArgs(
+				toolCall.params ?? {},
+				redactDiagnosticText,
+			) ?? {}) as Record<string, JsonValue>,
+			status: "pending",
+		},
+		...(streamingContext.messageId
+			? { messageId: streamingContext.messageId }
+			: {}),
+		metadata: { deterministic: true },
+	});
+}
+
+/** Settles a direct-call announcement when the canonical executor throws. */
+async function settleFailedDirectToolCallOnStream(
+	runtime: IAgentRuntime,
+	toolCall: PlannerToolCall,
+	error: unknown,
+): Promise<void> {
+	const streamingContext = getStreamingContext();
+	if (!streamingContext?.onToolResult) return;
+	const redactDiagnosticText = composeToolDiagnosticRedactor(runtime);
+	const id = toolCall.id ?? toolCall.name;
+	const message = redactDiagnosticText(
+		error instanceof Error ? error.message : String(error),
+	);
+	await emitStreamingHook(streamingContext, "onToolResult", {
+		toolCall: {
+			id,
+			name: toolCall.name,
+			arguments: (projectToolDiagnosticArgs(
+				toolCall.params ?? {},
+				redactDiagnosticText,
+			) ?? {}) as Record<string, JsonValue>,
+			status: "failed",
+			result: { success: false, text: message, error: message },
+		},
+		toolCallId: id,
+		result: { success: false, text: message, error: message },
+		status: "failed",
+		...(streamingContext.messageId
+			? { messageId: streamingContext.messageId }
+			: {}),
+		metadata: { deterministic: true },
+	});
+}
+
+/**
  * Pre-LLM action shortcut gate (#8791).
  *
  * Matches explicit slash/`!` protocol invocations against the runtime's
@@ -8297,34 +8387,47 @@ export async function runShortcutGate(args: {
 	if (!action) return null;
 
 	let captured: string | undefined;
+	const shortcutToolCall: PlannerToolCall = {
+		id: `shortcut:${normalizeActionIdentifier(action.name)}`,
+		name: action.name,
+		params: { ...target.parameters, ...match.parameters },
+	};
+	await announceDirectToolCallToStream(args.runtime, shortcutToolCall);
 	// Shortcuts enter the same executor as planner-selected tools so component
 	// gates, argument validation, callback buffering, audience revalidation, and
 	// action events remain one non-bypassable contract.
-	const shortcutActionResult = await executePlannedToolCall(
-		args.runtime,
-		{
-			message: args.message,
-			state: args.state,
-			userRoles: [args.senderRole],
-			activeContexts: ["general"],
-			callback: async (content) => {
-				if (typeof content?.text === "string" && content.text) {
-					captured = content.text;
-				}
-				return [];
+	let shortcutActionResult: ActionResult;
+	try {
+		shortcutActionResult = await executePlannedToolCall(
+			args.runtime,
+			{
+				message: args.message,
+				state: args.state,
+				userRoles: [args.senderRole],
+				activeContexts: ["general"],
+				callback: async (content) => {
+					if (typeof content?.text === "string" && content.text) {
+						captured = content.text;
+					}
+					return [];
+				},
 			},
-		},
-		{
-			name: action.name,
-			params: { ...target.parameters, ...match.parameters },
-		},
-		{
-			actions: [action],
-			...(args.onSettledActionResult
-				? { onSettledResult: args.onSettledActionResult }
-				: {}),
-		},
-	);
+			shortcutToolCall,
+			{
+				actions: [action],
+				...(args.onSettledActionResult
+					? { onSettledResult: args.onSettledActionResult }
+					: {}),
+			},
+		);
+	} catch (error) {
+		await settleFailedDirectToolCallOnStream(
+			args.runtime,
+			shortcutToolCall,
+			error,
+		);
+		throw error;
+	}
 	if (captured === undefined) {
 		const executionError = shortcutActionResult.data?.error;
 		if (executionError !== undefined) {
@@ -10194,6 +10297,7 @@ export async function runV5MessageRuntimeStage1(args: {
 							trajectoryId,
 							plannerLoopConfig: args.plannerLoopConfig,
 							activateActionContexts: false,
+							announceDirectExecution: true,
 						}),
 					);
 				} catch (error) {
