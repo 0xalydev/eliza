@@ -645,6 +645,10 @@ interface ClaudeCodeCredentialBlob {
   source: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function isClaudeCodeInvalidGrantError(err: unknown): boolean {
   const message = err instanceof Error ? err.message : String(err);
   return /\binvalid_grant\b/i.test(message);
@@ -652,8 +656,8 @@ function isClaudeCodeInvalidGrantError(err: unknown): boolean {
 
 /**
  * Try to read a Claude Code OAuth credential blob from its explicit local
- * file. Does NOT validate expiry — that's the caller's job (so it can decide
- * whether to refresh via the refresh token).
+ * file. It validates the persisted expiry shape but leaves freshness and
+ * refresh policy to the caller.
  *
  * Note that Claude Code's runtime keeps the live access token in memory and
  * refreshes it via the refresh token on demand — the persisted access token
@@ -666,24 +670,57 @@ function readClaudeCodeOAuthBlob(): ClaudeCodeCredentialBlob | null {
     source: string,
   ): ClaudeCodeCredentialBlob | null => {
     try {
-      const parsed = JSON.parse(raw) as {
-        claudeAiOauth?: {
-          accessToken?: string;
-          access_token?: string;
-          refreshToken?: string;
-          refresh_token?: string;
-          expiresAt?: number;
-          expires_at?: number;
-        };
-      };
+      const parsed: unknown = JSON.parse(raw);
+      if (!isRecord(parsed)) return null;
       const oauth = parsed.claudeAiOauth;
-      if (!oauth) return null;
+      if (!isRecord(oauth)) return null;
+      const accessTokenFields = [oauth.accessToken, oauth.access_token].filter(
+        (value) => value !== undefined,
+      );
+      if (
+        accessTokenFields.length === 0 ||
+        accessTokenFields.some(
+          (value) => typeof value !== "string" || !value.trim(),
+        )
+      ) {
+        return null;
+      }
       const accessToken = oauth.accessToken ?? oauth.access_token;
-      if (typeof accessToken !== "string" || !accessToken.trim()) return null;
+      if (typeof accessToken !== "string") return null;
+      const refreshTokenFields = [
+        oauth.refreshToken,
+        oauth.refresh_token,
+      ].filter((value) => value !== undefined);
+      if (
+        refreshTokenFields.some(
+          (value) => value !== null && typeof value !== "string",
+        )
+      ) {
+        return null;
+      }
+      const refreshTokenValue =
+        oauth.refreshToken ?? oauth.refresh_token ?? null;
+      const refreshToken =
+        typeof refreshTokenValue === "string" ? refreshTokenValue : null;
+      const expiresAtFields = [oauth.expiresAt, oauth.expires_at].filter(
+        (value) => value !== undefined,
+      );
+      if (
+        expiresAtFields.some(
+          (value) =>
+            value !== null &&
+            (typeof value !== "number" || !Number.isFinite(value) || value < 0),
+        )
+      ) {
+        return null;
+      }
+      const expiresAtValue = oauth.expiresAt ?? oauth.expires_at ?? null;
+      const expiresAt =
+        typeof expiresAtValue === "number" ? expiresAtValue : null;
       return {
         accessToken: accessToken.trim(),
-        refreshToken: oauth.refreshToken ?? oauth.refresh_token ?? null,
-        expiresAt: oauth.expiresAt ?? oauth.expires_at ?? null,
+        refreshToken,
+        expiresAt,
         source,
       };
     } catch {
