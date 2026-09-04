@@ -304,6 +304,16 @@ export async function clearStaleStewardSession(
     }
   } catch (error) {
     if (error instanceof StewardTokenRemovalError) throw error;
+    // Canonical A removal can publish `cleared` before obsolete refresh-key
+    // cleanup throws. Another realm or re-entrant storage boundary may publish
+    // account B while this awaited removal unwinds, so repeat the authority
+    // check before applying A's destructive mirror/cookie scrub.
+    if (
+      options.expectedToken !== undefined &&
+      readStoredStewardToken() !== null
+    ) {
+      return false;
+    }
     // error-policy:J2 canonical invalidation may already have succeeded before
     // obsolete refresh-key cleanup failed. Finish every credential teardown,
     // then rethrow the original storage error with its stack intact.

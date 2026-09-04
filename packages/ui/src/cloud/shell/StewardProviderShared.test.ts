@@ -241,6 +241,77 @@ describe("clearStaleStewardSession", () => {
     );
   });
 
+  it("preserves account B when it publishes while account A refresh-key cleanup fails", async () => {
+    localStorage.setItem(STEWARD_TOKEN_KEY, "account-a-token");
+    localStorage.setItem(STEWARD_REFRESH_TOKEN_KEY, "obsolete-refresh-token");
+    markStewardServerCookieSynced(
+      "account-a-token",
+      "/api/auth/steward-session",
+    );
+    const storageFailure = new Error("legacy refresh storage unavailable");
+    const storage = window.localStorage;
+    const originalRemoveItem = storage.removeItem.bind(storage);
+    const removeItemOwner = Object.hasOwn(storage, "removeItem")
+      ? storage
+      : (Object.getPrototypeOf(storage) as Storage);
+    const removeItem = vi
+      .spyOn(removeItemOwner, "removeItem")
+      .mockImplementation((key: string) => {
+        if (key === STEWARD_REFRESH_TOKEN_KEY) {
+          localStorage.setItem(STEWARD_TOKEN_KEY, "account-b-token");
+          savePersistedActiveServer({
+            id: "cloud:account-b-agent",
+            kind: "cloud",
+            label: "Account B",
+            apiBase: "https://account-b-agent.eliza.app",
+            accessToken: "account-b-token",
+          });
+          saveAgentProfileRegistry({
+            version: 1,
+            activeProfileId: "account-b-profile",
+            profiles: [
+              {
+                id: "account-b-profile",
+                label: "Account B",
+                kind: "cloud",
+                apiBase: "https://account-b-agent.eliza.app",
+                accessToken: "account-b-token",
+                createdAt: "2026-09-05T00:00:00.000Z",
+              },
+            ],
+          });
+          markStewardServerCookieSynced(
+            "account-b-token",
+            "/api/auth/steward-session",
+          );
+          throw storageFailure;
+        }
+        return originalRemoveItem(key);
+      });
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+
+    try {
+      await expect(
+        clearStaleStewardSession({ expectedToken: "account-a-token" }),
+      ).resolves.toBe(false);
+    } finally {
+      removeItem.mockRestore();
+    }
+
+    expect(localStorage.getItem(STEWARD_TOKEN_KEY)).toBe("account-b-token");
+    expect(loadPersistedActiveServer()?.accessToken).toBe("account-b-token");
+    expect(loadAgentProfileRegistry().profiles[0]?.accessToken).toBe(
+      "account-b-token",
+    );
+    expect(
+      consumeStewardServerCookieSynced(
+        "account-b-token",
+        "/api/auth/steward-session",
+      ),
+    ).toBe(true);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("retains logical account state when canonical protected removal fails", async () => {
     localStorage.setItem(STEWARD_TOKEN_KEY, "still-durable-token");
     savePersistedActiveServer({
