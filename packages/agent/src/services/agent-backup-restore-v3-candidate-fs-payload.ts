@@ -15,8 +15,10 @@ import {
   boundedInternalCleanup,
   CANDIDATE_FS_IO_CHUNK_BYTES,
   type CandidateFsExactStats,
+  candidateFsByteView,
   candidateFsError,
   candidateFsIdentity,
+  candidateFsNativeIoView,
   controlled,
   controlledAcquire,
   fileStatExact,
@@ -44,7 +46,15 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UINT64_PATTERN = /^(?:0|[1-9][0-9]*)$/;
 const PAYLOAD_OWNER_TOKEN_MINIMUM_BYTES = 32;
 const EMPTY_PAYLOAD_SHA256 = createHash("sha256").digest("hex");
-const TYPED_ARRAY_PROTOTYPE = Object.getPrototypeOf(Uint8Array.prototype);
+const OBJECT_FREEZE = Object.freeze;
+const OBJECT_GET_PROTOTYPE_OF = Object.getPrototypeOf;
+const OBJECT_IS = Object.is;
+const OBJECT_KEYS = Object.keys;
+const OBJECT_PROTOTYPE = Object.prototype;
+const ARRAY_IS_ARRAY = Array.isArray;
+const ARRAY_JOIN = Array.prototype.join;
+const ARRAY_SORT = Array.prototype.sort;
+const TYPED_ARRAY_PROTOTYPE = OBJECT_GET_PROTOTYPE_OF(Uint8Array.prototype);
 const TYPED_ARRAY_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
   TYPED_ARRAY_PROTOTYPE,
   "byteLength",
@@ -57,11 +67,60 @@ const ARRAY_BUFFER_BYTE_LENGTH_GETTER = Object.getOwnPropertyDescriptor(
   ArrayBuffer.prototype,
   "byteLength",
 )?.get;
+const REFLECT_APPLY = Reflect.apply;
+const INTRINSIC_UINT8_ARRAY = Uint8Array;
 const UINT8_ARRAY_SET = Uint8Array.prototype.set;
+const UINT8_ARRAY_FILL = Uint8Array.prototype.fill;
+const IS_PROXY = utilTypes.isProxy;
+const IS_UINT8_ARRAY = utilTypes.isUint8Array;
+const STRING_SLICE = String.prototype.slice;
+
+function sortedObjectKeys(value: object): string[] {
+  return REFLECT_APPLY(ARRAY_SORT, OBJECT_KEYS(value), []);
+}
+
+function joinStrings(value: readonly string[], separator: string): string {
+  return REFLECT_APPLY(ARRAY_JOIN, value, [separator]);
+}
+
+function hasExactKeys(
+  value: readonly string[],
+  expected: readonly string[],
+): boolean {
+  return joinStrings(value, "\0") === joinStrings(expected, "\0");
+}
+
+function stringSlice(value: string, start: number, end?: number): string {
+  return REFLECT_APPLY(
+    STRING_SLICE,
+    value,
+    end === undefined ? [start] : [start, end],
+  );
+}
+
+function typedArrayByteLength(value: Uint8Array): number {
+  return REFLECT_APPLY(
+    TYPED_ARRAY_BYTE_LENGTH_GETTER as () => number,
+    value,
+    [],
+  );
+}
+
+function zeroBytes(value: Uint8Array, start?: number, end?: number): void {
+  REFLECT_APPLY(
+    UINT8_ARRAY_FILL,
+    value,
+    end === undefined
+      ? start === undefined
+        ? [0]
+        : [0, start]
+      : [0, start, end],
+  );
+}
 
 function payloadFragmentByteLength(fragment: Uint8Array): number {
   if (
-    !utilTypes.isUint8Array(fragment) ||
+    !IS_UINT8_ARRAY(fragment) ||
     !TYPED_ARRAY_BYTE_LENGTH_GETTER ||
     !TYPED_ARRAY_BUFFER_GETTER ||
     !ARRAY_BUFFER_BYTE_LENGTH_GETTER
@@ -72,11 +131,11 @@ function payloadFragmentByteLength(fragment: Uint8Array): number {
     );
   }
   try {
-    const buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, fragment, []);
+    const buffer = REFLECT_APPLY(TYPED_ARRAY_BUFFER_GETTER, fragment, []);
     // The ArrayBuffer intrinsic rejects SharedArrayBuffer. A shared backing
     // store could otherwise change concurrently and yield a torn snapshot.
-    Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
-    return Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, fragment, []);
+    REFLECT_APPLY(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
+    return typedArrayByteLength(fragment);
   } catch (cause) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FRAGMENT_INVALID",
@@ -90,13 +149,13 @@ function copyPayloadFragment(
   fragment: Uint8Array,
   byteLength: number,
 ): Uint8Array {
-  const owned = new Uint8Array(byteLength);
+  const owned = new INTRINSIC_UINT8_ARRAY(byteLength);
   try {
     // Invoke the intrinsic typed-array copy path. Uint8Array.from and the
     // public iterator are caller-controlled and may disagree with byteLength.
-    Reflect.apply(UINT8_ARRAY_SET, owned, [fragment]);
+    REFLECT_APPLY(UINT8_ARRAY_SET, owned, [fragment]);
   } catch (cause) {
-    owned.fill(0);
+    zeroBytes(owned);
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_FRAGMENT_INVALID",
       "Candidate payload fragment could not be copied exactly",
@@ -186,7 +245,7 @@ function parsePayloadReceipt(
       "Candidate payload receipt is not exact and canonical",
     );
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     sizeBytes: snapshot.sizeBytes as number,
     sha256: snapshot.sha256 as string,
     device: snapshot.device as string,
@@ -196,9 +255,9 @@ function parsePayloadReceipt(
 
 function ownerTokenSha256(value: Uint8Array): string {
   if (
-    utilTypes.isProxy(value) ||
-    !utilTypes.isUint8Array(value) ||
-    Object.getPrototypeOf(value) !== Uint8Array.prototype ||
+    IS_PROXY(value) ||
+    !IS_UINT8_ARRAY(value) ||
+    OBJECT_GET_PROTOTYPE_OF(value) !== INTRINSIC_UINT8_ARRAY.prototype ||
     !TYPED_ARRAY_BYTE_LENGTH_GETTER ||
     !TYPED_ARRAY_BUFFER_GETTER ||
     !ARRAY_BUFFER_BYTE_LENGTH_GETTER
@@ -210,9 +269,9 @@ function ownerTokenSha256(value: Uint8Array): string {
   }
   let byteLength: number;
   try {
-    const buffer = Reflect.apply(TYPED_ARRAY_BUFFER_GETTER, value, []);
-    Reflect.apply(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
-    byteLength = Reflect.apply(TYPED_ARRAY_BYTE_LENGTH_GETTER, value, []);
+    const buffer = REFLECT_APPLY(TYPED_ARRAY_BUFFER_GETTER, value, []);
+    REFLECT_APPLY(ARRAY_BUFFER_BYTE_LENGTH_GETTER, buffer, []);
+    byteLength = typedArrayByteLength(value);
   } catch (cause) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
@@ -220,20 +279,17 @@ function ownerTokenSha256(value: Uint8Array): string {
       { cause },
     );
   }
-  if (
-    byteLength < PAYLOAD_OWNER_TOKEN_MINIMUM_BYTES ||
-    byteLength > 512
-  ) {
+  if (byteLength < PAYLOAD_OWNER_TOKEN_MINIMUM_BYTES || byteLength > 512) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
       "Candidate payload owner capability must be one bounded exact Uint8Array",
     );
   }
-  const owned = new Uint8Array(byteLength);
+  const owned = new INTRINSIC_UINT8_ARRAY(byteLength);
   try {
-    Reflect.apply(UINT8_ARRAY_SET, owned, [value]);
+    REFLECT_APPLY(UINT8_ARRAY_SET, owned, [value]);
   } catch (cause) {
-    owned.fill(0);
+    zeroBytes(owned);
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_INVALID",
       "Candidate payload owner capability could not be copied exactly",
@@ -241,9 +297,11 @@ function ownerTokenSha256(value: Uint8Array): string {
     );
   }
   try {
-    return createHash("sha256").update(owned).digest("hex");
+    return createHash("sha256")
+      .update(candidateFsNativeIoView(owned))
+      .digest("hex");
   } finally {
-    owned.fill(0);
+    zeroBytes(owned);
   }
 }
 
@@ -254,12 +312,12 @@ function payloadJournalNames(name: string): {
   readonly checkpoints: readonly [string, string];
 } {
   const derivation = createHash("sha256").update(name, "utf8").digest("hex");
-  const prefix = `.payload-${derivation.slice(0, 32)}`;
-  return Object.freeze({
+  const prefix = `.payload-${stringSlice(derivation, 0, 32)}`;
+  return OBJECT_FREEZE({
     owner: `${prefix}.owner.json`,
     identity: `${prefix}.identity.json`,
     receipt: `${prefix}.receipt.json`,
-    checkpoints: Object.freeze([
+    checkpoints: OBJECT_FREEZE([
       `${prefix}.checkpoint-0.json`,
       `${prefix}.checkpoint-1.json`,
     ]) as readonly [string, string],
@@ -274,8 +332,8 @@ function parseCheckpointJournal(
   if (
     !value ||
     typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
+    ARRAY_IS_ARRAY(value) ||
+    OBJECT_GET_PROTOTYPE_OF(value) !== OBJECT_PROTOTYPE
   ) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
@@ -283,20 +341,19 @@ function parseCheckpointJournal(
     );
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = sortedObjectKeys(record);
   if (
-    keys.join("\0") !==
-      [
-        "acknowledgedBytes",
-        "device",
-        "generation",
-        "inode",
-        "maximumBytes",
-        "name",
-        "ownerTokenSha256",
-        "prefixSha256",
-        "version",
-      ].join("\0") ||
+    !hasExactKeys(keys, [
+      "acknowledgedBytes",
+      "device",
+      "generation",
+      "inode",
+      "maximumBytes",
+      "name",
+      "ownerTokenSha256",
+      "prefixSha256",
+      "version",
+    ]) ||
     record.version !== 1 ||
     record.name !== expected.name ||
     record.ownerTokenSha256 !== expected.ownerTokenSha256 ||
@@ -305,12 +362,12 @@ function parseCheckpointJournal(
     record.inode !== expected.inode ||
     !Number.isSafeInteger(record.generation) ||
     (record.generation as number) < 0 ||
-    Object.is(record.generation, -0) ||
+    OBJECT_IS(record.generation, -0) ||
     (record.generation as number) % 2 !== slot ||
     !Number.isSafeInteger(record.acknowledgedBytes) ||
     (record.acknowledgedBytes as number) < 0 ||
     (record.acknowledgedBytes as number) > expected.maximumBytes ||
-    Object.is(record.acknowledgedBytes, -0) ||
+    OBJECT_IS(record.acknowledgedBytes, -0) ||
     typeof record.prefixSha256 !== "string" ||
     !SHA256_PATTERN.test(record.prefixSha256) ||
     ((record.generation as number) === 0 &&
@@ -324,7 +381,7 @@ function parseCheckpointJournal(
       "Candidate payload checkpoint belongs to another owner, inode, generation, or byte boundary",
     );
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     ...expected,
     generation: record.generation as number,
     acknowledgedBytes: record.acknowledgedBytes as number,
@@ -355,7 +412,7 @@ function payloadCheckpoint(
   acknowledgedBytes: number,
   prefixSha256: string,
 ): Readonly<PayloadCheckpointJournal> {
-  return Object.freeze({
+  return OBJECT_FREEZE({
     ...identity,
     generation,
     acknowledgedBytes,
@@ -370,8 +427,8 @@ function parseIdentityJournal(
   if (
     !value ||
     typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
+    ARRAY_IS_ARRAY(value) ||
+    OBJECT_GET_PROTOTYPE_OF(value) !== OBJECT_PROTOTYPE
   ) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
@@ -379,17 +436,16 @@ function parseIdentityJournal(
     );
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = sortedObjectKeys(record);
   if (
-    keys.join("\0") !==
-      [
-        "device",
-        "inode",
-        "maximumBytes",
-        "name",
-        "ownerTokenSha256",
-        "version",
-      ].join("\0") ||
+    !hasExactKeys(keys, [
+      "device",
+      "inode",
+      "maximumBytes",
+      "name",
+      "ownerTokenSha256",
+      "version",
+    ]) ||
     record.version !== 1 ||
     record.name !== expected.name ||
     record.ownerTokenSha256 !== expected.ownerTokenSha256 ||
@@ -406,7 +462,7 @@ function parseIdentityJournal(
       "Candidate payload identity belongs to another owner, contract, or inode",
     );
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     ...expected,
     device: record.device,
     inode: record.inode,
@@ -420,8 +476,8 @@ function parseOwnerJournal(
   if (
     !value ||
     typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
+    ARRAY_IS_ARRAY(value) ||
+    OBJECT_GET_PROTOTYPE_OF(value) !== OBJECT_PROTOTYPE
   ) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_OWNER_CONFLICT",
@@ -429,10 +485,14 @@ function parseOwnerJournal(
     );
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = sortedObjectKeys(record);
   if (
-    keys.join("\0") !==
-      ["maximumBytes", "name", "ownerTokenSha256", "version"].join("\0") ||
+    !hasExactKeys(keys, [
+      "maximumBytes",
+      "name",
+      "ownerTokenSha256",
+      "version",
+    ]) ||
     record.version !== 1 ||
     record.name !== expected.name ||
     record.ownerTokenSha256 !== expected.ownerTokenSha256 ||
@@ -443,7 +503,7 @@ function parseOwnerJournal(
       "Candidate payload path is already claimed by another owner or contract",
     );
   }
-  return Object.freeze({ ...expected });
+  return OBJECT_FREEZE({ ...expected });
 }
 
 function parseReceiptJournal(
@@ -453,8 +513,8 @@ function parseReceiptJournal(
   if (
     !value ||
     typeof value !== "object" ||
-    Array.isArray(value) ||
-    Object.getPrototypeOf(value) !== Object.prototype
+    ARRAY_IS_ARRAY(value) ||
+    OBJECT_GET_PROTOTYPE_OF(value) !== OBJECT_PROTOTYPE
   ) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
@@ -462,12 +522,15 @@ function parseReceiptJournal(
     );
   }
   const record = value as Record<string, unknown>;
-  const keys = Object.keys(record).sort();
+  const keys = sortedObjectKeys(record);
   if (
-    keys.join("\0") !==
-      ["maximumBytes", "name", "ownerTokenSha256", "receipt", "version"].join(
-        "\0",
-      ) ||
+    !hasExactKeys(keys, [
+      "maximumBytes",
+      "name",
+      "ownerTokenSha256",
+      "receipt",
+      "version",
+    ]) ||
     record.version !== 1 ||
     record.name !== expected.name ||
     record.ownerTokenSha256 !== expected.ownerTokenSha256 ||
@@ -482,7 +545,7 @@ function parseReceiptJournal(
     record.receipt as Readonly<AgentBackupRestoreV3CandidatePayloadReceipt>,
     expected.maximumBytes,
   );
-  return Object.freeze({ ...expected, receipt });
+  return OBJECT_FREEZE({ ...expected, receipt });
 }
 
 async function readPayloadCheckpoints(
@@ -508,7 +571,7 @@ async function readPayloadCheckpoints(
       value === null ? null : parseCheckpointJournal(value, identity, slot),
     );
   }
-  return Object.freeze([
+  return OBJECT_FREEZE([
     checkpoints[0] ?? null,
     checkpoints[1] ?? null,
   ]) as readonly [
@@ -527,12 +590,15 @@ function selectPayloadCheckpoint(
   readonly previous: Readonly<PayloadCheckpointJournal> | null;
   readonly ordered: readonly Readonly<PayloadCheckpointJournal>[];
 } {
-  const ordered = checkpoints
-    .filter(
-      (checkpoint): checkpoint is Readonly<PayloadCheckpointJournal> =>
-        checkpoint !== null,
-    )
-    .sort((left, right) => left.generation - right.generation);
+  const ordered: Readonly<PayloadCheckpointJournal>[] = [];
+  if (checkpoints[0]) ordered[ordered.length] = checkpoints[0];
+  if (checkpoints[1]) ordered[ordered.length] = checkpoints[1];
+  REFLECT_APPLY(ARRAY_SORT, ordered, [
+    (
+      left: Readonly<PayloadCheckpointJournal>,
+      right: Readonly<PayloadCheckpointJournal>,
+    ) => left.generation - right.generation,
+  ]);
   if (ordered.length === 2) {
     const previous = ordered[0] as Readonly<PayloadCheckpointJournal>;
     const current = ordered[1] as Readonly<PayloadCheckpointJournal>;
@@ -545,17 +611,17 @@ function selectPayloadCheckpoint(
         "Candidate payload checkpoints are not one adjacent, increasing generation pair",
       );
     }
-    return Object.freeze({
+    return OBJECT_FREEZE({
       current,
       previous,
-      ordered: Object.freeze(ordered),
+      ordered: OBJECT_FREEZE(ordered),
     });
   }
   const current = ordered[0] ?? null;
-  return Object.freeze({
+  return OBJECT_FREEZE({
     current,
     previous: null,
-    ordered: Object.freeze(ordered),
+    ordered: OBJECT_FREEZE(ordered),
   });
 }
 
@@ -575,7 +641,8 @@ async function hashAndValidatePayloadPrefix(
     expectedIdentity,
     control,
   );
-  const maximumAcknowledgedBytes = checkpoints.at(-1)?.acknowledgedBytes ?? 0;
+  const maximumAcknowledgedBytes =
+    checkpoints[checkpoints.length - 1]?.acknowledgedBytes ?? 0;
   if (before.size < maximumAcknowledgedBytes) {
     candidateFsError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_CONFLICT",
@@ -583,12 +650,13 @@ async function hashAndValidatePayloadPrefix(
     );
   }
   const hash = createHash("sha256");
-  const chunk = new Uint8Array(
+  const chunk = new INTRINSIC_UINT8_ARRAY(
     Math.min(
       CANDIDATE_FS_IO_CHUNK_BYTES,
       Math.max(1, maximumAcknowledgedBytes),
     ),
   );
+  const ioChunk = candidateFsNativeIoView(chunk);
   let position = 0;
   let checkpointIndex = 0;
   const validateReachedCheckpoints = () => {
@@ -616,12 +684,12 @@ async function hashAndValidatePayloadPrefix(
         checkpoints[checkpointIndex]?.acknowledgedBytes ??
         maximumAcknowledgedBytes;
       const requested = Math.min(
-        chunk.byteLength,
+        typedArrayByteLength(chunk),
         maximumAcknowledgedBytes - position,
         nextBoundary - position,
       );
       const read = await controlled(
-        () => handle.read(chunk, 0, requested, position),
+        () => handle.read(ioChunk, 0, requested, position),
         control,
       );
       if (read.bytesRead <= 0) {
@@ -630,13 +698,13 @@ async function hashAndValidatePayloadPrefix(
           "Candidate payload ended before its durable checkpoint",
         );
       }
-      hash.update(chunk.subarray(0, read.bytesRead));
-      chunk.fill(0, 0, read.bytesRead);
+      hash.update(candidateFsByteView(chunk, 0, read.bytesRead));
+      zeroBytes(chunk, 0, read.bytesRead);
       position += read.bytesRead;
       validateReachedCheckpoints();
     }
   } finally {
-    chunk.fill(0);
+    zeroBytes(chunk);
   }
   if (checkpointIndex !== checkpoints.length) {
     candidateFsError(
@@ -656,7 +724,7 @@ async function hashAndValidatePayloadPrefix(
       "Candidate payload changed while its checkpoint prefix was validated",
     );
   }
-  return Object.freeze({ hash, stats: after });
+  return OBJECT_FREEZE({ hash, stats: after });
 }
 
 async function truncatePayloadToCheckpoint(
@@ -774,15 +842,19 @@ async function proveOpenedPayload(
     );
   }
   const hash = createHash("sha256");
-  const chunk = new Uint8Array(
+  const chunk = new INTRINSIC_UINT8_ARRAY(
     Math.min(CANDIDATE_FS_IO_CHUNK_BYTES, Math.max(1, before.size)),
   );
+  const ioChunk = candidateFsNativeIoView(chunk);
   let position = 0;
   try {
     while (position < before.size) {
-      const requested = Math.min(chunk.byteLength, before.size - position);
+      const requested = Math.min(
+        typedArrayByteLength(chunk),
+        before.size - position,
+      );
       const read = await controlled(
-        () => handle.read(chunk, 0, requested, position),
+        () => handle.read(ioChunk, 0, requested, position),
         control,
       );
       if (read.bytesRead <= 0) {
@@ -791,12 +863,12 @@ async function proveOpenedPayload(
           "Candidate payload ended before its bound descriptor size",
         );
       }
-      hash.update(chunk.subarray(0, read.bytesRead));
-      chunk.fill(0, 0, read.bytesRead);
+      hash.update(candidateFsByteView(chunk, 0, read.bytesRead));
+      zeroBytes(chunk, 0, read.bytesRead);
       position += read.bytesRead;
     }
   } finally {
-    chunk.fill(0);
+    zeroBytes(chunk);
   }
   const after = await assertBoundFile(
     handle,
@@ -810,7 +882,7 @@ async function proveOpenedPayload(
       "Candidate payload changed while it was proved",
     );
   }
-  return Object.freeze({
+  return OBJECT_FREEZE({
     ...candidateFsIdentity(after),
     sizeBytes: after.size,
     sha256: hash.digest("hex"),
@@ -974,7 +1046,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
     try {
       releaseLockUse = this.#owner.beginLockUse(this.#lock);
     } catch (cause) {
-      owned.fill(0);
+      zeroBytes(owned);
       throw cause;
     }
     const durablePosition = this.#position;
@@ -1055,7 +1127,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
 
         nextHash = (this.#prefixHash as Hash).copy();
         nextHash.update(owned);
-        const nextAcknowledgedBytes = durablePosition + owned.byteLength;
+        const nextAcknowledgedBytes = durablePosition + byteLength;
         const nextCheckpoint = payloadCheckpoint(
           this.#identityJournal as PayloadIdentityJournal,
           nextGeneration,
@@ -1209,7 +1281,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
         throw cause;
       } finally {
         if (!lockUseReleased) releaseLockUse();
-        owned.fill(0);
+        zeroBytes(owned);
         nextHash = null;
         this.#writing = false;
       }
@@ -1274,7 +1346,7 @@ export class AgentBackupRestoreV3CandidatePayloadWriter {
             "Candidate payload differs from this writer's durable checkpoint",
           );
         }
-        const receipt = Object.freeze({
+        const receipt = OBJECT_FREEZE({
           ...candidateFsIdentity(before),
           sizeBytes: before.size,
           sha256: this.#prefixHash.copy().digest("hex"),
@@ -1404,10 +1476,8 @@ export async function createCandidateFsPayload(
     payloadOptions.maximumBytes as number,
     "maximumBytes",
   );
-  const ownerSha256 = ownerTokenSha256(
-    payloadOptions.ownerToken as Uint8Array,
-  );
-  const ownerJournal: PayloadOwnerJournal = Object.freeze({
+  const ownerSha256 = ownerTokenSha256(payloadOptions.ownerToken as Uint8Array);
+  const ownerJournal: PayloadOwnerJournal = OBJECT_FREEZE({
     version: 1,
     name: requireControlName(name, "payload name"),
     ownerTokenSha256: ownerSha256,
@@ -1417,7 +1487,7 @@ export async function createCandidateFsPayload(
   const payloadPath = authority.directPath(name, "payload name");
   await authority.assertAuthority(control);
   const operationLock = await authority.operationLock(
-    `.payload-${ownerSha256.slice(0, 16)}`,
+    `.payload-${stringSlice(ownerSha256, 0, 16)}`,
     control,
     heldLock,
   );
@@ -1630,7 +1700,7 @@ export async function createCandidateFsPayload(
     await authority.syncAttemptRoot(control);
     const durableIdentityJournal: Readonly<PayloadIdentityJournal> =
       identityJournal ??
-      Object.freeze({
+      OBJECT_FREEZE({
         ...ownerJournal,
         ...candidateFsIdentity(opened),
       });
@@ -1667,7 +1737,7 @@ export async function createCandidateFsPayload(
         control,
         activeLock,
       );
-      checkpointPair = Object.freeze([initialCheckpoint, null]);
+      checkpointPair = OBJECT_FREEZE([initialCheckpoint, null]);
       selected = selectPayloadCheckpoint(checkpointPair);
     }
     const currentCheckpoint = selected.current;
@@ -1788,7 +1858,11 @@ export async function proveCandidateFsPayload(
   }
   await authority.assertAuthority(control);
   const operationLock = await authority.operationLock(
-    `.prove-${createHash("sha256").update(name).digest("hex").slice(0, 16)}`,
+    `.prove-${stringSlice(
+      createHash("sha256").update(name).digest("hex"),
+      0,
+      16,
+    )}`,
     control,
     heldLock,
   );
@@ -1864,9 +1938,7 @@ export async function readCandidateFsPayload(
   const ownerJournal: PayloadOwnerJournal = Object.freeze({
     version: 1,
     name: exactName,
-    ownerTokenSha256: ownerTokenSha256(
-      readOptions.ownerToken as Uint8Array,
-    ),
+    ownerTokenSha256: ownerTokenSha256(readOptions.ownerToken as Uint8Array),
     maximumBytes,
   });
   const journalNames = payloadJournalNames(exactName);
@@ -1982,17 +2054,19 @@ export async function readCandidateFsPayload(
       opened,
       control,
     );
-    const exactPayload = new Uint8Array(before.size);
+    const exactPayload = new INTRINSIC_UINT8_ARRAY(before.size);
+    const ioPayload = candidateFsNativeIoView(exactPayload);
+    const exactPayloadByteLength = typedArrayByteLength(exactPayload);
     payload = exactPayload;
     let offset = 0;
     const hash = createHash("sha256");
-    while (offset < exactPayload.byteLength) {
+    while (offset < exactPayloadByteLength) {
       const read = await controlled(
         () =>
           (handle as FileHandle).read(
-            exactPayload,
+            ioPayload,
             offset,
-            exactPayload.byteLength - offset,
+            exactPayloadByteLength - offset,
             offset,
           ),
         control,
@@ -2003,7 +2077,9 @@ export async function readCandidateFsPayload(
           "Candidate payload ended before its exact receipt size",
         );
       }
-      hash.update(exactPayload.subarray(offset, offset + read.bytesRead));
+      hash.update(
+        candidateFsByteView(exactPayload, offset, offset + read.bytesRead),
+      );
       offset += read.bytesRead;
     }
     const after = await assertBoundFile(
@@ -2022,7 +2098,7 @@ export async function readCandidateFsPayload(
       );
     }
     await authority.assertLockHeld(activeLock, control);
-    result = Object.freeze({ receipt: expected, payload: exactPayload });
+    result = OBJECT_FREEZE({ receipt: expected, payload: exactPayload });
   } catch (cause) {
     primaryFailure = cause;
   }
@@ -2052,7 +2128,7 @@ export async function readCandidateFsPayload(
     }
   }
   if (primaryFailure !== undefined || cleanupFailures.length > 0 || !result) {
-    payload?.fill(0);
+    if (payload) zeroBytes(payload);
     if (primaryFailure !== undefined && cleanupFailures.length > 0) {
       throw new AgentBackupRestoreV3CandidateFsError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_READ_FAILED",
