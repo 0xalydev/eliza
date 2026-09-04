@@ -211,11 +211,11 @@ describe("AppModeEntryRoute — SSO auto-bridge (managed app origin)", () => {
     expect(replacedUrls).toHaveLength(1);
   });
 
-  it("an authenticated rerender cannot erase an in-flight logout marker", async () => {
+  it("a retained bearer cannot override an in-flight logout marker", async () => {
     localStorage.setItem(SSO_LOGGED_OUT_KEY, "1");
     signIn();
     renderEntry("/");
-    expect(await screen.findByTestId("join-page")).toBeTruthy();
+    expect(await screen.findByTestId("login-page")).toBeTruthy();
     expect(localStorage.getItem(SSO_LOGGED_OUT_KEY)).toBe("1");
     expect(replacedUrls).toEqual([]);
   });
