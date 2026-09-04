@@ -165,6 +165,120 @@ function fileRecords(input: {
   });
 }
 
+function candidatePartialName(filePath: string): string {
+  return `.restore-v3-partial-${createHash("sha256")
+    .update(filePath, "utf8")
+    .digest("hex")}`;
+}
+
+interface WriterDoubleFailureInjection {
+  readonly writeFailure: Error;
+  readonly closeFailure: Error;
+  readonly state: {
+    writeInjected: boolean;
+    closeInjected: boolean;
+    closeLeakedHandle: (() => Promise<void>) | null;
+  };
+  readonly restore: () => void;
+}
+
+async function injectWriterDoubleFailure(input: {
+  readonly attemptRoot: string;
+  readonly partialPath: string;
+  readonly label: string;
+}): Promise<WriterDoubleFailureInjection> {
+  const probe = await fs.open(
+    path.join(input.attemptRoot, `${input.label}-descriptor-probe`),
+    "w",
+  );
+  const handlePrototype = Object.getPrototypeOf(probe) as {
+    write: typeof probe.write;
+  };
+  const originalWrite = handlePrototype.write;
+  const originalOpen = fs.open;
+  await probe.close();
+  const matchesPartial = async (handle: typeof probe): Promise<boolean> => {
+    try {
+      const [opened, visible] = await Promise.all([
+        handle.stat({ bigint: true }),
+        fs.lstat(input.partialPath, { bigint: true }),
+      ]);
+      return opened.dev === visible.dev && opened.ino === visible.ino;
+    } catch {
+      return false;
+    }
+  };
+  const writeFailure = new Error(`injected ${input.label} write failure`);
+  const closeFailure = new Error(
+    `injected ${input.label} descriptor close failure`,
+  );
+  const state: WriterDoubleFailureInjection["state"] = {
+    writeInjected: false,
+    closeInjected: false,
+    closeLeakedHandle: null,
+  };
+  const partialName = path.basename(input.partialPath);
+  const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+    const handle = await Reflect.apply(originalOpen, fs, args);
+    if (path.basename(String(args[0])) === partialName) {
+      const exactClose = handle.close;
+      handle.close = async () => {
+        if (state.writeInjected && !state.closeInjected) {
+          state.closeInjected = true;
+          state.closeLeakedHandle = () => Reflect.apply(exactClose, handle, []);
+          throw closeFailure;
+        }
+        return Reflect.apply(exactClose, handle, []);
+      };
+    }
+    return handle;
+  });
+  const writeSpy = vi
+    .spyOn(handlePrototype, "write")
+    .mockImplementation(async function (
+      this: typeof probe,
+      ...args: Parameters<typeof probe.write>
+    ) {
+      if (!state.writeInjected && (await matchesPartial(this))) {
+        state.writeInjected = true;
+        throw writeFailure;
+      }
+      return Reflect.apply(originalWrite, this, args);
+    });
+  return {
+    writeFailure,
+    closeFailure,
+    state,
+    restore() {
+      writeSpy.mockRestore();
+      openSpy.mockRestore();
+    },
+  };
+}
+
+function expectExactWriterDoubleFailure(
+  failure: unknown,
+  injection: WriterDoubleFailureInjection,
+): void {
+  expect(injection.state.writeInjected).toBe(true);
+  expect(injection.state.closeInjected).toBe(true);
+  expect(failure).toMatchObject({
+    code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CLEANUP_FAILED",
+  });
+  const aggregate = (failure as { cause?: unknown }).cause;
+  expect(aggregate).toBeInstanceOf(AggregateError);
+  const causes = (aggregate as AggregateError).errors;
+  expect(causes).toHaveLength(2);
+  expect(causes[0]).toBe(injection.writeFailure);
+  expect(causes[1]).toBe(injection.closeFailure);
+  expect(
+    causes.filter((cause) => cause === injection.writeFailure),
+  ).toHaveLength(1);
+  expect(
+    causes.filter((cause) => cause === injection.closeFailure),
+  ).toHaveLength(1);
+}
+
 afterEach(async () => {
   const pendingCandidates = [...candidates];
   candidates.clear();
@@ -324,6 +438,49 @@ describe("restore-v3 candidate character materializer", () => {
     });
   });
 
+  it("preserves write and descriptor cleanup failures once and releases the character lock", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const bytes = new TextEncoder().encode('{"name":"Double Failure"}');
+    const receipt = await stageComponent(candidateFs, "character", [
+      { payload: bytes, entry: null },
+    ]);
+    const injection = await injectWriterDoubleFailure({
+      attemptRoot,
+      partialPath: path.join(
+        attemptRoot,
+        "components",
+        "character",
+        candidatePartialName("character.json"),
+      ),
+      label: "character",
+    });
+    let failure: unknown;
+    try {
+      await materializeAgentBackupRestoreV3CandidateCharacter({
+        candidateFs,
+        session: SESSION,
+        receipt,
+        control: operationControl(),
+      });
+    } catch (cause) {
+      failure = cause;
+    } finally {
+      injection.restore();
+    }
+    try {
+      expectExactWriterDoubleFailure(failure, injection);
+      const reacquired = await candidateFs.acquireLock(
+        ".restore-v3-materialize-c0.lock",
+        operationControl(),
+      );
+      await reacquired.release(operationControl());
+    } finally {
+      if (injection.state.closeLeakedHandle) {
+        await injection.state.closeLeakedHandle();
+      }
+    }
+  });
+
   it("rejects accessors and production lifecycle hooks before any durable mutation", async () => {
     const boundary = await fixture();
     const bytes = new TextEncoder().encode('{"name":"Boundary"}');
@@ -478,6 +635,97 @@ describe("restore-v3 candidate file-set materializer", () => {
     const alpha = await fs.stat(path.join(root, "a.txt"));
     expect(alpha.mode & 0o777).toBe(0o640);
     expect(Math.trunc(alpha.mtimeMs)).toBe(exactApfsMtimeMs);
+  });
+
+  it("fsyncs a target-only replay after cancellation follows the partial unlink", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const control = operationControl();
+    const relativeDirectory = "components/media";
+    const spec = Object.freeze({
+      path: "target-only.txt",
+      sizeBytes: 1,
+      mode: 0o600,
+      mtimeMs: 0,
+    });
+    await candidateFs.ensureFileTreeDirectory(relativeDirectory, control);
+    const writer = await candidateFs.createFileTreeFile(
+      relativeDirectory,
+      spec,
+      undefined,
+      control,
+    );
+    await writer.write(Uint8Array.of(1), control);
+
+    const root = path.join(attemptRoot, "components", "media");
+    const partialName = candidatePartialName(spec.path);
+    const partialPath = path.join(root, partialName);
+    const abortController = new AbortController();
+    const interruptedControl = Object.freeze({
+      signal: abortController.signal,
+      deadlineEpochMs: Date.now() + 30_000,
+    });
+    const originalUnlink = fs.unlink;
+    let unlinked = false;
+    const unlinkSpy = vi
+      .spyOn(fs, "unlink")
+      .mockImplementation(async (...args) => {
+        await Reflect.apply(originalUnlink, fs, args);
+        if (path.basename(String(args[0])) === partialName) {
+          unlinked = true;
+          abortController.abort(new Error("cancel after exact partial unlink"));
+        }
+      });
+    try {
+      await expect(writer.finalize(interruptedControl)).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_ABORTED",
+      });
+    } finally {
+      unlinkSpy.mockRestore();
+    }
+    expect(unlinked).toBe(true);
+    await expect(fs.lstat(partialPath)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await fs.readFile(path.join(root, spec.path))).toEqual(
+      Buffer.from([1]),
+    );
+
+    const rootIdentity = await fs.stat(root, { bigint: true });
+    const probe = await fs.open(root, "r");
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      sync: typeof probe.sync;
+    };
+    const originalSync = handlePrototype.sync;
+    await probe.close();
+    let targetParentSyncs = 0;
+    const syncSpy = vi
+      .spyOn(handlePrototype, "sync")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.sync>
+      ) {
+        const opened = await this.stat({ bigint: true });
+        if (
+          opened.dev === rootIdentity.dev &&
+          opened.ino === rootIdentity.ino
+        ) {
+          targetParentSyncs += 1;
+        }
+        return Reflect.apply(originalSync, this, args);
+      });
+    try {
+      const replayed = await candidateFs.createFileTreeFile(
+        relativeDirectory,
+        spec,
+        undefined,
+        operationControl(),
+      );
+      expect(replayed.replayed).toBe(true);
+      await replayed.finalize(operationControl());
+    } finally {
+      syncSpy.mockRestore();
+    }
+    expect(targetParentSyncs).toBe(1);
   });
 
   it("proves files in canonical full-path order across a file-directory prefix", async () => {
@@ -1329,6 +1577,55 @@ describe("restore-v3 candidate file-set materializer", () => {
       operationControl(),
     );
     await reacquired.release(operationControl());
+  });
+
+  it("reports write and descriptor cleanup failures once and releases the file-set lock", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const receipt = await stageComponent(
+      candidateFs,
+      "media",
+      fileRecords({
+        path: "double-failure.txt",
+        bytes: "failure",
+        mode: 0o600,
+        mtimeMs: 0,
+      }),
+    );
+    const injection = await injectWriterDoubleFailure({
+      attemptRoot,
+      partialPath: path.join(
+        attemptRoot,
+        "components",
+        "media",
+        candidatePartialName("double-failure.txt"),
+      ),
+      label: "file-set",
+    });
+    let failure: unknown;
+    try {
+      await materializeAgentBackupRestoreV3CandidateFileSet({
+        candidateFs,
+        session: SESSION,
+        receipt,
+        control: operationControl(),
+      });
+    } catch (cause) {
+      failure = cause;
+    } finally {
+      injection.restore();
+    }
+    try {
+      expectExactWriterDoubleFailure(failure, injection);
+      const reacquired = await candidateFs.acquireLock(
+        ".restore-v3-materialize-c2.lock",
+        operationControl(),
+      );
+      await reacquired.release(operationControl());
+    } finally {
+      if (injection.state.closeLeakedHandle) {
+        await injection.state.closeLeakedHandle();
+      }
+    }
   });
 
   it("releases caller lock use even when a proof descriptor close fails", async () => {

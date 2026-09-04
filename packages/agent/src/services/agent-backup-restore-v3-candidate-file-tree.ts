@@ -1104,7 +1104,14 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
       } catch (cause) {
         this.#closed = true;
         const disposal = this.#dispose(releaseLockUse);
-        this.#closePromise = disposal;
+        // write() is the sole reporter for a cleanup failure that it already
+        // awaits and combines with the primary write failure. A later close()
+        // only joins that completed cleanup; it must not publish the same
+        // cleanup error again and let a materializer mask or double-count it.
+        this.#closePromise = disposal.then(
+          () => undefined,
+          () => undefined,
+        );
         try {
           await disposal;
         } catch (cleanupCause) {
@@ -1470,6 +1477,16 @@ export async function createCandidateFsFileTreeFile(
         targetStats,
         "Candidate final path is a symbolic link, hardlink, or non-regular file",
       );
+      if (!partialStats) {
+        // A previous finalize may have unlinked its partial and then lost its
+        // response before synchronizing the parent directory. Replaying a
+        // target-only state must make that final dirent durable before it can
+        // return an exact proof.
+        await controlled(
+          () => (parentHandle as FileHandle).sync(),
+          exactControl,
+        );
+      }
       const proven = await proveFinalPath(targetPath, spec, exactControl);
       await authority.assertLockHeld(activeLock, exactControl);
       const writer = new AgentBackupRestoreV3CandidateFileTreeWriter({
