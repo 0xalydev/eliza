@@ -5,7 +5,7 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, Hash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -50,6 +50,18 @@ function platformTestOption() {
   return process.platform === "linux"
     ? {}
     : ({ testOnlyAllowNonLinuxFdEmulation: true as const } as const);
+}
+
+async function settlePromise<T>(
+  promise: Promise<T>,
+): Promise<
+  | { readonly status: "fulfilled"; readonly value: T }
+  | { readonly status: "rejected"; readonly reason: unknown }
+> {
+  return promise.then(
+    (value) => ({ status: "fulfilled", value }),
+    (reason: unknown) => ({ status: "rejected", reason }),
+  );
 }
 
 async function privateTemporaryRoot(prefix: string): Promise<string> {
@@ -318,6 +330,103 @@ describe("restore-v3 candidate filesystem", () => {
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_CLOSED",
     });
     await firstClose;
+  });
+
+  it("preserves undefined writer finalization and descriptor-close failures", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const probe = await fs.open(attemptRoot, "r");
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      sync: typeof probe.sync;
+    };
+    await probe.close();
+
+    const finalizeWriter = await candidate.createPayload(
+      "undefined-finalize.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    const payload = Buffer.from("undefined-finalize");
+    await finalizeWriter.write(payload, control);
+    const syncSpy = vi
+      .spyOn(handlePrototype, "sync")
+      .mockImplementationOnce(() => Promise.reject(undefined));
+    let finalizeOutcome: Awaited<ReturnType<typeof settlePromise<unknown>>>;
+    try {
+      const firstFinalize = finalizeWriter.finalize(control);
+      expect(finalizeWriter.finalize(control)).toBe(firstFinalize);
+      finalizeOutcome = await settlePromise(firstFinalize);
+    } finally {
+      syncSpy.mockRestore();
+    }
+    expect(finalizeOutcome).toEqual({
+      status: "rejected",
+      reason: undefined,
+    });
+
+    const finalizeReplay = await candidate.createPayload(
+      "undefined-finalize.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(finalizeReplay.acknowledgedBytes).toBe(payload.byteLength);
+    const replayedReceipt = await finalizeReplay.finalize(control);
+    await expect(
+      candidate.provePayload(
+        "undefined-finalize.payload",
+        replayedReceipt,
+        { maximumBytes: 64 },
+        control,
+      ),
+    ).resolves.toEqual(replayedReceipt);
+
+    const originalOpen = fs.open;
+    let rejectInternalClose = true;
+    let closeTargetOpened = false;
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await Reflect.apply(originalOpen, fs, args);
+      if (String(args[0]).endsWith("/undefined-close.payload")) {
+        closeTargetOpened = true;
+        const originalHandleClose = handle.close;
+        Object.defineProperty(handle, "close", {
+          configurable: true,
+          writable: true,
+          value: async function (this: typeof handle) {
+            const result = await Reflect.apply(originalHandleClose, this, []);
+            if (rejectInternalClose) {
+              rejectInternalClose = false;
+              return Promise.reject(undefined);
+            }
+            return result;
+          },
+        });
+      }
+      return handle;
+    });
+    let closeWriter: Awaited<ReturnType<typeof candidate.createPayload>>;
+    try {
+      closeWriter = await candidate.createPayload(
+        "undefined-close.payload",
+        { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+        control,
+      );
+    } finally {
+      openSpy.mockRestore();
+    }
+    expect(closeTargetOpened).toBe(true);
+    const firstClose = closeWriter.close();
+    expect(closeWriter.close()).toBe(firstClose);
+    const closeOutcome = await settlePromise(firstClose);
+    expect(closeOutcome).toEqual({ status: "rejected", reason: undefined });
+
+    const closeReplay = await candidate.createPayload(
+      "undefined-close.payload",
+      { maximumBytes: 64, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    expect(closeReplay.acknowledgedBytes).toBe(0);
+    await closeReplay.close();
+    payload.fill(0);
   });
 
   it("never redirects a mutation into a replacement attempt root", async () => {
@@ -598,15 +707,152 @@ describe("restore-v3 candidate filesystem", () => {
     }
   });
 
+  it("preserves undefined payload-read failures alone and with cleanup", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const exactBytes = new Uint8Array(8_193).fill(0x6b);
+    const writer = await candidate.createPayload(
+      "undefined-read.payload",
+      { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+      control,
+    );
+    await writer.write(exactBytes, control);
+    const receipt = await writer.finalize(control);
+
+    const probe = await fs.open(
+      path.join(attemptRoot, "undefined-read.payload"),
+      "r",
+    );
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      read: typeof probe.read;
+    };
+    const originalRead = handlePrototype.read;
+    await probe.close();
+
+    let rejectPayloadRead = false;
+    let rejectPayloadClose = false;
+    let payloadCopy: Uint8Array | null = null;
+    const cleanupFailure = new Error(
+      "injected undefined payload-read cleanup failure",
+    );
+    const originalOpen = fs.open;
+    const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
+      const handle = await Reflect.apply(originalOpen, fs, args);
+      if (String(args[0]).endsWith("/undefined-read.payload")) {
+        const originalHandleClose = handle.close;
+        Object.defineProperty(handle, "close", {
+          configurable: true,
+          writable: true,
+          value: async function (this: typeof handle) {
+            const result = await Reflect.apply(originalHandleClose, this, []);
+            if (rejectPayloadClose) {
+              rejectPayloadClose = false;
+              return Promise.reject(cleanupFailure);
+            }
+            return result;
+          },
+        });
+      }
+      return handle;
+    });
+    const readSpy = vi
+      .spyOn(handlePrototype, "read")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.read>
+      ) {
+        const buffer = args[0];
+        if (
+          buffer instanceof Uint8Array &&
+          buffer.byteLength === exactBytes.byteLength
+        ) {
+          payloadCopy = buffer;
+          if (rejectPayloadRead) {
+            rejectPayloadRead = false;
+            return Promise.reject(undefined);
+          }
+        }
+        return Reflect.apply(originalRead, this, args);
+      });
+    try {
+      rejectPayloadRead = true;
+      const primaryOutcome = await settlePromise(
+        candidate.readPayload(
+          "undefined-read.payload",
+          receipt,
+          { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+          control,
+        ),
+      );
+      expect(primaryOutcome).toEqual({
+        status: "rejected",
+        reason: undefined,
+      });
+      const primaryCopy = payloadCopy as unknown as Uint8Array;
+      expect(primaryCopy).toBeInstanceOf(Uint8Array);
+      expect(Array.from(primaryCopy).every((byte) => byte === 0)).toBe(true);
+
+      const afterPrimary = await candidate.readPayload(
+        "undefined-read.payload",
+        receipt,
+        { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+        control,
+      );
+      expect(afterPrimary.receipt).toEqual(receipt);
+      afterPrimary.payload.fill(0);
+
+      payloadCopy = null;
+      rejectPayloadRead = true;
+      rejectPayloadClose = true;
+      const combinedOutcome = await settlePromise(
+        candidate.readPayload(
+          "undefined-read.payload",
+          receipt,
+          { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+          control,
+        ),
+      );
+      expect(combinedOutcome.status).toBe("rejected");
+      if (combinedOutcome.status !== "rejected") {
+        throw new Error("Combined payload-read failure unexpectedly fulfilled");
+      }
+      expect(combinedOutcome.reason).toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PAYLOAD_READ_FAILED",
+      });
+      const combinedCause = (combinedOutcome.reason as Error).cause;
+      expect(combinedCause).toBeInstanceOf(AggregateError);
+      expect((combinedCause as AggregateError).errors).toEqual([
+        undefined,
+        cleanupFailure,
+      ]);
+      const combinedCopy = payloadCopy as unknown as Uint8Array;
+      expect(combinedCopy).toBeInstanceOf(Uint8Array);
+      expect(Array.from(combinedCopy).every((byte) => byte === 0)).toBe(true);
+
+      const afterCombined = await candidate.readPayload(
+        "undefined-read.payload",
+        receipt,
+        { maximumBytes: exactBytes.byteLength, ownerToken: OWNER_TOKEN },
+        control,
+      );
+      expect(afterCombined.receipt).toEqual(receipt);
+      afterCombined.payload.fill(0);
+    } finally {
+      readSpy.mockRestore();
+      openSpy.mockRestore();
+      exactBytes.fill(0);
+    }
+  });
+
   it("does not dispatch secrets through poisoned byte-array and Buffer intrinsics", async () => {
     const { candidate, attemptRoot } = await fixture();
     const control = operationControl();
     const intrinsicReflectApply = Reflect.apply;
-    const ownerToken = new TextEncoder().encode(
-      "owner-token-visible-only-to-candidate-fs",
-    );
+    const ownerCapability = "owner-token-visible-only-to-candidate-fs";
+    const ownerToken = new TextEncoder().encode(ownerCapability);
     const payloadPlaintext = "payload-plaintext-intrinsics";
     const canonicalSecret = "canonical-json-plaintext-intrinsics";
+    const canonicalPlaintext = `{"secret":"${canonicalSecret}"}\n`;
     const treePlaintext = "tree-plaintext-intrinsics";
     const payloadInput = Buffer.from(payloadPlaintext);
     const canonicalValue = { secret: canonicalSecret };
@@ -663,6 +909,31 @@ describe("restore-v3 candidate filesystem", () => {
       Buffer,
       "byteLength",
     ) as PropertyDescriptor & { value: typeof Buffer.byteLength };
+    const textEncoderEncodeDescriptor = Object.getOwnPropertyDescriptor(
+      TextEncoder.prototype,
+      "encode",
+    ) as PropertyDescriptor & { value: typeof TextEncoder.prototype.encode };
+    const textDecoderDescriptor = Object.getOwnPropertyDescriptor(
+      globalThis,
+      "TextDecoder",
+    ) as PropertyDescriptor & { value: typeof TextDecoder };
+    const textDecoderPrototype = TextDecoder.prototype;
+    const textDecoderDecodeDescriptor = Object.getOwnPropertyDescriptor(
+      textDecoderPrototype,
+      "decode",
+    ) as PropertyDescriptor & { value: typeof TextDecoder.prototype.decode };
+    const hashUpdateDescriptor = Object.getOwnPropertyDescriptor(
+      Hash.prototype,
+      "update",
+    ) as PropertyDescriptor & { value: typeof Hash.prototype.update };
+    const hashDigestDescriptor = Object.getOwnPropertyDescriptor(
+      Hash.prototype,
+      "digest",
+    ) as PropertyDescriptor & { value: typeof Hash.prototype.digest };
+    const hashCopyDescriptor = Object.getOwnPropertyDescriptor(
+      Hash.prototype,
+      "copy",
+    ) as PropertyDescriptor & { value: typeof Hash.prototype.copy };
     const reflectApplyDescriptor = Object.getOwnPropertyDescriptor(
       Reflect,
       "apply",
@@ -922,6 +1193,12 @@ describe("restore-v3 candidate filesystem", () => {
       [Buffer.prototype, "toString", toStringDescriptor],
       [Buffer, "from", fromDescriptor],
       [Buffer, "byteLength", bufferByteLengthDescriptor],
+      [TextEncoder.prototype, "encode", textEncoderEncodeDescriptor],
+      [textDecoderPrototype, "decode", textDecoderDecodeDescriptor],
+      [Hash.prototype, "update", hashUpdateDescriptor],
+      [Hash.prototype, "digest", hashDigestDescriptor],
+      [Hash.prototype, "copy", hashCopyDescriptor],
+      [globalThis, "TextDecoder", textDecoderDescriptor],
       [globalThis, "Uint8Array", uint8ArrayDescriptor],
       [Reflect, "apply", reflectApplyDescriptor],
       [Object, "defineProperties", definePropertiesDescriptor],
@@ -978,6 +1255,7 @@ describe("restore-v3 candidate filesystem", () => {
     const containsSensitiveBytes = (value: unknown): boolean => {
       try {
         return (
+          byteArrayIncludes(value as Uint8Array, ownerCapability) ||
           byteArrayIncludes(value as Uint8Array, payloadPlaintext) ||
           byteArrayIncludes(value as Uint8Array, canonicalSecret) ||
           byteArrayIncludes(value as Uint8Array, treePlaintext)
@@ -986,19 +1264,35 @@ describe("restore-v3 candidate filesystem", () => {
         return false;
       }
     };
-    const isTrackedSensitiveBytes = (value: unknown): boolean =>
+    const shouldTrapTypedArrayGetter = (value: unknown): boolean =>
       typeof value === "object" &&
       value !== null &&
-      sensitiveByteArrays.has(value) &&
-      !nativeIoByteArrays.has(value);
+      !nativeIoByteArrays.has(value) &&
+      (sensitiveByteArrays.has(value) || containsSensitiveBytes(value));
+    const containsSensitiveText = (value: unknown): boolean =>
+      typeof value === "string" &&
+      (intrinsicReflectApply(stringIncludesDescriptor.value, value, [
+        ownerCapability,
+      ]) ||
+        intrinsicReflectApply(stringIncludesDescriptor.value, value, [
+          payloadPlaintext,
+        ]) ||
+        intrinsicReflectApply(stringIncludesDescriptor.value, value, [
+          canonicalSecret,
+        ]) ||
+        intrinsicReflectApply(stringIncludesDescriptor.value, value, [
+          treePlaintext,
+        ]));
     const containsSensitiveDispatch = (
       receiver: unknown,
       args: readonly unknown[],
     ): boolean => {
       const isSensitiveValue = (value: unknown): boolean =>
-        value === payloadPlaintext ||
-        value === canonicalSecret ||
-        value === treePlaintext ||
+        value === ownerToken ||
+        containsSensitiveText(value) ||
+        (typeof value === "object" &&
+          value !== null &&
+          sensitiveByteArrays.has(value)) ||
         containsSensitiveBytes(value);
       if (isSensitiveValue(receiver)) return true;
       for (let index = 0; index < args.length; index += 1) {
@@ -1026,26 +1320,35 @@ describe("restore-v3 candidate filesystem", () => {
           },
         }),
       });
+      Object.defineProperty(globalThis, "TextDecoder", {
+        ...textDecoderDescriptor,
+        value: new Proxy(textDecoderDescriptor.value, {
+          construct(target, argumentsList) {
+            traps.push("TextDecoder constructor");
+            return Reflect.construct(target, argumentsList, target);
+          },
+        }),
+      });
       poisonGetter(
         typedArrayPrototype,
         "byteLength",
         byteLengthDescriptor,
         "TypedArray.byteLength",
-        isTrackedSensitiveBytes,
+        shouldTrapTypedArrayGetter,
       );
       poisonGetter(
         typedArrayPrototype,
         "buffer",
         bufferDescriptor,
         "TypedArray.buffer",
-        isTrackedSensitiveBytes,
+        shouldTrapTypedArrayGetter,
       );
       poisonGetter(
         typedArrayPrototype,
         "byteOffset",
         byteOffsetDescriptor,
         "TypedArray.byteOffset",
-        isTrackedSensitiveBytes,
+        shouldTrapTypedArrayGetter,
       );
       poisonMethod(
         typedArrayPrototype,
@@ -1078,6 +1381,33 @@ describe("restore-v3 candidate filesystem", () => {
         bufferByteLengthDescriptor,
         "Buffer.byteLength",
       );
+      poisonMethod(
+        TextEncoder.prototype,
+        "encode",
+        textEncoderEncodeDescriptor,
+        "TextEncoder.encode",
+        containsSensitiveDispatch,
+      );
+      poisonMethod(
+        textDecoderPrototype,
+        "decode",
+        textDecoderDecodeDescriptor,
+        "TextDecoder.decode",
+        containsSensitiveDispatch,
+      );
+      poisonMethod(
+        Hash.prototype,
+        "update",
+        hashUpdateDescriptor,
+        "Hash.update",
+      );
+      poisonMethod(
+        Hash.prototype,
+        "digest",
+        hashDigestDescriptor,
+        "Hash.digest",
+      );
+      poisonMethod(Hash.prototype, "copy", hashCopyDescriptor, "Hash.copy");
       poisonMethod(
         Reflect,
         "apply",
@@ -1255,7 +1585,7 @@ describe("restore-v3 candidate filesystem", () => {
     ).resolves.toBe(payloadPlaintext);
     await expect(
       fs.readFile(path.join(attemptRoot, publicationName), "utf8"),
-    ).resolves.toBe(`{"secret":"${canonicalSecret}"}\n`);
+    ).resolves.toBe(canonicalPlaintext);
   });
 
   it("refuses payload symlinks, hardlinks, overflow, and pathname swaps", async () => {
@@ -1883,6 +2213,181 @@ describe("restore-v3 candidate filesystem", () => {
     ).rejects.toMatchObject({
       code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_COMMIT_AMBIGUOUS",
     });
+  });
+
+  it("preserves corrupt JSON and lock cleanup failures independently and together", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const name = "corrupt-read-cleanup.json";
+    const options = { maximumBytes: 1_024 } as const;
+    const durablePath = path.join(attemptRoot, name);
+    await writePrivateFile(durablePath, "{\n");
+
+    const originalRelease =
+      AgentBackupRestoreV3CandidateFsLock.prototype.release;
+    const cleanupFailure = new Error("injected JSON read lock cleanup failure");
+    const releaseSpy = vi
+      .spyOn(AgentBackupRestoreV3CandidateFsLock.prototype, "release")
+      .mockImplementation(async function (
+        this: AgentBackupRestoreV3CandidateFsLock,
+        releaseControl,
+      ) {
+        await Reflect.apply(originalRelease, this, [releaseControl]);
+        throw cleanupFailure;
+      });
+    let combinedFailure: unknown;
+    try {
+      combinedFailure = await candidate
+        .readDurableJson(name, options, control)
+        .catch((cause: unknown) => cause);
+    } finally {
+      releaseSpy.mockRestore();
+    }
+
+    expect(combinedFailure).toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_READ_CLEANUP_FAILED",
+    });
+    const combinedCause = (combinedFailure as Error).cause;
+    expect(combinedCause).toBeInstanceOf(AggregateError);
+    const [primaryFailure, preservedCleanupFailure] = (
+      combinedCause as AggregateError
+    ).errors;
+    expect(primaryFailure).toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
+    });
+    expect(preservedCleanupFailure).toBe(cleanupFailure);
+
+    await expect(
+      candidate.readDurableJson(name, options, control),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_RECEIPT_INVALID",
+    });
+
+    await fs.writeFile(durablePath, '{"valid":true}\n');
+    const cleanupOnlyFailure = new Error(
+      "injected successful JSON read lock cleanup failure",
+    );
+    const cleanupOnlyReleaseSpy = vi
+      .spyOn(AgentBackupRestoreV3CandidateFsLock.prototype, "release")
+      .mockImplementation(async function (
+        this: AgentBackupRestoreV3CandidateFsLock,
+        releaseControl,
+      ) {
+        await Reflect.apply(originalRelease, this, [releaseControl]);
+        throw cleanupOnlyFailure;
+      });
+    try {
+      await expect(
+        candidate.readDurableJson(name, options, control),
+      ).rejects.toBe(cleanupOnlyFailure);
+    } finally {
+      cleanupOnlyReleaseSpy.mockRestore();
+    }
+  });
+
+  it("preserves undefined JSON publication failures alone and with cleanup", async () => {
+    const { candidate, attemptRoot } = await fixture();
+    const control = operationControl();
+    const options = { maximumBytes: 1_024 } as const;
+    const primaryName = "undefined-publication-primary.json";
+    const primaryLinkSpy = vi
+      .spyOn(fs, "link")
+      .mockImplementationOnce(() => Promise.reject(undefined));
+    let primaryOutcome: Awaited<ReturnType<typeof settlePromise<unknown>>>;
+    try {
+      primaryOutcome = await settlePromise(
+        candidate.publishDurableJson(
+          primaryName,
+          { exact: "primary" },
+          options,
+          control,
+        ),
+      );
+    } finally {
+      primaryLinkSpy.mockRestore();
+    }
+    expect(primaryOutcome).toEqual({
+      status: "rejected",
+      reason: undefined,
+    });
+    await expect(
+      fs.stat(path.join(attemptRoot, primaryName)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      candidate.publishDurableJson(
+        primaryName,
+        { exact: "primary" },
+        options,
+        control,
+      ),
+    ).resolves.toMatchObject({ replayed: false });
+
+    const combinedName = "undefined-publication-combined.json";
+    const cleanupFailure = new Error(
+      "injected undefined publication cleanup failure",
+    );
+    const originalRelease =
+      AgentBackupRestoreV3CandidateFsLock.prototype.release;
+    const combinedLinkSpy = vi
+      .spyOn(fs, "link")
+      .mockImplementationOnce(() => Promise.reject(undefined));
+    const releaseSpy = vi
+      .spyOn(AgentBackupRestoreV3CandidateFsLock.prototype, "release")
+      .mockImplementation(async function (
+        this: AgentBackupRestoreV3CandidateFsLock,
+        releaseControl,
+      ) {
+        await Reflect.apply(originalRelease, this, [releaseControl]);
+        throw cleanupFailure;
+      });
+    let combinedOutcome: Awaited<ReturnType<typeof settlePromise<unknown>>>;
+    try {
+      combinedOutcome = await settlePromise(
+        candidate.publishDurableJson(
+          combinedName,
+          { exact: "combined" },
+          options,
+          control,
+        ),
+      );
+    } finally {
+      releaseSpy.mockRestore();
+      combinedLinkSpy.mockRestore();
+    }
+    expect(combinedOutcome.status).toBe("rejected");
+    if (combinedOutcome.status !== "rejected") {
+      throw new Error(
+        "Combined JSON publication failure unexpectedly fulfilled",
+      );
+    }
+    expect(combinedOutcome.reason).toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_PUBLICATION_FAILED",
+    });
+    const combinedCause = (combinedOutcome.reason as Error).cause;
+    expect(combinedCause).toBeInstanceOf(AggregateError);
+    expect((combinedCause as AggregateError).errors).toEqual([
+      undefined,
+      cleanupFailure,
+    ]);
+    await expect(
+      fs.stat(path.join(attemptRoot, combinedName)),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(
+      candidate.publishDurableJson(
+        combinedName,
+        { exact: "combined" },
+        options,
+        control,
+      ),
+    ).resolves.toMatchObject({ replayed: false });
+    await expect(
+      candidate.publishDurableJson(
+        combinedName,
+        { exact: "combined" },
+        options,
+        control,
+      ),
+    ).resolves.toMatchObject({ replayed: true });
   });
 
   it("reconciles publication races without overwrite", async () => {
