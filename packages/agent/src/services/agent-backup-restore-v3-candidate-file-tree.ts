@@ -85,8 +85,10 @@ const BUFFER_COMPARE = Buffer.compare;
 const BUFFER_TO_STRING = Buffer.prototype.toString;
 const IS_PROXY = utilTypes.isProxy;
 const IS_UINT8_ARRAY = utilTypes.isUint8Array;
+const OBJECT_IS = Object.is;
 const MAXIMUM_DATE_EPOCH_MS = 8_640_000_000_000_000;
 const CANDIDATE_FILE_STAGING_MODE = 0o600;
+const CANDIDATE_FILE_CONTROL_MODE_MASK = 0o7777;
 // Linux uapi O_PATH. Node/Bun do not expose it consistently in fs.constants.
 const LINUX_O_PATH = 0o10000000;
 
@@ -146,6 +148,15 @@ function bufferToUtf8(value: Buffer): string {
   return REFLECT_APPLY(BUFFER_TO_STRING, value, ["utf8"]);
 }
 
+function pathUtf8Hex(value: string): string {
+  const encoded = bufferFromString(value, "utf8");
+  try {
+    return REFLECT_APPLY(BUFFER_TO_STRING, encoded, ["hex"]);
+  } finally {
+    zeroBytes(encoded);
+  }
+}
+
 function compareNames(left: string, right: string): number {
   const encodedLeft = bufferFromString(left, "utf8");
   const encodedRight = bufferFromString(right, "utf8");
@@ -201,6 +212,12 @@ export interface AgentBackupRestoreV3CandidateFileTreeProof
   readonly files: number;
   readonly directories: number;
   readonly entries: readonly Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>[];
+}
+
+interface StableFileTreeDirectory {
+  readonly relativePath: string;
+  readonly targetPath: string;
+  readonly stats: CandidateFsExactStats;
 }
 
 function fileTreeError(code: string, message: string, cause?: unknown): never {
@@ -274,13 +291,22 @@ function resolveLimits(
 }
 
 function exactMtimeMs(stats: CandidateFsExactStats): number {
-  if (stats.modifiedNanoseconds % 1_000_000n !== 0n) {
+  if (stats.modifiedNanoseconds < 0n) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
-      "Candidate file mtime is not exactly representable in milliseconds",
+      "Candidate file mtime is outside the exact stream range",
     );
   }
-  const value = Number(stats.modifiedNanoseconds / 1_000_000n);
+  // Capture v2 stores Math.trunc(Stats.mtimeMs). Reconstruct the same
+  // seconds-plus-nanoseconds projection instead of dividing the full bigint:
+  // libuv's double-second futimes representation can land a few nanoseconds
+  // either side of the requested millisecond on Linux while Stats.mtimeMs
+  // still round-trips to the exact captured integer.
+  const wholeSeconds = stats.modifiedNanoseconds / 1_000_000_000n;
+  const remainingNanoseconds = stats.modifiedNanoseconds % 1_000_000_000n;
+  const value = Math.trunc(
+    Number(wholeSeconds) * 1_000 + Number(remainingNanoseconds) / 1_000_000,
+  );
   if (!Number.isSafeInteger(value) || value < 0) {
     fileTreeError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
@@ -295,18 +321,17 @@ async function applyExactMtimeMs(
   mtimeMs: number,
   control: Readonly<AgentBackupRestoreV3OperationControl>,
 ): Promise<void> {
-  const targetNs = BigInt(mtimeMs) * 1_000_000n;
   const exactTime = new Date(mtimeMs);
   await controlled(() => handle.utimes(exactTime, exactTime), control);
   const firstObserved = await controlled(() => fileStatExact(handle), control);
-  let deltaNs = targetNs - firstObserved.modifiedNanoseconds;
-  if (deltaNs === 0n) return;
+  let deltaMs = mtimeMs - exactMtimeMs(firstObserved);
+  if (deltaMs === 0) return;
 
   let seconds = mtimeMs / 1_000;
-  let previousDeltaMagnitude = deltaNs < 0n ? -deltaNs : deltaNs;
+  let previousDeltaMagnitude = Math.abs(deltaMs);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const previousSeconds = seconds;
-    seconds += Number(deltaNs) / 1e9;
+    seconds += deltaMs / 1_000;
     if (!Number.isFinite(seconds)) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
@@ -315,9 +340,9 @@ async function applyExactMtimeMs(
     }
     await controlled(() => handle.utimes(seconds, seconds), control);
     const observed = await controlled(() => fileStatExact(handle), control);
-    deltaNs = targetNs - observed.modifiedNanoseconds;
-    if (deltaNs === 0n) return;
-    const deltaMagnitude = deltaNs < 0n ? -deltaNs : deltaNs;
+    deltaMs = mtimeMs - exactMtimeMs(observed);
+    if (deltaMs === 0) return;
+    const deltaMagnitude = Math.abs(deltaMs);
     if (
       seconds === previousSeconds ||
       deltaMagnitude >= previousDeltaMagnitude
@@ -396,12 +421,15 @@ function parseFileSpec(
     typeof filePath !== "string" ||
     !Number.isSafeInteger(sizeBytes) ||
     (sizeBytes as number) < 0 ||
+    OBJECT_IS(sizeBytes, -0) ||
     (sizeBytes as number) > limits.maximumBytes ||
     !Number.isSafeInteger(mode) ||
     (mode as number) < 0 ||
+    OBJECT_IS(mode, -0) ||
     (mode as number) > 0o777 ||
     !Number.isSafeInteger(mtimeMs) ||
     (mtimeMs as number) < 0 ||
+    OBJECT_IS(mtimeMs, -0) ||
     (mtimeMs as number) > MAXIMUM_DATE_EPOCH_MS
   ) {
     fileTreeError(
@@ -597,10 +625,13 @@ async function ensureDirectories(
       const childPath = path.join(parent.anchor, segment);
       try {
         await controlled(() => fs.mkdir(childPath, { mode: 0o700 }), control);
-        await controlled(() => parent.handle.sync(), control);
       } catch (cause) {
         if (!isErrno(cause, "EEXIST")) throw cause;
       }
+      // Sync both a fresh mkdir and its EEXIST replay. If mkdir reached the
+      // kernel but the first call was cancelled before this fsync, only the
+      // replay can make the parent dirent durably complete.
+      await controlled(() => parent.handle.sync(), control);
     } finally {
       await boundedInternalCleanup(() => parent.handle.close());
     }
@@ -716,12 +747,14 @@ async function proveOpenedFile(
     !sameIdentity(visible, before) ||
     visible.size !== spec.sizeBytes ||
     before.size !== spec.sizeBytes ||
-    ((visible.mode & 0o777) !== spec.mode &&
+    ((visible.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !== spec.mode &&
       (!allowStagingMode ||
-        (visible.mode & 0o777) !== CANDIDATE_FILE_STAGING_MODE)) ||
-    ((before.mode & 0o777) !== spec.mode &&
+        (visible.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !==
+          CANDIDATE_FILE_STAGING_MODE)) ||
+    ((before.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !== spec.mode &&
       (!allowStagingMode ||
-        (before.mode & 0o777) !== CANDIDATE_FILE_STAGING_MODE)) ||
+        (before.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !==
+          CANDIDATE_FILE_STAGING_MODE)) ||
     exactMtimeMs(visible) !== spec.mtimeMs ||
     exactMtimeMs(before) !== spec.mtimeMs
   ) {
@@ -730,7 +763,7 @@ async function proveOpenedFile(
       "Candidate output differs from its exact path, size, mode, or mtime",
     );
   }
-  if ((before.mode & 0o777) !== spec.mode) {
+  if ((before.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !== spec.mode) {
     await controlled(() => handle.chmod(spec.mode), control);
     await controlled(() => handle.sync(), control);
   }
@@ -753,7 +786,7 @@ async function proveOpenedFile(
     !sameIdentity(visibleBeforeHash, expectedIdentity) ||
     !sameStableFile(visibleBeforeHash, beforeHash) ||
     beforeHash.size !== spec.sizeBytes ||
-    (beforeHash.mode & 0o777) !== spec.mode ||
+    (beforeHash.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !== spec.mode ||
     exactMtimeMs(beforeHash) !== spec.mtimeMs
   ) {
     fileTreeError(
@@ -804,7 +837,7 @@ async function proveFinalPath(
     visible,
     "Candidate final path is not one regular single-link file",
   );
-  const visibleMode = visible.mode & 0o777;
+  const visibleMode = visible.mode & CANDIDATE_FILE_CONTROL_MODE_MASK;
   if (
     visible.size !== spec.sizeBytes ||
     (visibleMode !== spec.mode &&
@@ -1002,6 +1035,7 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
     this.#ownsLock = input.ownsLock;
     this.#replayedProof = input.replayedProof ?? null;
     this.replayed = this.#replayedProof !== null;
+    OBJECT_FREEZE(this);
   }
 
   get acknowledgedBytes(): number {
@@ -1144,7 +1178,8 @@ export class AgentBackupRestoreV3CandidateFileTreeWriter {
         if (
           !sameIdentity(beforeLink, this.#identity as CandidateFsExactStats) ||
           beforeLink.size !== this.spec.sizeBytes ||
-          (beforeLink.mode & 0o777) !== CANDIDATE_FILE_STAGING_MODE ||
+          (beforeLink.mode & CANDIDATE_FILE_CONTROL_MODE_MASK) !==
+            CANDIDATE_FILE_STAGING_MODE ||
           exactMtimeMs(beforeLink) !== this.spec.mtimeMs
         ) {
           fileTreeError(
@@ -1554,19 +1589,26 @@ export async function createCandidateFsFileTreeFile(
 
 function treeDigest(
   entries: readonly Readonly<AgentBackupRestoreV3CandidateFileTreeFileProof>[],
+  directories: readonly Readonly<StableFileTreeDirectory>[],
 ): string {
   return createHash("sha256")
     .update(
       candidateFsCanonicalJson({
         derivation: FILE_TREE_DERIVATION,
         entries: entries.map((entry) => ({
-          pathUtf8Hex: Buffer.from(entry.path, "utf8").toString("hex"),
+          pathUtf8Hex: pathUtf8Hex(entry.path),
           sha256: entry.sha256,
           sizeBytes: entry.sizeBytes,
           mode: entry.mode,
           mtimeMs: entry.mtimeMs,
           device: entry.device,
           inode: entry.inode,
+        })),
+        directories: directories.map((entry) => ({
+          pathUtf8Hex: pathUtf8Hex(entry.relativePath),
+          device: entry.stats.device.toString(10),
+          inode: entry.stats.inode.toString(10),
+          mode: entry.stats.mode & CANDIDATE_FILE_CONTROL_MODE_MASK,
         })),
       }),
       "utf8",
@@ -1628,10 +1670,24 @@ export async function proveCandidateFsFileTree(
     expected.push(parseExpectedProof(descriptor.value, limits));
   }
   let expectedBytes = 0;
+  const expectedDirectories = new Set<string>();
   for (const [index, entry] of expected.entries()) {
     expectedBytes += entry.sizeBytes;
+    const segments = entry.path.split("/");
+    let directoryPath = "";
+    for (
+      let segmentIndex = 0;
+      segmentIndex < segments.length - 1;
+      segmentIndex += 1
+    ) {
+      directoryPath = directoryPath
+        ? `${directoryPath}/${segments[segmentIndex] as string}`
+        : (segments[segmentIndex] as string);
+      expectedDirectories.add(directoryPath);
+    }
     if (
       expectedBytes > limits.maximumBytes ||
+      expectedDirectories.size > limits.maximumDirectories ||
       (index > 0 &&
         compareAgentBackupCaptureV2FilePaths(
           expected[index - 1]?.path ?? "",
@@ -1681,6 +1737,7 @@ export async function proveCandidateFsFileTree(
       readonly targetPath: string;
       readonly stats: CandidateFsExactStats;
     }> = [];
+    const stableDirectories: StableFileTreeDirectory[] = [];
     let directories = 0;
     let bytes = 0;
     const walk = async (
@@ -1690,7 +1747,7 @@ export async function proveCandidateFsFileTree(
       relative: string,
       expectedDirectory: CandidateFsExactStats,
       depth: number,
-    ): Promise<void> => {
+    ): Promise<CandidateFsExactStats> => {
       if (depth > limits.maximumDepth) {
         fileTreeError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_LIMIT",
@@ -1730,6 +1787,12 @@ export async function proveCandidateFsFileTree(
           );
         }
         if (visible.directory) {
+          if (!expectedDirectories.has(childRelative)) {
+            fileTreeError(
+              "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CONFLICT",
+              "Candidate file-tree contains an unmanifested directory",
+            );
+          }
           const child = await controlledAcquire(
             () =>
               fs.open(
@@ -1763,13 +1826,20 @@ export async function proveCandidateFsFileTree(
                 "Candidate file-tree directory count exceeds its derived bound",
               );
             }
-            await walk(
+            const stableDirectory = await walk(
               child,
               authority.directoryAnchor(child, path.join(testPath, name)),
               path.join(testPath, name),
               childRelative,
               opened,
               depth + 1,
+            );
+            stableDirectories.push(
+              OBJECT_FREEZE({
+                relativePath: childRelative,
+                targetPath: path.join(root.anchor, ...childSegments),
+                stats: stableDirectory,
+              }),
             );
           } finally {
             await boundedInternalCleanup(() => child.close());
@@ -1852,12 +1922,35 @@ export async function proveCandidateFsFileTree(
         afterDirectory,
         "Candidate file-tree directory ceased to be private during proof",
       );
+      return afterDirectory;
     };
-    await walk(root.handle, root.anchor, root.testPath, "", root.stats, 0);
+    const stableRoot = await walk(
+      root.handle,
+      root.anchor,
+      root.testPath,
+      "",
+      root.stats,
+      0,
+    );
+    stableDirectories.push(
+      OBJECT_FREEZE({
+        relativePath: ".",
+        targetPath: root.testPath,
+        stats: stableRoot,
+      }),
+    );
+    REFLECT_APPLY(ARRAY_SORT, stableDirectories, [
+      (left: StableFileTreeDirectory, right: StableFileTreeDirectory) =>
+        compareNames(left.relativePath, right.relativePath),
+    ]);
     observed.sort((left, right) =>
       compareAgentBackupCaptureV2FilePaths(left.path, right.path),
     );
-    if (observed.length !== expected.length || bytes !== expectedBytes) {
+    if (
+      observed.length !== expected.length ||
+      bytes !== expectedBytes ||
+      directories !== expectedDirectories.size
+    ) {
       fileTreeError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CONFLICT",
         "Candidate file-tree is incomplete",
@@ -1871,61 +1964,91 @@ export async function proveCandidateFsFileTree(
         );
       }
     }
-    // A file proved early in a large tree can otherwise be replaced or
-    // rewritten after its descriptor closes. Re-check every final pathname
-    // against the ctime-bearing post-hash snapshot before producing the tree
-    // digest.
-    for (const stableFile of stableFiles) {
-      const finalFile = await controlled(
-        () => lstatExact(stableFile.targetPath),
-        exactControl,
-      );
-      requireRegularSingleLink(
-        finalFile,
-        "Candidate file-tree file changed after its exact proof",
-      );
-      if (!sameStableFile(finalFile, stableFile.stats)) {
-        fileTreeError(
-          "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
-          "Candidate file-tree file changed after its exact proof",
-        );
-      }
-    }
     await authority.assertLockHeld(activeLock, exactControl);
-    const rootAfter = await controlled(
-      () => fileStatExact(root.handle),
-      exactControl,
-    );
-    if (!sameStableDirectory(rootAfter, root.stats)) {
-      fileTreeError(
-        "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
-        "Candidate file-tree root identity changed",
-      );
-    }
     const reboundRoot = await authority.openDirectorySegments(
       rootSegments,
       exactControl,
     );
     try {
-      if (!sameStableDirectory(reboundRoot.stats, rootAfter)) {
+      const nestedDirectories = stableDirectories.filter(
+        (entry) => entry.relativePath !== ".",
+      );
+      // Queue the last pathname/descriptor observations together after the
+      // root rebind. This closes deterministic gaps between files and nested
+      // directories for every writer that honors the quarantine lock. POSIX
+      // provides no atomic multi-inode snapshot against a raw writer that
+      // deliberately ignores that advisory boundary; CandidateFs documents
+      // the stopped/inaccessible quarantine precondition explicitly.
+      const [finalFiles, finalDirectories, rootPair] = await controlled(
+        () =>
+          Promise.all([
+            Promise.all(
+              stableFiles.map((entry) => lstatExact(entry.targetPath)),
+            ),
+            Promise.all(
+              nestedDirectories.map((entry) => lstatExact(entry.targetPath)),
+            ),
+            Promise.all([
+              fileStatExact(root.handle),
+              fileStatExact(reboundRoot.handle),
+            ]),
+          ]),
+        exactControl,
+      );
+      for (let index = 0; index < stableFiles.length; index += 1) {
+        const finalFile = finalFiles[index] as CandidateFsExactStats;
+        const stableFile = stableFiles[index] as (typeof stableFiles)[number];
+        requireRegularSingleLink(
+          finalFile,
+          "Candidate file-tree file changed after its exact proof",
+        );
+        if (!sameStableFile(finalFile, stableFile.stats)) {
+          fileTreeError(
+            "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+            "Candidate file-tree file changed after its exact proof",
+          );
+        }
+      }
+      for (let index = 0; index < nestedDirectories.length; index += 1) {
+        const finalDirectory = finalDirectories[index] as CandidateFsExactStats;
+        const stableDirectory = nestedDirectories[
+          index
+        ] as StableFileTreeDirectory;
+        requirePrivateDirectory(
+          finalDirectory,
+          "Candidate file-tree directory ceased to be private",
+        );
+        if (!sameStableDirectory(finalDirectory, stableDirectory.stats)) {
+          fileTreeError(
+            "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
+            "Candidate nested directory changed after its exact proof",
+          );
+        }
+      }
+      const rootAfter = rootPair[0] as CandidateFsExactStats;
+      const reboundAfter = rootPair[1] as CandidateFsExactStats;
+      if (
+        !sameStableDirectory(rootAfter, stableRoot) ||
+        !sameStableDirectory(reboundRoot.stats, reboundAfter) ||
+        !sameStableDirectory(reboundAfter, rootAfter)
+      ) {
         fileTreeError(
           "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_INODE_CHANGED",
           "Candidate file-tree root pathname changed during exact proof",
         );
       }
+      return OBJECT_FREEZE({
+        derivation: FILE_TREE_DERIVATION,
+        ...candidateFsIdentity(rootAfter),
+        sha256: treeDigest(observed, stableDirectories),
+        bytes,
+        files: observed.length,
+        directories,
+        entries: Object.freeze(observed.map((entry) => Object.freeze(entry))),
+      });
     } finally {
       await boundedInternalCleanup(() => reboundRoot.handle.close());
     }
-    await authority.assertLockHeld(activeLock, exactControl);
-    return OBJECT_FREEZE({
-      derivation: FILE_TREE_DERIVATION,
-      ...candidateFsIdentity(rootAfter),
-      sha256: treeDigest(observed),
-      bytes,
-      files: observed.length,
-      directories,
-      entries: Object.freeze(observed.map((entry) => Object.freeze(entry))),
-    });
   } finally {
     const cleanupOperations: Array<() => Promise<void>> = [];
     if (rootHandle) {

@@ -603,8 +603,13 @@ async function materializeCopiedFileSet(
     }
     const expectedSha256 = currentHash.digest("hex");
     currentHash = null;
-    const proof = await writer.finalize(input.control);
+    const finalizingWriter = writer;
+    const finalizePromise = finalizingWriter.finalize(input.control);
+    // finalize() owns descriptor/use/lease disposal once it returns a promise.
+    // Clear the outer cleanup slot before awaiting so a rejected finalize is
+    // not replayed through close() and misclassified as a cleanup failure.
     writer = null;
+    const proof = await finalizePromise;
     if (proof.sha256 !== expectedSha256) {
       fileSetError(
         "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_SET_FILE_CONFLICT",

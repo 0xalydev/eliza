@@ -1,5 +1,6 @@
 /** Adversarial proofs for exact character and file-set materialization. */
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
@@ -388,7 +389,7 @@ describe("restore-v3 candidate character materializer", () => {
 });
 
 describe("restore-v3 candidate file-set materializer", () => {
-  it("recovers a partial crash, preserves exact APFS mtime metadata, and replays finish", async () => {
+  it("recovers a partial crash, preserves captured mtime metadata, and replays finish", async () => {
     const { candidateFs, attemptRoot } = await fixture();
     const exactApfsMtimeMs = 1_700_000_000_123;
     const records = [
@@ -474,9 +475,9 @@ describe("restore-v3 candidate file-set materializer", () => {
     expect(await fs.readFile(path.join(root, "nested", "é.bin"))).toEqual(
       Buffer.from([0, 1, 2, 3]),
     );
-    const alpha = await fs.stat(path.join(root, "a.txt"), { bigint: true });
-    expect(Number(alpha.mode & 0o777n)).toBe(0o640);
-    expect(alpha.mtimeNs).toBe(BigInt(exactApfsMtimeMs) * 1_000_000n);
+    const alpha = await fs.stat(path.join(root, "a.txt"));
+    expect(alpha.mode & 0o777).toBe(0o640);
+    expect(Math.trunc(alpha.mtimeMs)).toBe(exactApfsMtimeMs);
   });
 
   it("proves files in canonical full-path order across a file-directory prefix", async () => {
@@ -593,6 +594,157 @@ describe("restore-v3 candidate file-set materializer", () => {
     }
   });
 
+  it("refuses unauthenticated set-id and sticky file mode bits", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const control = operationControl();
+    await candidateFs.ensureFileTreeDirectory("components/media", control);
+    const writer = await candidateFs.createFileTreeFile(
+      "components/media",
+      { path: "special-mode", sizeBytes: 1, mode: 0o600, mtimeMs: 0 },
+      undefined,
+      control,
+    );
+    await writer.write(Uint8Array.of(1), control);
+    const proof = await writer.finalize(control);
+    const target = path.join(
+      attemptRoot,
+      "components",
+      "media",
+      "special-mode",
+    );
+    // Bun currently masks 07000 in its fs.chmod shim. Use the host syscall
+    // utility so the proof is exercised against an actual hostile inode mode.
+    execFileSync("chmod", ["4600", target]);
+    const changed = await fs.stat(target, { bigint: true });
+    expect(Number(changed.mode & 0o7000n)).toBe(0o4000);
+    await expect(
+      candidateFs.proveFileTree(
+        "components/media",
+        [proof],
+        undefined,
+        control,
+      ),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_METADATA_CHANGED",
+    });
+  });
+
+  it("keeps writer bounds immutable and rejects negative-zero specs", async () => {
+    const { candidateFs } = await fixture();
+    const control = operationControl();
+    await candidateFs.ensureFileTreeDirectory("components/media", control);
+    for (const spec of [
+      { path: "negative-size", sizeBytes: -0, mode: 0o600, mtimeMs: 0 },
+      { path: "negative-mode", sizeBytes: 0, mode: -0, mtimeMs: 0 },
+      { path: "negative-mtime", sizeBytes: 0, mode: 0o600, mtimeMs: -0 },
+    ]) {
+      await expect(
+        candidateFs.createFileTreeFile(
+          "components/media",
+          spec,
+          undefined,
+          control,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_SPEC_INVALID",
+      });
+    }
+
+    const writer = await candidateFs.createFileTreeFile(
+      "components/media",
+      { path: "bounded", sizeBytes: 1, mode: 0o600, mtimeMs: 0 },
+      { maximumBytes: 1 },
+      control,
+    );
+    expect(
+      Reflect.set(writer, "spec", {
+        path: "forged",
+        sizeBytes: 2,
+        mode: 0o777,
+        mtimeMs: 1,
+      }),
+    ).toBe(false);
+    expect(Reflect.set(writer, "replayed", true)).toBe(false);
+    expect(writer.spec).toEqual({
+      path: "bounded",
+      sizeBytes: 1,
+      mode: 0o600,
+      mtimeMs: 0,
+    });
+    expect(writer.replayed).toBe(false);
+    await writer.write(Uint8Array.of(1), control);
+    await writer.finalize(control);
+  });
+
+  it("fsyncs an EEXIST replay after mkdir completed before cancellation", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const controller = new AbortController();
+    const interruptedControl = {
+      signal: controller.signal,
+      deadlineEpochMs: Date.now() + 30_000,
+    };
+    const originalMkdir = fs.mkdir;
+    let injected = false;
+    const mkdirSpy = vi
+      .spyOn(fs, "mkdir")
+      .mockImplementation(async (...args) => {
+        const result = await Reflect.apply(originalMkdir, fs, args);
+        if (!injected && String(args[0]).endsWith(`${path.sep}components`)) {
+          injected = true;
+          controller.abort(new Error("cancel after durable mkdir syscall"));
+        }
+        return result;
+      });
+    try {
+      await expect(
+        candidateFs.ensureFileTreeDirectory(
+          "components/replayed",
+          interruptedControl,
+        ),
+      ).rejects.toMatchObject({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FS_ABORTED",
+      });
+    } finally {
+      mkdirSpy.mockRestore();
+    }
+    expect(injected).toBe(true);
+    await expect(
+      fs.stat(path.join(attemptRoot, "components")),
+    ).resolves.toBeDefined();
+
+    const rootIdentity = await fs.stat(attemptRoot, { bigint: true });
+    const probePath = path.join(attemptRoot, "sync-probe");
+    const probe = await fs.open(probePath, "w", 0o600);
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      sync: typeof probe.sync;
+    };
+    const originalSync = handlePrototype.sync;
+    await probe.close();
+    await fs.unlink(probePath);
+    let replayParentSynced = false;
+    const syncSpy = vi
+      .spyOn(handlePrototype, "sync")
+      .mockImplementation(async function (this: typeof probe) {
+        const opened = await this.stat({ bigint: true });
+        if (
+          opened.dev === rootIdentity.dev &&
+          opened.ino === rootIdentity.ino
+        ) {
+          replayParentSynced = true;
+        }
+        return Reflect.apply(originalSync, this, []);
+      });
+    try {
+      await candidateFs.ensureFileTreeDirectory(
+        "components/replayed",
+        operationControl(),
+      );
+    } finally {
+      syncSpy.mockRestore();
+    }
+    expect(replayParentSynced).toBe(true);
+  });
+
   it("accepts only an exact authenticated empty set and refuses extra inbox records", async () => {
     const emptyCase = await fixture();
     const receipt = await stageComponent(emptyCase.candidateFs, "vault", []);
@@ -611,6 +763,25 @@ describe("restore-v3 candidate file-set materializer", () => {
     expect(
       await fs.readdir(path.join(emptyCase.attemptRoot, "components", "vault")),
     ).toEqual([]);
+    await fs.mkdir(
+      path.join(
+        emptyCase.attemptRoot,
+        "components",
+        "vault",
+        "unmanifested-empty",
+      ),
+      { mode: 0o700 },
+    );
+    await expect(
+      materializeAgentBackupRestoreV3CandidateFileSet({
+        candidateFs: emptyCase.candidateFs,
+        session: SESSION,
+        receipt,
+        control: operationControl(),
+      }),
+    ).rejects.toMatchObject({
+      code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_FILE_TREE_CONFLICT",
+    });
 
     const forgedCase = await fixture();
     const descriptor = AGENT_BACKUP_RESTORE_V3_COMPONENT_DESCRIPTORS[4];
@@ -1107,8 +1278,61 @@ describe("restore-v3 candidate file-set materializer", () => {
     expect(firstAfter.ctimeNs).not.toBe(firstBefore.ctimeNs);
   });
 
+  it("preserves a finalize failure classification and still releases its lock", async () => {
+    const { candidateFs, attemptRoot } = await fixture();
+    const receipt = await stageComponent(
+      candidateFs,
+      "media",
+      fileRecords({
+        path: "finalize-failure",
+        bytes: "x",
+        mode: 0o600,
+        mtimeMs: 0,
+      }),
+    );
+    const probePath = path.join(attemptRoot, "utimes-probe");
+    const probe = await fs.open(probePath, "w", 0o600);
+    const handlePrototype = Object.getPrototypeOf(probe) as {
+      utimes: typeof probe.utimes;
+    };
+    const originalUtimes = handlePrototype.utimes;
+    await probe.close();
+    await fs.unlink(probePath);
+    let injected = false;
+    const utimesSpy = vi
+      .spyOn(handlePrototype, "utimes")
+      .mockImplementation(async function (
+        this: typeof probe,
+        ...args: Parameters<typeof probe.utimes>
+      ) {
+        if (!injected) {
+          injected = true;
+          throw new Error("injected file-tree finalize failure");
+        }
+        return Reflect.apply(originalUtimes, this, args);
+      });
+    try {
+      await expect(
+        materializeAgentBackupRestoreV3CandidateFileSet({
+          candidateFs,
+          session: SESSION,
+          receipt,
+          control: operationControl(),
+        }),
+      ).rejects.toThrow("injected file-tree finalize failure");
+    } finally {
+      utimesSpy.mockRestore();
+    }
+    expect(injected).toBe(true);
+    const reacquired = await candidateFs.acquireLock(
+      "after-finalize-failure.lock",
+      operationControl(),
+    );
+    await reacquired.release(operationControl());
+  });
+
   it("releases caller lock use even when a proof descriptor close fails", async () => {
-    const { candidateFs } = await fixture();
+    const { candidateFs, attemptRoot } = await fixture();
     const control = operationControl();
     await candidateFs.ensureFileTreeDirectory("components/media", control);
     const writer = await candidateFs.createFileTreeFile(
@@ -1119,6 +1343,8 @@ describe("restore-v3 candidate file-set materializer", () => {
     );
     await writer.write(new TextEncoder().encode("cleanup"), control);
     const proof = await writer.finalize(control);
+    const treeRoot = path.join(attemptRoot, "components", "media");
+    const treeRootIdentity = await fs.stat(treeRoot, { bigint: true });
     const heldLock = await candidateFs.acquireLock(
       "file-tree-cleanup.lock",
       control,
@@ -1130,7 +1356,11 @@ describe("restore-v3 candidate file-set materializer", () => {
     } = { closeLeakedHandle: null };
     const openSpy = vi.spyOn(fs, "open").mockImplementation(async (...args) => {
       const handle = await Reflect.apply(originalOpen, fs, args);
-      if (String(args[0]).endsWith(`${path.sep}components${path.sep}media`)) {
+      const opened = await handle.stat({ bigint: true });
+      if (
+        opened.dev === treeRootIdentity.dev &&
+        opened.ino === treeRootIdentity.ino
+      ) {
         const exactClose = handle.close;
         handle.close = async () => {
           if (!injected) {
@@ -1315,6 +1545,8 @@ describe("restore-v3 candidate file-set materializer", () => {
     try {
       Object.defineProperty(Uint8Array.prototype, "fill", {
         ...descriptors.fill,
+        configurable: true,
+        writable: true,
         value(this: Uint8Array, ...args: readonly unknown[]) {
           observe(this);
           return Reflect.apply(fillIntrinsic, this, args);
@@ -1322,6 +1554,8 @@ describe("restore-v3 candidate file-set materializer", () => {
       });
       Object.defineProperty(Uint8Array.prototype, "set", {
         ...descriptors.set,
+        configurable: true,
+        writable: true,
         value(this: Uint8Array, ...args: readonly unknown[]) {
           observe(this, args[0]);
           return Reflect.apply(setIntrinsic, this, args);
@@ -1329,6 +1563,8 @@ describe("restore-v3 candidate file-set materializer", () => {
       });
       Object.defineProperty(Uint8Array.prototype, "subarray", {
         ...descriptors.subarray,
+        configurable: true,
+        writable: true,
         value(this: Uint8Array, ...args: readonly unknown[]) {
           observe(this);
           return Reflect.apply(subarrayIntrinsic, this, args);

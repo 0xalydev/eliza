@@ -100,6 +100,16 @@ export {
   AGENT_BACKUP_RESTORE_V3_CANDIDATE_TREE_LIMITS,
 } from "./agent-backup-restore-v3-candidate-fs-tree";
 
+/**
+ * Authority for one stopped restore quarantine.
+ *
+ * POSIX flock is advisory: callers must keep both roots inaccessible to the
+ * workload and to non-cooperating same-UID writers until activation, and must
+ * route every authorized mutation through this capability while its lock is
+ * held. File-tree proofs additionally detect bounded in-operation races, but
+ * cannot manufacture an atomic multi-inode snapshot against a raw writer that
+ * deliberately ignores the quarantine boundary.
+ */
 export class AgentBackupRestoreV3CandidateFs {
   readonly trustedRoot: string;
   readonly attemptRoot: string;
