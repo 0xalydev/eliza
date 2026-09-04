@@ -11,7 +11,7 @@ import type {
 } from "@elizaos/shared";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  type AgentBackupRestoreV3CandidateFs,
+  AgentBackupRestoreV3CandidateFs,
   openAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
 import {
@@ -780,6 +780,29 @@ describe("restore-v3 candidate record inbox", () => {
       expect.objectContaining({
         code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
       }),
+    );
+
+    const forgedBrandedPrototype = Object.create(
+      AgentBackupRestoreV3CandidateFs.prototype,
+    ) as Record<string, unknown>;
+    Object.defineProperty(forgedBrandedPrototype, "acquireLock", {
+      value: failTrap,
+    });
+    expect(() =>
+      stageAgentBackupRestoreV3CandidateRecord({
+        candidateFs: forgedBrandedPrototype,
+        session: SESSION,
+        record: record("forged-candidate-fs-prototype"),
+        control: operationControl(),
+      } as never),
+    ).toThrowError(
+      expect.objectContaining({
+        code: "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",
+      }),
+    );
+    expect(Object.isFrozen(candidateFs)).toBe(true);
+    expect(Object.isFrozen(AgentBackupRestoreV3CandidateFs.prototype)).toBe(
+      true,
     );
 
     const revokedControl = Proxy.revocable(operationControl(), {});

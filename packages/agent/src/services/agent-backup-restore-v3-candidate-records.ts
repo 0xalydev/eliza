@@ -25,10 +25,11 @@ import {
   parseAgentBackupRestoreV3StagingSession,
 } from "@elizaos/shared";
 import {
-  AgentBackupRestoreV3CandidateFs,
+  type AgentBackupRestoreV3CandidateFs,
   type AgentBackupRestoreV3CandidateFsLock,
   type AgentBackupRestoreV3CandidatePayloadReceipt,
   type AgentBackupRestoreV3CandidatePayloadWriter,
+  isAgentBackupRestoreV3CandidateFs,
 } from "./agent-backup-restore-v3-candidate-fs";
 import { snapshotOwnDataRecord } from "./agent-backup-restore-v3-candidate-fs-control";
 import { candidateFsCanonicalJson } from "./agent-backup-restore-v3-candidate-fs-json";
@@ -171,7 +172,7 @@ function requireCandidateFs(value: unknown): AgentBackupRestoreV3CandidateFs {
     !value ||
     typeof value !== "object" ||
     isProxy(value) ||
-    !(value instanceof AgentBackupRestoreV3CandidateFs)
+    !isAgentBackupRestoreV3CandidateFs(value)
   ) {
     recordError(
       "AGENT_BACKUP_RESTORE_V3_CANDIDATE_RECORD_INPUT_INVALID",

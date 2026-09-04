@@ -39,6 +39,15 @@ import {
   proveCandidateFsTree,
 } from "./agent-backup-restore-v3-candidate-fs-tree";
 
+const CANDIDATE_FS_CONSTRUCTION_AUTHORITY = Symbol(
+  "candidate-fs-construction-authority",
+);
+const CANDIDATE_FS_INSTANCES = new WeakSet<object>();
+const OBJECT_FREEZE = Object.freeze;
+const REFLECT_APPLY = Reflect.apply;
+const WEAK_SET_ADD = WeakSet.prototype.add;
+const WEAK_SET_HAS = WeakSet.prototype.has;
+
 export type {
   AgentBackupRestoreV3CandidateFsIdentity,
   OpenAgentBackupRestoreV3CandidateFsInput,
@@ -78,12 +87,20 @@ export class AgentBackupRestoreV3CandidateFs {
   readonly attemptRootIdentity: AgentBackupRestoreV3CandidateFsIdentity;
   readonly #control: AgentBackupRestoreV3CandidateFsControl;
 
-  private constructor(control: AgentBackupRestoreV3CandidateFsControl) {
+  private constructor(
+    control: AgentBackupRestoreV3CandidateFsControl,
+    constructionAuthority: symbol,
+  ) {
+    if (constructionAuthority !== CANDIDATE_FS_CONSTRUCTION_AUTHORITY) {
+      throw new TypeError("Candidate filesystem construction is private");
+    }
     this.#control = control;
     this.trustedRoot = control.trustedRoot;
     this.attemptRoot = control.attemptRoot;
     this.trustedRootIdentity = control.trustedRootIdentity;
     this.attemptRootIdentity = control.attemptRootIdentity;
+    REFLECT_APPLY(WEAK_SET_ADD, CANDIDATE_FS_INSTANCES, [this]);
+    OBJECT_FREEZE(this);
   }
 
   static async open(
@@ -91,6 +108,7 @@ export class AgentBackupRestoreV3CandidateFs {
   ): Promise<AgentBackupRestoreV3CandidateFs> {
     return new AgentBackupRestoreV3CandidateFs(
       await AgentBackupRestoreV3CandidateFsControl.open(input),
+      CANDIDATE_FS_CONSTRUCTION_AUTHORITY,
     );
   }
 
@@ -239,6 +257,19 @@ export class AgentBackupRestoreV3CandidateFs {
       heldLock,
     );
   }
+}
+
+OBJECT_FREEZE(AgentBackupRestoreV3CandidateFs.prototype);
+
+/** Runtime-only brand check for the unforgeable candidate-FS authority. */
+export function isAgentBackupRestoreV3CandidateFs(
+  value: unknown,
+): value is AgentBackupRestoreV3CandidateFs {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    REFLECT_APPLY(WEAK_SET_HAS, CANDIDATE_FS_INSTANCES, [value])
+  );
 }
 
 export async function openAgentBackupRestoreV3CandidateFs(
