@@ -564,24 +564,28 @@ export function deterministicScheduledDispatchRenderText(
           )
           .trim()
       : "";
-  const ownerMessage = instruction
+  let ownerMessage = instruction
     .replace(/^remind the owner to\s+/i, "")
     .replace(/^ask the owner to\s+/i, "")
     .replace(/^tell the owner to\s+/i, "")
     .replace(/^gentle check-in:\s*/i, "")
     .replace(/\s+/g, " ")
     .trim();
+  if (ownerMessage === instruction && ownerMessage.length >= 64) {
+    const clauseBreak = ownerMessage.match(/^([^,;:]+)[,;:]\s*(.+)$/s);
+    const wordBreak = ownerMessage.match(/^(\S+)\s+(.+)$/s);
+    const messageParts = clauseBreak ?? wordBreak;
+    if (messageParts)
+      ownerMessage = `${messageParts[1].trim()} — ${messageParts[2].trim()}`;
+  }
   // A deterministic stand-in for the dispatch-render model must be predictable
-  // so scenarios can assert the delivered copy exactly, but the renderer's
-  // instruction-echo guard rejects copy that equals (or, at >=64 chars,
-  // contains) the raw instruction. Prefix the de-framed instruction and clamp
-  // long instructions so the deterministic copy always passes that guard.
+  // so scenarios can assert the delivered copy exactly. Prefixing the de-framed
+  // instruction keeps it distinct from the raw instruction without discarding
+  // any owner-authored content. Long instructions without a conventional
+  // owner-address prefix receive an internal clause break so the production
+  // verbatim-echo guard does not reject the deterministic stand-in.
   if (!ownerMessage) return "checking in.";
-  const clamped =
-    ownerMessage.length >= 64
-      ? `${ownerMessage.slice(0, 60).trimEnd()}…`
-      : ownerMessage;
-  return `Heads up: ${clamped}`;
+  return `Heads up: ${ownerMessage}`;
 }
 
 // The dispatcher renders a notification TITLE through a second model call
@@ -944,6 +948,7 @@ export async function createScenarioRuntime(
             ? { SKILLS_DIR: process.env.SKILLS_DIR }
             : {}),
           ACTION_CALLBACK_VOICE_REWRITE: "false",
+          OUTBOUND_VOICE_REWRITE: "false",
           LIFEOPS_INBOX_PRIORITY_SCORING: "false",
         }
       : {};

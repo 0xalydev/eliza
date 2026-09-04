@@ -13,7 +13,7 @@ import {
 } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
-  await seedAppStorage(page);
+  await seedAppStorage(page, { "eliza:developerMode": "1" });
   await installDefaultAppRoutes(page);
 });
 
@@ -135,10 +135,13 @@ test("trajectories view loads and search re-queries", async ({ page }) => {
   await expect.poll(trajReqs).toBeGreaterThan(before);
 });
 
-test("relationships view loads the graph and platform filter re-queries", async ({
+test("relationships view loads the entity and relationship graph", async ({
   page,
 }) => {
-  const relReqs = countRequests(page, /\/api\/relationships\/(graph|people)/);
+  const relReqs = countRequests(
+    page,
+    /\/api\/lifeops\/(entities|relationships)(?:\?|$)/,
+  );
   await openAppPath(page, "/apps/relationships");
   await expect(page.getByTestId("relationships-view")).toBeVisible({
     timeout: 60_000,
@@ -153,14 +156,12 @@ test("stream view renders the offline status surface", async ({ page }) => {
   });
 });
 
-test("rolodex resolves to the launcher with registered view tiles", async ({
-  page,
-}) => {
+test("rolodex renders its designed unavailable boundary", async ({ page }) => {
   await openAppPath(page, "/rolodex");
-  await expect(page.getByTestId("launcher")).toBeVisible({
-    timeout: 60_000,
-  });
   await expect(
-    page.locator('[data-testid^="launcher-tile-"]').first(),
-  ).toBeVisible();
+    page.locator(
+      '[data-view-status="unavailable"][data-view-id="rolodex"]',
+    ),
+  ).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByRole("button", { name: "Retry" })).toBeVisible();
 });

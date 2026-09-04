@@ -2604,59 +2604,63 @@ function BrowserWorkspaceForAuthority(): React.JSX.Element {
         onOpen={openTabSwitcher}
         controlRef={switcherReturnFocusRef}
       />
-      <BrowserNavButton
-        agentId="new-tab"
-        agentLabel={newTabLabel}
-        agentDescription="Open a new browser tab"
-        group="browser-nav"
-        onActivate={() =>
-          void runBrowserWorkspaceAction("open:new", async () => {
-            await openNewBrowserWorkspaceTab(
-              newBrowserWorkspaceTabSeedUrl,
-              "user",
-            );
-          })
-        }
-        variant="ghost"
-        size="icon"
-        className="hidden size-11 shrink-0 md:inline-flex"
-        aria-label={newTabLabel}
-        disabled={busyAction !== null || browserWorkspaceUnavailable}
-        onClick={() =>
-          void runBrowserWorkspaceAction("open:new", async () => {
-            await openNewBrowserWorkspaceTab(
-              newBrowserWorkspaceTabSeedUrl,
-              "user",
-            );
-          })
-        }
-        data-testid="browser-workspace-nav-new-tab"
-      >
-        <Plus className="size-4" />
-      </BrowserNavButton>
-      <BrowserNavButton
-        agentId="reload"
-        agentLabel={t("common.refresh", { defaultValue: "Refresh" })}
-        agentDescription="Reload the active browser tab"
-        group="browser-nav"
-        onActivate={() =>
-          void runBrowserWorkspaceAction("reload:selected", async () => {
-            await reloadSelectedBrowserWorkspaceTab();
-          })
-        }
-        variant="ghost"
-        size="icon"
-        className="hidden size-11 md:inline-flex"
-        aria-label={t("common.refresh", { defaultValue: "Refresh" })}
-        disabled={!selectedTab || busyAction !== null}
-        onClick={() =>
-          void runBrowserWorkspaceAction("reload:selected", async () => {
-            await reloadSelectedBrowserWorkspaceTab();
-          })
-        }
-      >
-        <RefreshCw className="size-4" />
-      </BrowserNavButton>
+      <span className="max-md:hidden">
+        <BrowserNavButton
+          agentId="new-tab"
+          agentLabel={newTabLabel}
+          agentDescription="Open a new browser tab"
+          group="browser-nav"
+          onActivate={() =>
+            void runBrowserWorkspaceAction("open:new", async () => {
+              await openNewBrowserWorkspaceTab(
+                newBrowserWorkspaceTabSeedUrl,
+                "user",
+              );
+            })
+          }
+          variant="ghost"
+          size="icon"
+          className="size-11 shrink-0"
+          aria-label={newTabLabel}
+          disabled={busyAction !== null || browserWorkspaceUnavailable}
+          onClick={() =>
+            void runBrowserWorkspaceAction("open:new", async () => {
+              await openNewBrowserWorkspaceTab(
+                newBrowserWorkspaceTabSeedUrl,
+                "user",
+              );
+            })
+          }
+          data-testid="browser-workspace-nav-new-tab"
+        >
+          <Plus className="size-4" />
+        </BrowserNavButton>
+      </span>
+      <span className="max-md:hidden">
+        <BrowserNavButton
+          agentId="reload"
+          agentLabel={t("common.refresh", { defaultValue: "Refresh" })}
+          agentDescription="Reload the active browser tab"
+          group="browser-nav"
+          onActivate={() =>
+            void runBrowserWorkspaceAction("reload:selected", async () => {
+              await reloadSelectedBrowserWorkspaceTab();
+            })
+          }
+          variant="ghost"
+          size="icon"
+          className="size-11"
+          aria-label={t("common.refresh", { defaultValue: "Refresh" })}
+          disabled={!selectedTab || busyAction !== null}
+          onClick={() =>
+            void runBrowserWorkspaceAction("reload:selected", async () => {
+              await reloadSelectedBrowserWorkspaceTab();
+            })
+          }
+        >
+          <RefreshCw className="size-4" />
+        </BrowserNavButton>
+      </span>
       <span className="max-md:hidden">
         <BrowserNavButton
           agentId="close-all-tabs"
@@ -2790,82 +2794,86 @@ function BrowserWorkspaceForAuthority(): React.JSX.Element {
       {/* Mobile overflow (#29261): the toolbar stays one 44px row, so the
           secondary actions live behind one touch-sized menu instead of a
           second row. */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-11 shrink-0 md:hidden"
-            aria-label={t("browserworkspace.MoreActions", {
-              defaultValue: "More browser actions",
-            })}
-            data-testid="browser-workspace-mobile-more"
-          >
-            <EllipsisVertical className="size-4" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end" className="min-w-52 md:hidden">
-          <DropdownMenuItem
-            className="min-h-12 gap-3"
-            disabled={busyAction !== null || browserWorkspaceUnavailable}
-            onSelect={() =>
-              void runBrowserWorkspaceAction("open:new", async () => {
-                await openNewBrowserWorkspaceTab(
-                  newBrowserWorkspaceTabSeedUrl,
-                  "user",
-                );
-              })
-            }
-          >
-            <Plus className="size-4" />
-            {newTabLabel}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-12 gap-3"
-            disabled={!selectedTab || busyAction !== null}
-            onSelect={() =>
-              void runBrowserWorkspaceAction("reload:selected", async () => {
-                await reloadSelectedBrowserWorkspaceTab();
-              })
-            }
-          >
-            <RefreshCw className="size-4" />
-            {t("common.refresh", { defaultValue: "Refresh" })}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-12 gap-3"
-            disabled={
-              busyAction !== null ||
-              !workspace.tabs.some((tab) => !isInternalBrowserWorkspaceTab(tab))
-            }
-            onSelect={() =>
-              void runBrowserWorkspaceAction("close:all", async () => {
-                await closeAllBrowserWorkspaceTabs();
-              })
-            }
-          >
-            <X className="size-4" />
-            {t("browserworkspace.CloseAllTabs", {
-              defaultValue: "Close all tabs",
-            })}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            className="min-h-12 gap-3"
-            disabled={!selectedTab || busyAction !== null}
-            onSelect={() =>
-              void runBrowserWorkspaceAction("open:external", async () => {
-                if (!selectedTab) return;
-                await openExternalUrl(selectedTab.url);
-              })
-            }
-          >
-            <ExternalLink className="size-4" />
-            {t("browserworkspace.OpenExternal", {
-              defaultValue: "Open external",
-            })}
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <span className="shrink-0 max-md:inline-flex md:hidden">
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-11 shrink-0"
+              aria-label={t("browserworkspace.MoreActions", {
+                defaultValue: "More browser actions",
+              })}
+              data-testid="browser-workspace-mobile-more"
+            >
+              <EllipsisVertical className="size-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="min-w-52 md:hidden">
+            <DropdownMenuItem
+              className="min-h-12 gap-3"
+              disabled={busyAction !== null || browserWorkspaceUnavailable}
+              onSelect={() =>
+                void runBrowserWorkspaceAction("open:new", async () => {
+                  await openNewBrowserWorkspaceTab(
+                    newBrowserWorkspaceTabSeedUrl,
+                    "user",
+                  );
+                })
+              }
+            >
+              <Plus className="size-4" />
+              {newTabLabel}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="min-h-12 gap-3"
+              disabled={!selectedTab || busyAction !== null}
+              onSelect={() =>
+                void runBrowserWorkspaceAction("reload:selected", async () => {
+                  await reloadSelectedBrowserWorkspaceTab();
+                })
+              }
+            >
+              <RefreshCw className="size-4" />
+              {t("common.refresh", { defaultValue: "Refresh" })}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="min-h-12 gap-3"
+              disabled={
+                busyAction !== null ||
+                !workspace.tabs.some(
+                  (tab) => !isInternalBrowserWorkspaceTab(tab),
+                )
+              }
+              onSelect={() =>
+                void runBrowserWorkspaceAction("close:all", async () => {
+                  await closeAllBrowserWorkspaceTabs();
+                })
+              }
+            >
+              <X className="size-4" />
+              {t("browserworkspace.CloseAllTabs", {
+                defaultValue: "Close all tabs",
+              })}
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              className="min-h-12 gap-3"
+              disabled={!selectedTab || busyAction !== null}
+              onSelect={() =>
+                void runBrowserWorkspaceAction("open:external", async () => {
+                  if (!selectedTab) return;
+                  await openExternalUrl(selectedTab.url);
+                })
+              }
+            >
+              <ExternalLink className="size-4" />
+              {t("browserworkspace.OpenExternal", {
+                defaultValue: "Open external",
+              })}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </span>
     </div>
   );
 
@@ -3276,7 +3284,7 @@ function BrowserWorkspaceForAuthority(): React.JSX.Element {
       data-chat-clearance-aware="true"
       aria-busy={loading || busyAction !== null}
       tabIndex={-1}
-      className="relative flex h-full min-h-0 w-full min-w-0 flex-col gap-3 overflow-hidden bg-bg px-4 pt-[calc(0.75rem+var(--safe-area-top,0px))] pb-[calc(1rem+var(--eliza-mobile-nav-offset,0px)+max(var(--safe-area-bottom,0px),var(--android-gesture-inset-bottom,0px))+var(--eliza-chat-clearance,5.25rem))] lg:px-6 lg:pt-[calc(1.5rem+var(--safe-area-top,0px))] lg:pb-[calc(1.5rem+var(--eliza-mobile-nav-offset,0px)+max(var(--safe-area-bottom,0px),var(--android-gesture-inset-bottom,0px))+var(--eliza-chat-clearance,5.25rem))]"
+      className="relative flex h-full min-h-0 w-full min-w-0 flex-col gap-3 overflow-hidden bg-bg px-4 pt-[calc(0.75rem+var(--safe-area-top,0px))] pb-[calc(1rem+var(--eliza-chat-clearance,5.25rem))] lg:px-6 lg:pt-[calc(1.5rem+var(--safe-area-top,0px))] lg:pb-[calc(1.5rem+var(--eliza-chat-clearance,5.25rem))]"
     >
       <div
         data-testid="browser-workspace-toolbar"

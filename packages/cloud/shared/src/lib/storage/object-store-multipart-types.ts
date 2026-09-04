@@ -20,10 +20,22 @@ export const DEFAULT_MULTIPART_REQUEST_DURATION_MS = DEFAULT_IMMUTABLE_UPLOAD_DU
 export const MAX_MULTIPART_REQUEST_DURATION_MS = MAX_IMMUTABLE_UPLOAD_DURATION_MS;
 export const MULTIPART_SHA256_METADATA_KEY = "eliza-content-sha256";
 const DEFAULT_CONTENT_TYPE = "application/octet-stream";
+const arrayBufferByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")
+  ?.get as (this: ArrayBuffer) => number;
+const typedArrayByteLength = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype) as object,
+  "byteLength",
+)?.get as (this: Uint8Array) => number;
+const copyUint8Array = Uint8Array.prototype.set;
 
 export interface MultipartObjectRequestControl extends ObjectRequestControl {
   /** Normally delegates to `ExecutionContext.waitUntil`. */
   readonly registerLateSettlement: (settlement: Promise<void>) => void;
+}
+
+export interface MultipartObjectMutationControl extends MultipartObjectRequestControl {
+  /** Fenced authority check run immediately before every provider mutation attempt. */
+  readonly beforeProviderMutation: () => Promise<void>;
 }
 
 export interface MultipartObjectUploadPlan {
@@ -37,7 +49,7 @@ export interface MultipartObjectUploadPlan {
 
 export interface CreateMultipartObjectUploadInput extends MultipartObjectUploadPlan {
   readonly backend: ExactObjectStorageBackend;
-  readonly control: MultipartObjectRequestControl;
+  readonly control: MultipartObjectMutationControl;
 }
 
 export interface ResumeMultipartObjectUploadInput {
@@ -51,7 +63,7 @@ export interface ResumeMultipartObjectUploadInput {
 export interface UploadMultipartObjectPartInput {
   readonly partNumber: number;
   readonly body: ArrayBuffer | Uint8Array;
-  readonly control: MultipartObjectRequestControl;
+  readonly control: MultipartObjectMutationControl;
 }
 
 export interface ValidatedMultipartObjectUploadPlan {
@@ -187,8 +199,8 @@ export interface MultipartObjectUploadSession {
   readonly handle: MultipartObjectUploadHandle;
   acknowledgedParts(): readonly MultipartObjectPartReceipt[];
   uploadPart(input: UploadMultipartObjectPartInput): Promise<MultipartObjectPartReceipt>;
-  complete(control: MultipartObjectRequestControl): Promise<ImmutableObjectUploadReceipt>;
-  abort(control: MultipartObjectRequestControl): Promise<void>;
+  complete(control: MultipartObjectMutationControl): Promise<ImmutableObjectUploadReceipt>;
+  abort(control: MultipartObjectMutationControl): Promise<void>;
 }
 
 export interface ProviderPart {
@@ -261,24 +273,28 @@ function requireContentType(value: string | undefined): string {
 }
 
 export function requirePlan(input: MultipartObjectUploadPlan): ValidatedMultipartObjectUploadPlan {
-  const key = requireExactKey(input.key);
+  const suppliedKey = input.key;
+  const expectedSize = input.expectedSize;
+  const expectedSha256 = input.expectedSha256;
+  const suppliedContentType = input.contentType;
+  const key = requireExactKey(suppliedKey);
   if (
-    !Number.isSafeInteger(input.expectedSize) ||
-    input.expectedSize <= 0 ||
-    input.expectedSize > MAX_MULTIPART_OBJECT_BYTES
+    !Number.isSafeInteger(expectedSize) ||
+    expectedSize <= 0 ||
+    expectedSize > MAX_MULTIPART_OBJECT_BYTES
   ) {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_INVALID",
       "Multipart object upload requires a positive size no larger than 1 GiB",
     );
   }
-  if (!/^[0-9a-f]{64}$/.test(input.expectedSha256)) {
+  if (!/^[0-9a-f]{64}$/.test(expectedSha256)) {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_INVALID",
       "Multipart object upload requires a canonical object SHA-256",
     );
   }
-  const partCount = Math.ceil(input.expectedSize / MULTIPART_OBJECT_PART_BYTES);
+  const partCount = Math.ceil(expectedSize / MULTIPART_OBJECT_PART_BYTES);
   if (partCount < 1 || partCount > MAX_MULTIPART_OBJECT_PARTS) {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_INVALID",
@@ -287,17 +303,32 @@ export function requirePlan(input: MultipartObjectUploadPlan): ValidatedMultipar
   }
   return {
     key,
-    expectedSize: input.expectedSize,
-    expectedSha256: input.expectedSha256,
-    contentType: requireContentType(input.contentType),
+    expectedSize,
+    expectedSha256,
+    contentType: requireContentType(suppliedContentType),
     partCount,
   };
 }
 
 export function requireBackend(backend: ExactObjectStorageBackend): ExactObjectStorageBackend {
-  const locator = backend.locator;
+  const suppliedLocator = backend?.locator;
+  if (!suppliedLocator) {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_INVALID",
+      "Multipart object upload requires exact backend authority",
+    );
+  }
+  const locator = Object.freeze({
+    transport: suppliedLocator.transport,
+    provider: suppliedLocator.provider,
+    endpointAlias: suppliedLocator.endpointAlias,
+    backendIdentityFingerprint: suppliedLocator.backendIdentityFingerprint,
+    bucket: suppliedLocator.bucket,
+    region: suppliedLocator.region,
+  });
+  const runtimeBucket = "runtimeBucket" in backend ? backend.runtimeBucket : undefined;
+  const s3Client = "s3Client" in backend ? backend.s3Client : undefined;
   if (
-    !locator ||
     (locator.transport !== "worker-r2-binding" && locator.transport !== "s3-compatible") ||
     (locator.provider !== "r2" && locator.provider !== "s3") ||
     locator.endpointAlias.length === 0 ||
@@ -313,7 +344,22 @@ export function requireBackend(backend: ExactObjectStorageBackend): ExactObjectS
       "Multipart object upload requires exact backend authority",
     );
   }
-  return backend;
+  if (runtimeBucket) {
+    if (locator.transport !== "worker-r2-binding" || locator.provider !== "r2") {
+      throw lifecycle(
+        "OBJECT_STORAGE_MULTIPART_INVALID",
+        "Multipart Worker R2 binding does not match its exact backend authority",
+      );
+    }
+    return Object.freeze({ locator, runtimeBucket });
+  }
+  if (!s3Client || locator.transport !== "s3-compatible") {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_INVALID",
+      "Multipart S3 client does not match its exact backend authority",
+    );
+  }
+  return Object.freeze({ locator, s3Client });
 }
 
 export function requireUploadId(uploadId: unknown): string {
@@ -364,18 +410,43 @@ export function providerCode(error: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
 
+function providerHasCode(error: unknown, ...expected: readonly string[]): boolean {
+  if (!error || typeof error !== "object") return false;
+  const shaped = error as { name?: unknown; code?: unknown; Code?: unknown };
+  return [shaped.name, shaped.code, shaped.Code].some(
+    (value) => typeof value === "string" && expected.includes(value),
+  );
+}
+
 export function isNotFound(error: unknown): boolean {
   const code = providerCode(error);
-  return providerStatus(error) === 404 && (code === "NotFound" || code === "NoSuchKey");
+  return (
+    providerStatus(error) === 404 &&
+    (code === "NotFound" || code === "NoSuchKey" || code === "NoSuchVersion" || code === "404")
+  );
 }
 
 export function isNoSuchUpload(error: unknown): boolean {
-  return providerStatus(error) === 404 && providerCode(error) === "NoSuchUpload";
+  return (
+    (providerStatus(error) === 404 && providerCode(error) === "NoSuchUpload") ||
+    // Workers R2 appends its numeric error code to Error.message and does not
+    // expose the S3 HTTP/code fields; 10024 is the documented NoSuchUpload code.
+    (error instanceof Error && /\(10024\)\s*$/.test(error.message))
+  );
 }
 
 export function isAuthoritativeCreateFailure(error: unknown): boolean {
   const status = providerStatus(error);
-  return status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429;
+  if (providerHasCode(error, "RequestTimeout", "RequestTimeoutException")) return false;
+  return (
+    status !== null &&
+    status >= 400 &&
+    status < 500 &&
+    status !== 408 &&
+    status !== 409 &&
+    status !== 425 &&
+    status !== 429
+  );
 }
 
 export async function sha256Hex(value: Uint8Array | string): Promise<string> {
@@ -505,12 +576,17 @@ export async function rehydrateMultipartObjectUploadHandle(
 ): Promise<MultipartObjectUploadHandle> {
   const backend = requireBackend(input.backend);
   const plan = requirePlan(input);
+  const uploadId = requireUploadId(input.uploadId);
+  const receipt =
+    input.receipt !== null && typeof input.receipt === "object"
+      ? Object.freeze({ ...input.receipt })
+      : input.receipt;
   const expected = await buildHandle({
     backend,
     plan,
-    uploadId: requireUploadId(input.uploadId),
+    uploadId,
   });
-  if (!serializedHandleMatches(expected, input.receipt)) {
+  if (!serializedHandleMatches(expected, receipt)) {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_HANDLE_MISMATCH",
       "Serialized multipart receipt does not match its private exact locator",
@@ -522,36 +598,76 @@ export async function rehydrateMultipartObjectUploadHandle(
 export async function assertHandleMatchesBackend(
   backend: ExactObjectStorageBackend,
   handle: MultipartObjectUploadHandle,
-): Promise<void> {
+): Promise<MultipartObjectUploadHandle> {
   if (!handle || typeof handle !== "object") {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_HANDLE_MISMATCH",
       "Multipart resume requires an exact upload handle",
     );
   }
-  const plan = requirePlan(handle);
-  const expected = await buildHandle({ backend, plan, uploadId: handle.uploadId });
+  const actual = Object.freeze({
+    version: handle.version,
+    transport: handle.transport,
+    provider: handle.provider,
+    endpointAlias: handle.endpointAlias,
+    backendIdentityFingerprint: handle.backendIdentityFingerprint,
+    bucket: handle.bucket,
+    region: handle.region,
+    key: handle.key,
+    uploadId: handle.uploadId,
+    keyFingerprint: handle.keyFingerprint,
+    uploadIdFingerprint: handle.uploadIdFingerprint,
+    planFingerprint: handle.planFingerprint,
+    handleFingerprint: handle.handleFingerprint,
+    expectedSize: handle.expectedSize,
+    expectedSha256: handle.expectedSha256,
+    contentType: handle.contentType,
+    partSizeBytes: handle.partSizeBytes,
+    partCount: handle.partCount,
+  });
+  const plan = requirePlan(actual);
+  const expected = await buildHandle({ backend, plan, uploadId: actual.uploadId });
   if (
-    handle.version !== expected.version ||
-    handle.transport !== expected.transport ||
-    handle.provider !== expected.provider ||
-    handle.endpointAlias !== expected.endpointAlias ||
-    handle.backendIdentityFingerprint !== expected.backendIdentityFingerprint ||
-    handle.bucket !== expected.bucket ||
-    handle.region !== expected.region ||
-    handle.keyFingerprint !== expected.keyFingerprint ||
-    handle.uploadIdFingerprint !== expected.uploadIdFingerprint ||
-    handle.planFingerprint !== expected.planFingerprint ||
-    handle.handleFingerprint !== expected.handleFingerprint ||
-    handle.partSizeBytes !== expected.partSizeBytes ||
-    handle.partCount !== expected.partCount ||
-    handle.contentType !== expected.contentType
+    actual.version !== expected.version ||
+    actual.transport !== expected.transport ||
+    actual.provider !== expected.provider ||
+    actual.endpointAlias !== expected.endpointAlias ||
+    actual.backendIdentityFingerprint !== expected.backendIdentityFingerprint ||
+    actual.bucket !== expected.bucket ||
+    actual.region !== expected.region ||
+    actual.keyFingerprint !== expected.keyFingerprint ||
+    actual.uploadIdFingerprint !== expected.uploadIdFingerprint ||
+    actual.planFingerprint !== expected.planFingerprint ||
+    actual.handleFingerprint !== expected.handleFingerprint ||
+    actual.partSizeBytes !== expected.partSizeBytes ||
+    actual.partCount !== expected.partCount ||
+    actual.contentType !== expected.contentType
   ) {
     throw lifecycle(
       "OBJECT_STORAGE_MULTIPART_HANDLE_MISMATCH",
       "Multipart upload handle does not match the exact backend and object plan",
     );
   }
+  return expected;
+}
+
+export function snapshotMultipartPartReceipt(
+  receipt: MultipartObjectPartReceipt,
+): MultipartObjectPartReceipt {
+  if (!receipt || typeof receipt !== "object") {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_HANDLE_MISMATCH",
+      "Multipart resume requires exact provider-acknowledged part receipts",
+    );
+  }
+  return Object.freeze({
+    handleFingerprint: receipt.handleFingerprint,
+    partNumber: receipt.partNumber,
+    sizeBytes: receipt.sizeBytes,
+    bodySha256: receipt.bodySha256,
+    etag: receipt.etag,
+    providerAcknowledged: receipt.providerAcknowledged,
+  }) as MultipartObjectPartReceipt;
 }
 
 export function validateReceiptForHandle(
@@ -586,11 +702,28 @@ export function hasEveryExactPart(
   );
 }
 
-export function snapshotBody(body: ArrayBuffer | Uint8Array): Uint8Array {
-  if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
-  if (body instanceof Uint8Array) return Uint8Array.from(body);
-  throw lifecycle(
-    "OBJECT_STORAGE_MULTIPART_INVALID",
-    "Multipart part body must be an exact byte range",
-  );
+export function snapshotBody(body: ArrayBuffer | Uint8Array, expectedSize: number): Uint8Array {
+  let source: Uint8Array;
+  let byteLength: number;
+  if (body instanceof ArrayBuffer) {
+    byteLength = arrayBufferByteLength.call(body);
+    source = new Uint8Array(body, 0, byteLength);
+  } else if (body instanceof Uint8Array) {
+    byteLength = typedArrayByteLength.call(body);
+    source = body;
+  } else {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_INVALID",
+      "Multipart part body must be an exact byte range",
+    );
+  }
+  if (byteLength !== expectedSize) {
+    throw lifecycle(
+      "OBJECT_STORAGE_MULTIPART_INVALID",
+      "Multipart part body does not match its fixed exact slot size",
+    );
+  }
+  const snapshot = new Uint8Array(byteLength);
+  copyUint8Array.call(snapshot, source);
+  return snapshot;
 }

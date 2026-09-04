@@ -449,7 +449,9 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       });
       expect(expiredAuthorize.status).toBe("rejected");
       if (expiredAuthorize.status === "rejected") {
-        expect(errorChainText(expiredAuthorize.reason)).toMatch(/expired after authority locks/);
+        expect(errorChainText(expiredAuthorize.reason)).toMatch(
+          /seal authorization lacks current candidate authority/,
+        );
       }
       await Bun.sleep(50);
       const noLateAuthorize = await control.query<{
@@ -500,7 +502,9 @@ describe("restore-v3 candidate seal repository on real PostgreSQL", () => {
       });
       expect(expiredSeal.status).toBe("rejected");
       if (expiredSeal.status === "rejected") {
-        expect(errorChainText(expiredSeal.reason)).toMatch(/expired after terminal locks/);
+        expect(errorChainText(expiredSeal.reason)).toMatch(
+          /seal command proof is stale, consumed, or divergent/,
+        );
       }
       await Bun.sleep(50);
       const noLateSeal = await control.query<{

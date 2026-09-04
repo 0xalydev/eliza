@@ -205,6 +205,7 @@ import {
   clearCloudAuthFirstScreenGreeting,
   markCloudAuthFirstScreenGreeting,
 } from "./state/cloud-auth-first-screen";
+import { cloudAuthFirstScreenOwnsHost } from "./state/cloud-auth-first-screen-policy";
 import { hasUsableStoredStewardToken } from "./state/cloud-steward-login";
 import { isAuthoritativeFirstRunOpen } from "./state/first-run-chat-release";
 import {
@@ -224,7 +225,7 @@ import {
 } from "./surface-realm-broker";
 import { shellHistory } from "./surface-realm-channel";
 import { TutorialConductorMount } from "./tutorial/TutorialConductor";
-import { isElizaCloudControlPlaneAgentlessBase } from "./utils/cloud-agent-base";
+import { isTrustedHostedCloudOnboardingBase } from "./utils/cloud-agent-base";
 import { confirmDesktopAction } from "./utils/desktop-dialogs";
 import { openExternalUrl } from "./utils/openExternalUrl";
 import { playCaptureSendCue, playCaptureStartCue } from "./voice/capture-cues";
@@ -2685,7 +2686,10 @@ function AppContent() {
 
   const isAgentlessCloudOrigin =
     typeof window !== "undefined" &&
-    isElizaCloudControlPlaneAgentlessBase(window.location.origin);
+    isTrustedHostedCloudOnboardingBase(
+      window.location.origin,
+      branding.cloudOnly === true,
+    );
 
   // Existing remote backends still probe during first-run so a real 401 can
   // surface their password wall. The shared Cloud app defers that probe because
@@ -3258,9 +3262,15 @@ function AppContent() {
     !isPopout &&
     !isAuxiliaryAppWindow &&
     !cloudPairToken &&
-    (branding.cloudOnly === true ||
-      (isAndroidCloudBuild() && branding.cloudOnly !== false) ||
-      isElizaCloudRuntimeLocked());
+    (cloudAuthFirstScreenOwnsHost({
+      cloudOnlyBranding: branding.cloudOnly === true,
+      isAgentlessCloudOrigin,
+      isNative,
+      isDesktopShell: isElectrobunRuntime(),
+    }) ||
+      (isNative &&
+        ((isAndroidCloudBuild() && branding.cloudOnly !== false) ||
+          isElizaCloudRuntimeLocked())));
   const hasUsableCloudSession =
     elizaCloudConnected ||
     hasUsableStoredStewardToken() ||
