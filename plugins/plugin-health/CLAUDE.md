@@ -178,7 +178,7 @@ Create `src/default-packs/<name>.ts` implementing `DefaultPack`, add it to `HEAL
 - **Canonical time helpers.** `src/util/time.ts` and `src/util/time-util.ts` own the shared timezone and parsing helpers consumed by health and personal-assistant.
 - **CircadianInsightContract is the canonical seam.** Any code that needs circadian state or scheduling-window inference resolves it via `getCircadianInsightContract(runtime)` — never deep-imports `src/sleep/*` from outside the plugin.
 - **screen-time aggregation ownership.** `src/screen-time/` owns taxonomy/classification, range/window helpers, mobile signal parsing/status helpers, pure summary/breakdown/metrics builders, system-inactivity filtering, and shared payload contracts. The repository-backed aggregator lives in `@elizaos/plugin-personal-assistant` while signal-bus ownership remains split across the two plugins.
-- **Token encryption.** `src/util/token-encryption.ts` is a compatibility re-export of the Node-only `@elizaos/core` implementation; do not fork the ciphertext, key-file, or environment contract.
+- **Token encryption.** `src/util/token-encryption.ts` is a compatibility re-export of the Node-only `@elizaos/shared/crypto/token-encryption` implementation; do not fork the ciphertext, key-file, or environment contract.
 - See root `CLAUDE.md` for global architecture rules, logger conventions, and ESM/naming requirements.
 
 ## Verification

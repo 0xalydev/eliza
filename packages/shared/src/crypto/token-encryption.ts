@@ -59,11 +59,30 @@ function loadOrCreateKeyFile(credentialsDir: string): Buffer {
   }
   fs.mkdirSync(credentialsDir, { recursive: true, mode: 0o700 });
   const key = crypto.randomBytes(KEY_BYTES);
-  fs.writeFileSync(filePath, key.toString("base64"), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  return key;
+  const candidatePath = path.join(
+    credentialsDir,
+    `${KEY_FILENAME}.${crypto.randomUUID()}.tmp`,
+  );
+  const descriptor = fs.openSync(candidatePath, "wx", 0o600);
+  try {
+    try {
+      fs.writeFileSync(descriptor, key.toString("base64"), "utf8");
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    try {
+      // Linking publishes a complete key without replacing a concurrent winner.
+      // Both paths share a directory, so the link stays on the same filesystem.
+      fs.linkSync(candidatePath, filePath);
+      return key;
+    } catch (error) {
+      // error-policy:J1 EEXIST identifies another exclusively published key.
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      return decodeKeyMaterial(fs.readFileSync(filePath, "utf8"));
+    }
+  } finally {
+    fs.unlinkSync(candidatePath);
+  }
 }
 
 /**
