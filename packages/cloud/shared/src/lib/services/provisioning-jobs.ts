@@ -6551,7 +6551,11 @@ export class ProvisioningJobService {
               },
         );
       }
-      throw new Error(provisionError);
+      throw new ElizaError(provisionError, {
+        code: "AGENT_PROVISION_FAILED",
+        context: { jobId: job.id, agentId: data.agentId },
+        cause: provResult.failureCause,
+      });
     }
 
     const jobResult: AgentProvisionJobResult = {

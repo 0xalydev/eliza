@@ -3921,18 +3921,22 @@ export class ElizaSandboxService {
       try {
         reviewedRestore = await assertReviewedProvisionRestoreAuthority(agentId, restoreOverride);
       } catch (error) {
+        // error-policy:J1 preserve restore authority failure for the queue boundary.
         return {
           success: false,
           error: error instanceof Error ? error.message : "Reviewed backup authority changed",
+          failureCause: error,
         };
       }
     } else if (restoreOverride?.kind === "reviewed-fresh-boot") {
       try {
         await assertReviewedFreshBootAuthority(agentId, restoreOverride);
       } catch (error) {
+        // error-policy:J1 preserve restore authority failure for the queue boundary.
         return {
           success: false,
           error: error instanceof Error ? error.message : "Reviewed fresh-boot authority changed",
+          failureCause: error,
         };
       }
     }
@@ -4000,6 +4004,7 @@ export class ElizaSandboxService {
             error: `Replacement cleanup is still pending: ${
               error instanceof Error ? error.message : String(error)
             }`,
+            failureCause: error,
           };
         }
         candidate = await agentSandboxesRepository.findByIdAndOrg(agentId, orgId);
@@ -4049,6 +4054,7 @@ export class ElizaSandboxService {
         reviewedRestore = reviewedAdmissionFence.reviewedRestore;
         await this.testHooks?.afterReviewedRestoreFence?.();
       } catch (error) {
+        // error-policy:J1 translate rejected restore admission with its original cause.
         const message =
           error instanceof Error ? error.message : "Reviewed restore authority changed";
         if (reviewedAdmissionFence) {
@@ -4060,6 +4066,7 @@ export class ElizaSandboxService {
           success: false,
           sandboxRecord: await agentSandboxesRepository.findById(rec.id),
           error: message,
+          failureCause: error,
         };
       }
     }
@@ -4127,6 +4134,7 @@ export class ElizaSandboxService {
     // Solution: Retry loop catches unique constraint errors, cleans up ghost container, and retries.
     const MAX_PROVISION_ATTEMPTS = 3;
     let lastError: string = "Unknown error";
+    let lastFailureCause: unknown;
     // Only a port collision retries; any other failure gives up after its first
     // attempt. `attempt` is scoped to the loop header, so the count that
     // actually ran is mirrored here for the post-loop markError message —
@@ -4156,12 +4164,14 @@ export class ElizaSandboxService {
         (rec.environment_vars as Record<string, string>) ?? {},
       );
     } catch (envError) {
+      // error-policy:J1 return a failed provision without losing its decryption cause.
       const message = envError instanceof Error ? envError.message : String(envError);
       await this.markError(rec, `Environment decryption failed: ${message}`);
       return {
         success: false,
         sandboxRecord: await agentSandboxesRepository.findById(rec.id),
         error: message,
+        failureCause: envError,
       };
     }
 
@@ -4225,6 +4235,7 @@ export class ElizaSandboxService {
           });
         }
       } catch (err) {
+        // error-policy:J1 retain provider failure for the queue and cleanup boundaries.
         const msg = err instanceof Error ? err.message : String(err);
         if (err instanceof SandboxReplacementCleanupUnresolvedError) {
           await this.persistUnresolvedReplacementCleanupFence(rec.id, rec.organization_id, err);
@@ -4241,6 +4252,7 @@ export class ElizaSandboxService {
           success: false,
           sandboxRecord: await agentSandboxesRepository.findById(rec.id),
           error: msg,
+          failureCause: err,
         };
       }
 
@@ -4645,9 +4657,11 @@ export class ElizaSandboxService {
           healthUrl: handle.healthUrl,
         };
       } catch (err) {
+        // error-policy:J1 preserve startup failure while proving replacement cleanup.
         // Ghost container deletion: provider.create() succeeded but DB update or health check failed
         const msg = err instanceof Error ? err.message : String(err);
         lastError = msg;
+        lastFailureCause = err;
 
         // Transport-unresolved readiness probe: the probe never reached the
         // container, so it is likely healthy. DO NOT tear it down and DO NOT
@@ -4667,6 +4681,7 @@ export class ElizaSandboxService {
             retryable: true,
             sandboxRecord: await agentSandboxesRepository.findById(rec.id),
             error: msg,
+            failureCause: err,
           };
         }
 
@@ -4705,6 +4720,7 @@ export class ElizaSandboxService {
             error: `${msg}; replacement cleanup remains pending: ${
               stopErr instanceof Error ? stopErr.message : String(stopErr)
             }`,
+            failureCause: err,
           };
         }
 
@@ -4740,6 +4756,7 @@ export class ElizaSandboxService {
       success: false,
       sandboxRecord: await agentSandboxesRepository.findById(rec.id),
       error: lastError,
+      failureCause: lastFailureCause,
     };
     } finally {
       if (reviewedAdmissionFence) {
